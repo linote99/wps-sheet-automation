@@ -21,7 +21,7 @@ from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree as ET
 from xml.parsers import expat
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.formula.translate import Translator
 from openpyxl.utils.cell import column_index_from_string, get_column_letter, range_boundaries
@@ -52,9 +52,8 @@ WINDOW_SIZE_PATH = _window_size_path()
 CONFIG_VERSION = 7
 LEGACY_FORMULA_ROW_KEYS = ("formula_seed_row", "formula_template_row", "formula_row", "seed_row")
 MAX_PROCESSING_CELLS = 500_000
-MAX_IMAGE_CELLS = 100_000
-MAX_IMAGE_ROWS = 2_000
-MAX_IMAGE_COLUMNS = 2_000
+MAX_REGION_XLSX_CELLS = 100_000
+MAX_REGION_XLSX_CHARS = 2_000_000
 MAX_TEXT_CELLS = 100_000
 MAX_TEXT_CHARS = 2_000_000
 TEXT_COPY_CHUNK_ROWS = 500
@@ -71,6 +70,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "output_dir": "",
     "output_filename": "处理结果.xlsx",
     "output_filename_custom": None,
+    "open_region_exports": False,
     "copy_start_col": "A",
     "copy_end_col": "",
     "pre_mappings": [],
@@ -348,12 +348,13 @@ def _check_text_area_size(bounds: tuple[int, int, int, int], label: str) -> None
         raise ProcessingError(f"{label}包含 {count:,} 个单元格，超过文本预览/复制上限 {MAX_TEXT_CELLS:,}；请缩小范围。")
 
 
-def _check_image_area_size(bounds: tuple[int, int, int, int], label: str) -> None:
-    rows = bounds[3] - bounds[1] + 1
-    cols = bounds[2] - bounds[0] + 1
-    cells = rows * cols
-    if rows > MAX_IMAGE_ROWS or cols > MAX_IMAGE_COLUMNS or cells > MAX_IMAGE_CELLS:
-        raise ProcessingError(f"{label}区域为 {rows:,} 行 × {cols:,} 列（{cells:,} 格），超过 WPS 图片安全上限（{MAX_IMAGE_ROWS:,} 行、{MAX_IMAGE_COLUMNS:,} 列、{MAX_IMAGE_CELLS:,} 格）；请改选较小矩形区域。")
+def _check_region_xlsx_area_size(bounds: tuple[int, int, int, int], label: str) -> None:
+    cells = _area_cell_count(bounds)
+    if cells > MAX_REGION_XLSX_CELLS:
+        raise ProcessingError(
+            f"{label}区域包含 {cells:,} 个单元格，超过独立 XLSX 区域输出上限 "
+            f"{MAX_REGION_XLSX_CELLS:,}；请缩小范围。"
+        )
 
 
 def _area_address(bounds: tuple[int, int, int, int]) -> str:
@@ -363,39 +364,22 @@ def _area_address(bounds: tuple[int, int, int, int]) -> str:
     return first if first == last else f"{first}:{last}"
 
 
-def _merge_area_bounds(merge_area) -> tuple[int, int, int, int]:
-    """Read a COM MergeArea as worksheet-local bounds without changing the sheet."""
-    min_col = int(merge_area.Column)
-    min_row = int(merge_area.Row)
-    max_col = min_col + int(merge_area.Columns.Count) - 1
-    max_row = min_row + int(merge_area.Rows.Count) - 1
-    bounds = (min_col, min_row, max_col, max_row)
-    if (min_col < 1 or min_row < 1 or max_col > 16_384 or max_row > 1_048_576
-            or min_col > max_col or min_row > max_row):
-        raise ProcessingError("WPS 返回的合并单元格区域超出 Excel 工作表边界。")
-    return bounds
-
-
-def _expand_image_bounds_for_merged_cells(worksheet, bounds: tuple[int, int, int, int],
-                                          label: str) -> tuple[int, int, int, int]:
-    """Expand an image rectangle to the closure of every intersecting merged area."""
+def _expand_bounds_for_merged_cells(worksheet, bounds: tuple[int, int, int, int],
+                                    label: str) -> tuple[int, int, int, int]:
+    """Expand a selected area until it completely contains every intersecting merged cell."""
     expanded = bounds
-    checked_cells: set[tuple[int, int]] = set()
     while True:
-        scan_bounds = expanded
-        for row in range(scan_bounds[1], scan_bounds[3] + 1):
-            for col in range(scan_bounds[0], scan_bounds[2] + 1):
-                if (col, row) in checked_cells:
-                    continue
-                checked_cells.add((col, row))
-                cell = worksheet.Cells(row, col)
-                if not bool(cell.MergeCells):
-                    continue
-                merged = _merge_area_bounds(cell.MergeArea)
-                expanded = (min(expanded[0], merged[0]), min(expanded[1], merged[1]),
-                            max(expanded[2], merged[2]), max(expanded[3], merged[3]))
-                _check_image_area_size(expanded, f"{label}完整包含合并单元格后的 {_area_address(expanded)}")
-        if expanded == scan_bounds:
+        previous = expanded
+        for merged in worksheet.merged_cells.ranges:
+            merged_bounds = (merged.min_col, merged.min_row, merged.max_col, merged.max_row)
+            if not _areas_overlap(expanded, merged_bounds):
+                continue
+            expanded = (min(expanded[0], merged_bounds[0]), min(expanded[1], merged_bounds[1]),
+                        max(expanded[2], merged_bounds[2]), max(expanded[3], merged_bounds[3]))
+            _check_region_xlsx_area_size(
+                expanded, f"{label}完整包含合并单元格后的 {_area_address(expanded)}"
+            )
+        if expanded == previous:
             return expanded
 
 
@@ -476,6 +460,7 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
             job["sources"] = converted
         normalized_jobs.append(job)
     settings["jobs"] = normalized_jobs
+    settings["open_region_exports"] = bool(settings.get("open_region_exports", False))
     for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs"):
         if settings.get(key) is None:
             settings[key] = []
@@ -613,7 +598,7 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
                     raise ProcessingError(f"第 {previous_idx} 条和第 {rule_idx} 条{label}规则的目标区域重叠：{target_sheet}!{_area_address(previous)} 与 {_area_address(target_bounds)}。")
             destinations[target_sheet].append((rule_idx, target_bounds))
 
-    for key, label in (("image_outputs", "图片输出"), ("text_outputs", "文本输出")):
+    for key, label in (("image_outputs", "区域 XLSX 输出"), ("text_outputs", "文本输出")):
         outputs = settings.get(key, [])
         if not isinstance(outputs, list):
             raise ProcessingError(f"配置中的 {key} 必须是数组。")
@@ -624,9 +609,9 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
                 raise ProcessingError(f"第 {output_idx} 项{label}配置需要 sheet 和 range。")
             _validate_sheet_name(output["sheet"], f"第 {output_idx} 项{label}")
             bounds, selection_kind = _parse_selection_details(output["range"], f"第 {output_idx} 项{label}")
-            if key == "image_outputs":
-                _check_image_area_size(bounds, f"第 {output_idx} 项图片输出")
-            elif selection_kind not in ("sheet", "row", "column"):
+            if key == "image_outputs" and selection_kind not in ("sheet", "row", "column"):
+                _check_region_xlsx_area_size(bounds, f"第 {output_idx} 项区域 XLSX 输出")
+            elif key == "text_outputs" and selection_kind not in ("sheet", "row", "column"):
                 _check_text_area_size(bounds, f"第 {output_idx} 项文本输出")
 
     for key, label in (("TextToColumns", "文本分列"), ("Deduplicate", "去重"), ("FormatConvert", "格式转换")):
@@ -1384,7 +1369,7 @@ def _validate_template_area_sheets(workbook, settings: dict[str, Any]) -> None:
                 sheet_name = str(rule[field]).strip()
                 if sheet_name not in workbook.sheetnames:
                     raise ProcessingError(f"第 {idx} 条{label}规则引用了模板中不存在的工作表“{sheet_name}”。")
-    for key, label in (("image_outputs", "图片输出"), ("text_outputs", "文本输出")):
+    for key, label in (("image_outputs", "区域 XLSX 输出"), ("text_outputs", "文本输出")):
         for idx, output in enumerate(settings.get(key, []), 1):
             sheet_name = str(output["sheet"]).strip()
             if sheet_name not in workbook.sheetnames:
@@ -1809,7 +1794,7 @@ def _calculate_in_wps(staging_path: Path, formula_jobs: list[tuple[str, int, int
         recalc_phase = "后映射及区域处理后" if applied_steps else "后映射写入后"
         _recalculate_and_wait(app, log, recalc_phase)
         workbook.Save()
-        log("WPS 已完成后映射、第二次完整重算并保存工作簿；接下来只导出图片和读取文本预览，不再改动工作簿。")
+        log("WPS 已完成后映射、第二次完整重算并保存工作簿；接下来只导出区域 XLSX 和读取文本预览，不再改动工作簿。")
     except ProcessingError:
         raise
     except Exception as exc:
@@ -1864,13 +1849,13 @@ def _sanitize_filename_fragment(value: str) -> str:
     return sanitized[:80] or "区域"
 
 
-def _image_filename(output: dict[str, Any], index: int, collision: int = 1,
-                    bounds: tuple[int, int, int, int] | None = None) -> str:
+def _region_xlsx_filename(output: dict[str, Any], index: int, collision: int = 1,
+                          bounds: tuple[int, int, int, int] | None = None) -> str:
     sheet = _sanitize_filename_fragment(str(output["sheet"]))
-    bounds = bounds or _parse_selected_area(output["range"], "图片输出")
+    bounds = bounds or _parse_selected_area(output["range"], "区域 XLSX 输出")
     area = _sanitize_filename_fragment(_area_address(bounds).replace(":", "-"))
     suffix = "" if collision == 1 else f"_{collision}"
-    return f"{sheet}_{area}_{index:03d}{suffix}.png"
+    return f"{sheet}_{area}_{index:03d}{suffix}.xlsx"
 
 
 def _copy_file_exclusive(source: Path, destination: Path) -> None:
@@ -1898,210 +1883,218 @@ def _publish_staging_workbook(staging_path: Path, final_path: Path) -> None:
             raise ProcessingError(f"输出文件在处理过程中被创建；为避免覆盖已停止：\n{final_path}") from exc
 
 
-def _pump_wps_messages(pythoncom, wait_seconds: float = 0.0) -> None:
-    if pythoncom is not None:
-        try:
-            pump = getattr(pythoncom, "PumpWaitingMessages", None)
-            if callable(pump):
-                pump()
-        except Exception:
-            pass
-    if wait_seconds > 0:
-        time.sleep(wait_seconds)
-        if pythoncom is not None:
+def _resolve_selected_output_bounds(worksheet, selected_bounds: tuple[int, int, int, int],
+                                    selection_kind: str) -> tuple[int, int, int, int]:
+    used_rows = max(1, min(1_048_576, int(worksheet.max_row or 1)))
+    used_cols = max(1, min(16_384, int(worksheet.max_column or 1)))
+    min_col, min_row, max_col, max_row = selected_bounds
+    if selection_kind == "sheet":
+        return 1, 1, used_cols, used_rows
+    if selection_kind == "row":
+        return 1, min_row, used_cols, min_row
+    if selection_kind == "column":
+        return min_col, 1, min_col, used_rows
+    return selected_bounds
+
+
+def _column_dimension_for_index(worksheet, column: int):
+    letter = get_column_letter(column)
+    exact = worksheet.column_dimensions.get(letter)
+    if exact is not None and (exact.min or column) <= column <= (exact.max or exact.min or column):
+        return exact
+    for dimension in worksheet.column_dimensions.values():
+        first = dimension.min
+        if first is None:
             try:
-                pump = getattr(pythoncom, "PumpWaitingMessages", None)
-                if callable(pump):
-                    pump()
-            except Exception:
+                first = column_index_from_string(str(dimension.index))
+            except ValueError:
+                continue
+        last = dimension.max or first
+        if first <= column <= last:
+            return dimension
+    return None
+
+
+def _column_is_hidden(worksheet, column: int) -> bool:
+    dimension = _column_dimension_for_index(worksheet, column)
+    return bool(dimension.hidden) if dimension is not None else False
+
+
+def _value_as_export_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    return str(value)
+
+
+def _copy_dimension_properties(source_dimension, target_dimension, names: tuple[str, ...]) -> None:
+    for name in names:
+        try:
+            setattr(target_dimension, name, getattr(source_dimension, name))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if getattr(source_dimension, "has_style", False):
+        for name in ("font", "fill", "border", "alignment", "protection", "number_format"):
+            try:
+                setattr(target_dimension, name, copy(getattr(source_dimension, name)))
+            except (AttributeError, TypeError, ValueError):
                 pass
 
 
-def _activate_wps_object(target) -> None:
-    if target is None:
-        return
-    try:
-        activate = getattr(target, "Activate", None)
-        if callable(activate):
-            activate()
-    except Exception:
-        pass
-
-
-def _export_image_areas_from_workbook(workbook, image_outputs: list[dict[str, Any]], output_dir: Path,
-                                      log: Callable[[str], None], application=None, pythoncom=None) -> list[Path]:
+def _export_table_areas(workbook_path: Path, area_outputs: list[dict[str, Any]], output_dir: Path,
+                        log: Callable[[str], None]) -> list[Path]:
+    """Create one styled, text-valued XLSX workbook for each configured source area."""
+    if not area_outputs:
+        return []
     generated: list[Path] = []
     output_dir.mkdir(parents=True, exist_ok=True)
+    source_workbook = None
     try:
-        for index, output in enumerate(image_outputs, 1):
+        source_workbook = load_workbook(workbook_path, data_only=True, keep_links=False)
+        for index, output in enumerate(area_outputs, 1):
             sheet_name = str(output["sheet"]).strip()
-            configured_bounds = _parse_selected_area(output["range"], f"第 {index} 项图片输出")
-            _check_image_area_size(configured_bounds, f"第 {index} 项图片输出")
-            worksheet = workbook.Worksheets(sheet_name)
-            try:
-                bounds = _expand_image_bounds_for_merged_cells(
-                    worksheet, configured_bounds, f"第 {index} 项图片输出"
+            if sheet_name not in source_workbook.sheetnames:
+                raise ProcessingError(f"第 {index} 项区域 XLSX 输出工作表“{sheet_name}”在已保存工作簿中不存在。")
+            worksheet = source_workbook[sheet_name]
+            selected_bounds, selection_kind = _parse_selection_details(
+                output["range"], f"第 {index} 项区域 XLSX 输出"
+            )
+            configured_bounds = _resolve_selected_output_bounds(worksheet, selected_bounds, selection_kind)
+            _check_region_xlsx_area_size(configured_bounds, f"第 {index} 项区域 XLSX 输出")
+            bounds = _expand_bounds_for_merged_cells(
+                worksheet, configured_bounds, f"第 {index} 项区域 XLSX 输出"
+            )
+            _check_region_xlsx_area_size(bounds, f"第 {index} 项区域 XLSX 输出（合并区域闭包）")
+            min_col, min_row, max_col, max_row = bounds
+            visible_rows = [row for row in range(min_row, max_row + 1)
+                            if not worksheet.sheet_format.zeroHeight
+                            and not worksheet.row_dimensions[row].hidden]
+            visible_cols = [col for col in range(min_col, max_col + 1)
+                            if not _column_is_hidden(worksheet, col)]
+            if not visible_rows or not visible_cols:
+                raise ProcessingError(
+                    f"第 {index} 项区域 XLSX 输出 {sheet_name}!{_area_address(bounds)} 的行列均为隐藏状态，"
+                    "剔除隐藏行列后没有可导出的单元格。"
                 )
-            except ProcessingError:
-                raise
-            except Exception as exc:
-                raise ProcessingError(
-                    f"WPS 无法读取工作表“{sheet_name}”中配置区域 {_area_address(configured_bounds)} "
-                    f"的合并单元格范围（{type(exc).__name__}: {exc}）；请确认工作表可访问且工作簿未处于受保护/异常状态。"
-                ) from exc
-            area = _area_address(bounds)
-            configured_area = _area_address(configured_bounds)
-            if bounds != configured_bounds:
-                log(f"图片区域配置 {sheet_name}!{configured_area} 与合并单元格相交；本次只读导出范围自动扩展为 {area}，配置保持不变。")
-            try:
-                picture_range = worksheet.Range(area)
-            except Exception as exc:
-                raise ProcessingError(
-                    f"WPS 无法构建图片区域 {sheet_name}!{area}（配置范围 {configured_area}）："
-                    f"{type(exc).__name__}: {exc}。请确认工作表仍存在且区域地址有效。"
-                ) from exc
-            temp_handle, temp_name = tempfile.mkstemp(prefix=".wps_area_export_", suffix=".png", dir=str(output_dir))
-            os.close(temp_handle)
-            temp_path = Path(temp_name)
-            temp_path.unlink(missing_ok=True)
-            try:
-                copy_modes = ((1, 2), (1, -4147), (1, 2))
-                failures: list[tuple[str, str]] = []
-                exported = False
-                for attempt, (appearance, picture_format) in enumerate(copy_modes, 1):
-                    chart_object = None
-                    stage = "CopyPicture 阶段"
-                    temp_path.unlink(missing_ok=True)
-                    try:
-                        if attempt > 1:
-                            _pump_wps_messages(pythoncom, 0.08 if pythoncom is not None else 0.0)
-                        _activate_wps_object(application)
-                        _activate_wps_object(workbook)
-                        _activate_wps_object(worksheet)
-                        try:
-                            select_range = getattr(picture_range, "Select", None)
-                            if callable(select_range):
-                                select_range()
-                        except Exception:
-                            pass
+            row_map = {source_row: target_row for target_row, source_row in enumerate(visible_rows, 1)}
+            col_map = {source_col: target_col for target_col, source_col in enumerate(visible_cols, 1)}
+            rows_removed = max_row - min_row + 1 - len(visible_rows)
+            cols_removed = max_col - min_col + 1 - len(visible_cols)
 
-                        try:
-                            picture_range.CopyPicture(Appearance=appearance, Format=picture_format)
-                        except TypeError:
-                            picture_range.CopyPicture(appearance, picture_format)
-                        _pump_wps_messages(pythoncom, 0.12 if pythoncom is not None else 0.0)
+            export_workbook = Workbook()
+            export_sheet = export_workbook.active
+            export_sheet.title = worksheet.title
+            export_sheet.sheet_view.showGridLines = worksheet.sheet_view.showGridLines
+            export_sheet.sheet_view.zoomScale = worksheet.sheet_view.zoomScale
+            for name in ("defaultRowHeight", "defaultColWidth", "baseColWidth", "zeroHeight"):
+                try:
+                    setattr(export_sheet.sheet_format, name, getattr(worksheet.sheet_format, name))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            export_sheet.sheet_format.zeroHeight = False
 
-                        stage = "图表创建阶段"
-                        chart_objects = worksheet.ChartObjects()
-                        chart_object = chart_objects.Add(
-                            0, 0, max(1.0, float(picture_range.Width)), max(1.0, float(picture_range.Height))
+            total_chars = 0
+            try:
+                for target_row, source_row in enumerate(visible_rows, 1):
+                    source_dimension = worksheet.row_dimensions.get(source_row)
+                    if source_dimension is not None:
+                        _copy_dimension_properties(
+                            source_dimension, export_sheet.row_dimensions[target_row],
+                            ("height", "outlineLevel", "collapsed")
                         )
-                        _activate_wps_object(chart_object)
-                        chart = chart_object.Chart
-                        stage = "图表粘贴阶段"
-                        chart.Paste()
-                        _pump_wps_messages(pythoncom, 0.12 if pythoncom is not None else 0.0)
+                    export_sheet.row_dimensions[target_row].hidden = False
+                    for target_col, source_col in enumerate(visible_cols, 1):
+                        source_cell = worksheet.cell(source_row, source_col)
+                        target_cell = export_sheet.cell(target_row, target_col)
+                        if source_cell.has_style:
+                            for style_name in ("font", "fill", "border", "alignment", "protection"):
+                                setattr(target_cell, style_name, copy(getattr(source_cell, style_name)))
+                            target_cell.number_format = source_cell.number_format
+                        text = _value_as_export_text(source_cell.value)
+                        if text is not None:
+                            total_chars += len(text)
+                            if total_chars > MAX_REGION_XLSX_CHARS:
+                                raise ProcessingError(
+                                    f"第 {index} 项区域 XLSX 输出超过 {MAX_REGION_XLSX_CHARS:,} 个字符上限；请缩小范围。"
+                                )
+                            target_cell.value = text
+                            target_cell.data_type = "s"
+                for target_col, source_col in enumerate(visible_cols, 1):
+                    source_dimension = _column_dimension_for_index(worksheet, source_col)
+                    target_dimension = export_sheet.column_dimensions[get_column_letter(target_col)]
+                    if source_dimension is not None:
+                        _copy_dimension_properties(
+                            source_dimension, target_dimension,
+                            ("width", "bestFit", "outlineLevel", "collapsed")
+                        )
+                    target_dimension.hidden = False
 
-                        stage = "PNG 导出阶段"
+                for merged in worksheet.merged_cells.ranges:
+                    if not _areas_overlap(bounds, (merged.min_col, merged.min_row, merged.max_col, merged.max_row)):
+                        continue
+                    merged_rows = [row_map[row] for row in range(merged.min_row, merged.max_row + 1)
+                                   if row in row_map]
+                    merged_cols = [col_map[col] for col in range(merged.min_col, merged.max_col + 1)
+                                   if col in col_map]
+                    if merged_rows and merged_cols and (len(merged_rows) > 1 or len(merged_cols) > 1):
+                        export_sheet.merge_cells(
+                            start_row=min(merged_rows), start_column=min(merged_cols),
+                            end_row=max(merged_rows), end_column=max(merged_cols)
+                        )
+
+                temp_handle, temp_name = tempfile.mkstemp(
+                    prefix=".wps_region_export_", suffix=".xlsx", dir=str(output_dir)
+                )
+                os.close(temp_handle)
+                temp_path = Path(temp_name)
+                try:
+                    export_workbook.save(temp_path)
+                    if not temp_path.is_file() or temp_path.stat().st_size == 0:
+                        raise ProcessingError(f"第 {index} 项区域 XLSX 输出未生成有效文件。")
+                    collision = 1
+                    while True:
+                        target = output_dir / _region_xlsx_filename(output, index, collision, bounds)
                         try:
-                            export_result = chart.Export(str(temp_path), "PNG")
-                        except TypeError:
-                            export_result = chart.Export(Filename=str(temp_path), FilterName="PNG")
-                        if export_result is False or not temp_path.is_file() or temp_path.stat().st_size == 0:
-                            raise RuntimeError("Chart.Export 未生成有效PNG文件")
-                        exported = True
-                        break
-                    except Exception as exc:
-                        failures.append((stage, f"{type(exc).__name__}: {exc}"))
-                    finally:
-                        if chart_object is not None:
-                            try:
-                                chart_object.Delete()
-                            except Exception:
-                                pass
-                        if not exported:
-                            temp_path.unlink(missing_ok=True)
-
-                if not exported:
-                    attempt_summary = "；".join(f"第 {i} 次 {stage}：{error}" for i, (stage, error) in enumerate(failures, 1))
-                    last_stage = failures[-1][0] if failures else "PNG 导出阶段"
-                    last_error = failures[-1][1] if failures else "未获得有效 PNG 文件"
-                    raise ProcessingError(
-                        f"WPS 的 {last_stage}失败，图片导出重试结束，区域为 {sheet_name}!{area}（配置范围 {configured_area}）："
-                        f"{last_error}。尝试记录：{attempt_summary}。程序不会裁切合并区域，也未临时取消隐藏或更改行列隐藏状态；"
-                        "请确认 WPS 剪贴板/图表导出可用、该范围可复制且输出目录可写。"
-                    )
-
-                collision = 1
-                while True:
-                    target = output_dir / _image_filename(output, index, collision, bounds)
-                    try:
-                        os.link(temp_path, target)
-                        generated.append(target)
-                        break
-                    except FileExistsError:
-                        collision += 1
-                    except OSError:
-                        if target.exists():
-                            collision += 1
-                            continue
-                        try:
-                            _copy_file_exclusive(temp_path, target)
-                            generated.append(target)
+                            os.link(temp_path, target)
                             break
                         except FileExistsError:
                             collision += 1
-                log(f"已导出图片 {sheet_name}!{area}：{target.name}")
+                        except OSError:
+                            if target.exists():
+                                collision += 1
+                                continue
+                            try:
+                                _copy_file_exclusive(temp_path, target)
+                                break
+                            except FileExistsError:
+                                collision += 1
+                    generated.append(target)
+                finally:
+                    temp_path.unlink(missing_ok=True)
             finally:
-                temp_path.unlink(missing_ok=True)
+                export_workbook.close()
+
+            if bounds != configured_bounds:
+                log(f"区域 {sheet_name}!{_area_address(configured_bounds)} 与合并单元格相交，导出范围扩展为 {_area_address(bounds)}。")
+            log(
+                f"已导出区域 XLSX {sheet_name}!{_area_address(bounds)}：{target.name}；"
+                f"隐藏行剔除 {rows_removed} 行、隐藏列剔除 {cols_removed} 列，单元格值均为文本。"
+            )
         return generated
-    except Exception:
+    except Exception as exc:
         for path in generated:
             path.unlink(missing_ok=True)
-        raise
-
-
-def _export_image_areas_wps(workbook_path: Path, image_outputs: list[dict[str, Any]], output_dir: Path,
-                            log: Callable[[str], None]) -> list[Path]:
-    if not image_outputs:
-        return []
-    app = workbook = pythoncom = None
-    com_initialized = False
-    try:
-        app, pythoncom, progid = _connect_wps(log)
-        com_initialized = True
-        for prop, value in (("Visible", False), ("DisplayAlerts", False), ("AskToUpdateLinks", False),
-                            ("EnableEvents", False), ("AutomationSecurity", 3)):
-            try:
-                setattr(app, prop, value)
-            except Exception:
-                pass
-        workbook = app.Workbooks.Open(str(workbook_path), UpdateLinks=0, ReadOnly=False, AddToMru=False)
-        log(f"已从已保存的工作簿启动图片输出阶段（WPS {progid}）；此后不再修改工作簿。")
-        return _export_image_areas_from_workbook(
-            workbook, image_outputs, output_dir, log, application=app, pythoncom=pythoncom
-        )
-    except ProcessingError:
-        raise
-    except Exception as exc:
-        raise ProcessingError(f"WPS 图片区域导出失败：{type(exc).__name__}: {exc}") from exc
+        if isinstance(exc, ProcessingError):
+            raise
+        raise ProcessingError(f"独立区域 XLSX 导出失败：{type(exc).__name__}: {exc}") from exc
     finally:
-        if workbook is not None:
-            try:
-                workbook.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if app is not None:
-            try:
-                app.Quit()
-            except Exception:
-                pass
-        if com_initialized and pythoncom is not None:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-
+        if source_workbook is not None:
+            source_workbook.close()
 
 def _format_text_matrix(matrix: list[list[Any]]) -> str:
     return "\n".join("\t".join("" if value is None else str(value) for value in row) for row in matrix)
@@ -2274,8 +2267,9 @@ def _read_text_output_areas(workbook_path: Path, text_outputs: list[dict[str, An
 
 
 def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] = print,
-                      on_text_previews: Callable[[list[dict[str, str]]], None] | None = None) -> Path:
-    """Process and save the XLSX, then publish it after outputs or on PNG failure."""
+                      on_text_previews: Callable[[list[dict[str, str]]], None] | None = None,
+                      on_region_outputs: Callable[[list[Path]], None] | None = None) -> Path:
+    """Process and save the XLSX, then publish it after terminal outputs."""
     settings = normalize_settings(raw_settings)
     template_path, final_path = _validate_inputs(settings)
     copy_start, copy_end = column_number(settings["copy_start_col"]), column_number(settings["copy_end_col"])
@@ -2298,9 +2292,9 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
     fd, temp_name = tempfile.mkstemp(prefix=f".{final_path.stem}_", suffix=".staging.xlsx", dir=str(final_path.parent))
     os.close(fd)
     staging_path = Path(temp_name)
-    generated_images: list[Path] = []
+    generated_region_files: list[Path] = []
     published_final = False
-    preserve_final_after_image_failure = False
+    preserve_final_after_region_failure = False
     try:
         log("校验模板公式和目标子表后，在输出目录创建临时副本。")
         formula_jobs = _create_staging_workbook(template_path, settings, all_records, staging_path, log)
@@ -2311,12 +2305,12 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
             raise ProcessingError(f"输出文件在处理过程中被创建；为避免覆盖已停止：\n{final_path}")
 
         # WPS has saved all cell changes. These are terminal read/export steps; the workbook is never modified again.
-        log("工作簿已保存；开始最后的图片 PNG 导出与文本区域读取（后续不再修改工作簿）。")
+        log("工作簿已保存；开始最后的区域 XLSX 导出与文本区域读取（后续不再修改工作簿）。")
         text_previews = []
         for module_id in settings.get("workflow", DEFAULT_WORKFLOW):
             if module_id == "image_output":
                 try:
-                    generated_images = _export_image_areas_wps(
+                    generated_region_files = _export_table_areas(
                         staging_path, settings.get("image_outputs", []), final_path.parent, log
                     )
                 except Exception as image_exc:
@@ -2324,14 +2318,14 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
                         _publish_staging_workbook(staging_path, final_path)
                     except Exception as publish_exc:
                         raise ProcessingError(
-                            f"图片 PNG 输出失败：{image_exc}\n"
+                            f"区域 XLSX 输出失败：{image_exc}\n"
                             f"WPS 已完成计算并成功保存工作簿，但无法安全发布到目标路径：\n"
                             f"{final_path}\n发布原因：{publish_exc}"
                         ) from image_exc
                     published_final = True
-                    preserve_final_after_image_failure = True
+                    preserve_final_after_region_failure = True
                     raise ProcessingError(
-                        f"图片 PNG 输出失败：{image_exc}\n"
+                        f"区域 XLSX 输出失败：{image_exc}\n"
                         f"WPS 已完成计算并成功保存 XLSX；该文件已保留：\n{final_path}"
                     ) from image_exc
             elif module_id == "text_output":
@@ -2345,17 +2339,35 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
         log(f"处理成功，已另存为：{final_path}")
         if on_text_previews is not None:
             on_text_previews(text_previews)
+        if on_region_outputs is not None:
+            on_region_outputs(list(generated_region_files))
         return final_path
     except Exception as exc:
         try:
             staging_path.unlink(missing_ok=True)
-            for image_path in generated_images:
-                image_path.unlink(missing_ok=True)
-            if published_final and not preserve_final_after_image_failure:
+            for region_path in generated_region_files:
+                region_path.unlink(missing_ok=True)
+            if published_final and not preserve_final_after_region_failure:
                 final_path.unlink(missing_ok=True)
         except Exception as cleanup_exc:
             raise ProcessingError(f"处理失败：{exc}\n同时无法清理临时工作簿：{staging_path}\n清理错误：{cleanup_exc}") from exc
         raise
+
+
+def _open_region_xlsx_files(paths: list[Path], log: Callable[[str], None]) -> None:
+    """Open generated region workbooks using Windows' registered file association."""
+    if not paths:
+        return
+    opener = getattr(os, "startfile", None)
+    if opener is None:
+        log("自动打开区域 XLSX 仅支持 Windows 文件关联；导出文件已保存。")
+        return
+    for path in paths:
+        try:
+            opener(str(path))
+            log(f"已请求系统自动打开区域文件：{path}")
+        except Exception as exc:
+            log(f"自动打开区域文件失败（文件已保存）：{path}；{exc}")
 
 
 class App:
@@ -2379,6 +2391,9 @@ class App:
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.settings = load_settings()
         self.output_filename_custom = bool(self.settings.get("output_filename_custom", False))
+        self.region_auto_open_var = tk.BooleanVar(value=bool(self.settings.get("open_region_exports", False)))
+        self._auto_open_for_run = False
+        self._region_output_files: list[Path] = []
         self._suppress_output_filename_trace = False
         startup_migration_notices = self.settings.pop("_migration_notices", [])
         self.vars: dict[str, Any] = {}
@@ -2542,7 +2557,7 @@ class App:
         for label, command in (("添加映射", self._add_mapping), ("编辑映射", self._edit_mapping), ("删除映射", self._delete_mapping)):
             ttk.Button(map_buttons, text=label, command=command).pack(side="left", padx=2)
         editor.rowconfigure(1, weight=1)
-        note = "执行顺序：模板清理/前映射 → 多源追加 → 填公式与完整重算 → 后映射 → TextToColumns → Deduplicate → FormatConvert → 再完整重算并保存 → 最后 PNG 导出与文本预览/复制（此后不改工作簿）。三个区域处理功能各有独立开关、规则列表和顺序；分列目标必须为空且不得覆盖公式、源或其他已有数据。"
+        note = "执行顺序：模板清理/前映射 → 多源追加 → 填公式与完整重算 → 后映射 → TextToColumns → Deduplicate → FormatConvert → 再完整重算并保存 → 最后导出区域 XLSX 与文本预览/复制（此后不改工作簿）。区域 XLSX 保留格式、剔除隐藏行列并将数据写为文本；三个区域处理功能各有独立开关和规则列表。"
         ttk.Label(editor, text=note, foreground="#4b5563", wraplength=1180, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 0))
 
         area_box = ttk.LabelFrame(outer, text="模板内部前/后映射及终端输出区域（与每份源文件无关）", padding=5)
@@ -2553,7 +2568,7 @@ class App:
         area_tabs.grid(row=0, column=0, sticky="nsew")
         self.pre_mapping_tree = self._create_area_tab(area_tabs, "前映射", "pre_mappings",
             (("source_sheet", "源工作表", 180), ("source_range", "源范围", 110), ("target_sheet", "目标工作表", 180), ("target_range", "目标范围", 110)))
-        self.image_tree = self._create_area_tab(area_tabs, "图片 PNG 输出", "image_outputs",
+        self.image_tree = self._create_area_tab(area_tabs, "区域 XLSX 输出", "image_outputs",
             (("sheet", "模板工作表", 220), ("range", "单元格范围", 180)))
         self.text_tree = self._create_area_tab(area_tabs, "文本预览/复制", "text_outputs",
             (("sheet", "模板工作表", 220), ("range", "单元格范围", 180)))
@@ -2568,11 +2583,13 @@ class App:
         self.workflow_tree = self._create_workflow_tab(area_tabs)
         selector_help = ("范围选择（映射区保持普通矩形语法）：单格 A1=整表，A5=整行5，D1=整列D；"
                          "B3,B3=单格；两个不同端点如 D8,B3=自动规范化的矩形。Excel 上限 XFD / 1048576 行。"
-                         f"图片限 {MAX_IMAGE_ROWS} 行、{MAX_IMAGE_COLUMNS} 列、{MAX_IMAGE_CELLS:,} 格；文本整行/整列/整表按工作表已用范围解析，"
+                         f"区域 XLSX 整行/整列/整表按已用范围解析，最多 {MAX_REGION_XLSX_CELLS:,} 格、{MAX_REGION_XLSX_CHARS:,} 字符；隐藏行列会从导出副本中剔除。文本整行/整列/整表按工作表已用范围解析，"
                          f"最多 {MAX_TEXT_CELLS:,} 格、{MAX_TEXT_CHARS:,} 字符，并按 {TEXT_COPY_CHUNK_ROWS} 行分块预览/复制；"
                          f"区域处理单条规则最多 {MAX_PROCESSING_CELLS:,} 格。")
         ttk.Label(area_box, text=selector_help, foreground="#4b5563", wraplength=1180,
                   justify="left").grid(row=1, column=0, sticky="w", padx=4, pady=(4, 1))
+        ttk.Checkbutton(area_box, text="处理成功后自动打开单独导出的区域 XLSX 文件",
+                        variable=self.region_auto_open_var).grid(row=2, column=0, sticky="w", padx=4, pady=(3, 1))
 
         controls = ttk.Frame(outer)
         controls.grid(row=4, column=0, sticky="ew", pady=7)
@@ -2615,7 +2632,7 @@ class App:
         notebook.add(page, text="模块工作流")
         page.columnconfigure(0, weight=1)
         page.rowconfigure(1, weight=1)
-        ttk.Label(page, text="添加模块并用上移/下移定制执行顺序。核心依赖不可颠倒；分列、去重、格式转换可互换，图片与文本输出可互换。非法顺序会在保存或开始处理时给出具体原因。",
+        ttk.Label(page, text="添加模块并用上移/下移定制执行顺序。核心依赖不可颠倒；分列、去重、格式转换可互换，区域 XLSX 与文本输出可互换。非法顺序会在保存或开始处理时给出具体原因。",
                   wraplength=1080, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 5))
         self.workflow_tree = ttk.Treeview(page, columns=("module", "label", "role"), show="headings", height=7, selectmode="browse")
         for column, title, width in (("module", "模块 ID", 190), ("label", "模块名称", 190), ("role", "配置/依赖说明", 470)):
@@ -2649,7 +2666,7 @@ class App:
             "Deduplicate": "区域处理阶段，可与另两项区域操作互换",
             "FormatConvert": "区域处理阶段，可与另两项区域操作互换",
             "final_recalc_save": "所有工作簿写入后最终完整重算并保存",
-            "image_output": "只读末端输出，必须在最终保存后",
+            "image_output": "只读末端区域 XLSX 导出，必须在最终保存后",
             "text_output": "只读末端输出，必须在最终保存后",
         }
         for index, module_id in enumerate(workflow):
@@ -2790,7 +2807,7 @@ class App:
         existing = entries[index] if index is not None else {}
         is_mapping = key in ("pre_mappings", "post_mappings")
         title = {"pre_mappings": "前映射规则", "post_mappings": "后映射规则",
-                 "image_outputs": "图片输出区域", "text_outputs": "文本输出区域"}[key]
+                 "image_outputs": "区域 XLSX 输出", "text_outputs": "文本输出区域"}[key]
         fields = (("source_sheet", "源工作表"), ("source_range", "源区域"),
                   ("target_sheet", "目标工作表"), ("target_range", "目标区域")) if is_mapping else (("sheet", "模板工作表"), ("range", "单元格区域"))
         dialog = self.tk.Toplevel(self.root)
@@ -2821,9 +2838,9 @@ class App:
                 else:
                     _validate_sheet_name(value["sheet"], "输出")
                     bounds, selection_kind = _parse_selection_details(value["range"], "输出")
-                    if key == "image_outputs":
-                        _check_image_area_size(bounds, "图片输出")
-                    elif selection_kind not in ("sheet", "row", "column"):
+                    if key == "image_outputs" and selection_kind not in ("sheet", "row", "column"):
+                        _check_region_xlsx_area_size(bounds, "区域 XLSX 输出")
+                    elif key == "text_outputs" and selection_kind not in ("sheet", "row", "column"):
                         _check_text_area_size(bounds, "文本输出")
             except ProcessingError as exc:
                 self.messagebox.showerror(APP_NAME, str(exc), parent=dialog)
@@ -3257,6 +3274,7 @@ class App:
             raise ProcessingError("当前目标表的保留标题行数和粘贴起始行必须是整数。")
         settings = {key: var.get().strip() for key, var in self.vars.items()}
         settings["output_filename_custom"] = bool(self.output_filename_custom)
+        settings["open_region_exports"] = bool(self.region_auto_open_var.get())
         settings["config_version"] = CONFIG_VERSION
         settings["config_name"] = self.active_profile_name
         settings["jobs"] = deepcopy(self.settings["jobs"])
@@ -3322,6 +3340,7 @@ class App:
             self._suppress_output_filename_trace = False
         for key, var in self.operation_enabled.items():
             var.set(bool(normalized.get(key, {}).get("enabled", False)))
+        self.region_auto_open_var.set(bool(normalized.get("open_region_exports", False)))
         self.profile_choice.set(self.active_profile_name)
         self._render_jobs()
         self._render_area_configs()
@@ -3471,11 +3490,14 @@ class App:
         self.run_button.configure(state="disabled")
         self.progress.start(10)
         self._render_text_previews([])
+        self._auto_open_for_run = bool(settings.get("open_region_exports", False))
+        self._region_output_files = []
         self._log("开始处理……")
         def work():
             try:
                 path = process_workbooks(settings, lambda text: self.events.put(("log", text)),
-                                         lambda previews: self.events.put(("text_previews", previews)))
+                                         lambda previews: self.events.put(("text_previews", previews)),
+                                         lambda paths: self.events.put(("region_outputs", paths)))
                 self.events.put(("success", str(path)))
             except Exception as exc:
                 self.events.put(("error", f"{exc}\n\n详细诊断：\n{traceback.format_exc()}"))
@@ -3489,11 +3511,15 @@ class App:
                     self._log(str(payload))
                 elif event == "text_previews":
                     self._render_text_previews(payload)
+                elif event == "region_outputs":
+                    self._region_output_files = [Path(path) for path in payload]
                 elif event in ("success", "error"):
                     self.progress.stop()
                     self.run_button.configure(state="normal")
                     if event == "success":
                         self._log(f"完成：{payload}")
+                        if self._auto_open_for_run:
+                            _open_region_xlsx_files(self._region_output_files, self._log)
                         self.messagebox.showinfo(APP_NAME, f"处理成功，已保存新文件：\n{payload}")
                     else:
                         self._log("处理未全部完成；请查看详细诊断中的已保存文件路径及清理信息。")

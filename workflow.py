@@ -20,7 +20,7 @@ MODULE_LABELS = {
     "Deduplicate": "去重",
     "FormatConvert": "格式转换",
     "final_recalc_save": "最终重算并保存",
-    "image_output": "图片区域 PNG 输出",
+    "image_output": "自定义区域 XLSX 文本输出",
     "text_output": "文本区域剪贴板输出",
 }
 
@@ -38,7 +38,7 @@ DEPENDENCIES = (
     ("formula_fill", "formula_recalc", "公式填充必须先于首次完整重算"),
     ("formula_recalc", "result_mapping", "公式结果列映射必须读取首次完整重算后的结果"),
     ("result_mapping", "final_recalc_save", "结果映射必须在最终重算和保存之前完成"),
-    ("final_recalc_save", "image_output", "PNG 必须在工作簿最终重算并保存后导出"),
+    ("final_recalc_save", "image_output", "区域 XLSX 必须在工作簿最终重算并保存后导出"),
     ("final_recalc_save", "text_output", "文本必须在工作簿最终重算并保存后读取"),
 )
 
@@ -68,7 +68,7 @@ def validate_workflow(settings: dict[str, Any]) -> None:
         if isinstance(operation, dict) and operation.get("enabled", False):
             required.append((module_id, f"已启用 {MODULE_LABELS[module_id]}"))
     if settings.get("image_outputs"):
-        required.append(("image_output", "配置了图片输出区域"))
+        required.append(("image_output", "配置了区域 XLSX 输出"))
     if settings.get("text_outputs"):
         required.append(("text_output", "配置了文本输出区域"))
     for module_id, reason in required:
