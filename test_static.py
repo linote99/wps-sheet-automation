@@ -77,6 +77,16 @@ class FakeComWorksheet:
         self.worksheet = worksheet
         self.events = events
 
+    @property
+    def UsedRange(self):
+        rows = [cell.row for cell in self.worksheet._cells.values() if cell.value is not None]
+        first = min(rows, default=1)
+        last = max(rows, default=1)
+        return type("FakeUsedRange", (), {
+            "Row": first,
+            "Rows": type("FakeRows", (), {"Count": last - first + 1})(),
+        })()
+
     def Range(self, address):
         return FakeMappedRange(self.worksheet, address, self.events)
 
@@ -2174,3 +2184,70 @@ class StaticConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RegionFilterRangeShorthandTests(unittest.TestCase):
+    def test_region_filter_range_shorthand_and_legacy_rectangle(self):
+        bounds, kind = main._parse_region_filter_area("A")
+        self.assertEqual((1, 1, 1, 1_048_576), bounds)
+        self.assertEqual("column", kind)
+        bounds, kind = main._parse_region_filter_area("a1")
+        self.assertEqual((1, 1, 1, 1), bounds)
+        self.assertEqual("cell", kind)
+        bounds, kind = main._parse_region_filter_area("A1:F100")
+        self.assertEqual((1, 1, 6, 100), bounds)
+        self.assertEqual("rectangle", kind)
+        bounds, kind = main._parse_region_filter_area("A1")
+        self.assertEqual("sheet", kind)
+        self.assertEqual((1, 1, 16_384, 1_048_576), bounds)
+
+    def test_region_filter_single_column_validates_without_full_column_cell_limit(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["RegionFilter"] = {"enabled": True, "rules": [{
+            "scope": "target", "sheet": "数据", "range": "A", "has_header": True,
+            "filter_column": "A", "operator": "equals", "criteria": "保留",
+        }]}
+        main.validate_static_settings(settings)
+
+    def test_target_region_filter_single_column_uses_used_rows_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "target-filter-column.xlsx"
+            make_test_workbook(path, [("数据", {
+                1: {1: "状态", 2: "关联列"},
+                2: {1: "保留", 2: "记录-1"},
+                3: {1: "丢弃", 2: "记录-2"},
+                4: {1: "保留", 2: "记录-3"},
+            })])
+            fake_workbook = FakeComWorkbook(path, [])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = []
+            settings["RegionFilter"] = {"enabled": True, "rules": [{
+                "scope": "target", "sheet": "数据", "range": "A", "has_header": True,
+                "filter_column": "A", "operator": "equals", "criteria": "保留",
+            }]}
+            self.assertTrue(main._apply_region_processing(fake_workbook, settings, [], lambda _msg: None))
+            sheet = fake_workbook.workbook["数据"]
+            self.assertEqual(["状态", "保留", "保留", None], [sheet.cell(row=row, column=1).value for row in range(1, 5)])
+            self.assertEqual(["关联列", "记录-1", "记录-2", "记录-3"], [sheet.cell(row=row, column=2).value for row in range(1, 5)])
+            fake_workbook.workbook.close()
+
+    def test_source_region_filter_single_column_covers_blank_key_rows_through_sheet_data(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "source-filter-column.xlsx"
+            make_test_workbook(path, [("Data", {
+                1: {1: "状态", 2: "记录"},
+                2: {1: "保留", 2: "first"},
+                3: {1: "丢弃", 2: "remove"},
+                4: {1: "保留", 2: "last"},
+                5: {2: "empty-key-row"},
+            })])
+            original = path.read_bytes()
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["RegionFilter"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "Data", "range": "A", "has_header": True,
+                "filter_column": "A", "operator": "equals", "criteria": "保留",
+            }]}
+            records = main._read_source_records(path, "Data", 1, 1, 2, lambda _msg: None,
+                                               source_processing=settings)
+            self.assertEqual([["状态", "记录"], ["保留", "first"], ["保留", "last"]], records)
+            self.assertEqual(original, path.read_bytes())

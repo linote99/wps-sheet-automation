@@ -334,6 +334,28 @@ def _parse_selected_area(value: Any, label: str = "区域") -> tuple[int, int, i
     return _parse_selection_details(value, label)[0]
 
 
+def _parse_region_filter_area(value: Any, label: str = "区域筛选") -> tuple[tuple[int, int, int, int], str]:
+    """Parse filter-only shorthand while preserving other selector semantics."""
+    text = str(value or "").strip()
+    if re.fullmatch(r"[A-Za-z]{1,3}", text):
+        column = column_number(text)
+        return (column, 1, column, 1_048_576), "column"
+    if re.fullmatch(r"[a-z]{1,3}[1-9][0-9]{0,6}", text):
+        return _parse_area(text, label), "cell"
+    return _parse_selection_details(text, label)
+
+
+def _last_used_row_from_com(worksheet, label: str) -> int:
+    """Return the final row of a COM worksheet's used range, failing safely."""
+    try:
+        used_range = worksheet.UsedRange
+        first_row = int(used_range.Row)
+        row_count = int(used_range.Rows.Count)
+        return max(1, first_row + row_count - 1)
+    except Exception as exc:
+        raise ProcessingError(f"无法读取{label}的已用行范围；整列筛选已停止。原因：{exc}") from exc
+
+
 def _area_cell_count(bounds: tuple[int, int, int, int]) -> int:
     return (bounds[2] - bounds[0] + 1) * (bounds[3] - bounds[1] + 1)
 
@@ -633,8 +655,12 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
             scope = str(rule.get("scope", "target")).strip().lower()
             if scope not in ("target", "source"):
                 raise ProcessingError(f"第 {idx} 条{label}规则的 scope 只能是 target（目标工作簿）或 source（源文件）。")
-            bounds = _parse_selected_area(rule.get("range"), f"第 {idx} 条{label}")
-            _check_processing_area_size(bounds, f"第 {idx} 条{label}")
+            if key == "RegionFilter":
+                bounds, selection_kind = _parse_region_filter_area(rule.get("range"), f"第 {idx} 条{label}")
+            else:
+                bounds, selection_kind = _parse_selection_details(rule.get("range"), f"第 {idx} 条{label}")
+            if selection_kind != "column":
+                _check_processing_area_size(bounds, f"第 {idx} 条{label}")
             if key == "TextToColumns":
                 if bounds[0] != bounds[2]:
                     raise ProcessingError(f"第 {idx} 条文本分列规则的源范围必须是单列。")
@@ -702,7 +728,10 @@ def _validate_region_module_dependencies(settings: dict[str, Any]) -> None:
                     continue
                 if str(rule.get("scope", "target")) != str(split_rule.get("scope", "target")):
                     continue
-                other = _parse_selected_area(rule["range"], f"第 {rule_idx} 条{MODULE_LABELS[later_key]}")
+                if later_key == "RegionFilter":
+                    other = _parse_region_filter_area(rule["range"], f"第 {rule_idx} 条{MODULE_LABELS[later_key]}")[0]
+                else:
+                    other = _parse_selected_area(rule["range"], f"第 {rule_idx} 条{MODULE_LABELS[later_key]}")
                 if _areas_overlap(source, other) or _areas_overlap(target, other):
                     if positions["TextToColumns"] >= positions[later_key]:
                         raise ProcessingError(
@@ -1317,7 +1346,7 @@ def _read_source_records_from_copy(load_path: _TemporaryWorkbookCopy, path: Path
         overlay: dict[tuple[int, int], Any] = {}
         if source_processing is not None:
             overlay, excluded_rows, used = _apply_source_region_processing(
-                raw_ws, val_ws, resolved_sheet, source_processing, path, log
+                raw_ws, val_ws, resolved_sheet, source_processing, path, log, actual_last_row
             )
             if source_rules_used is not None:
                 source_rules_used.update(used)
@@ -1357,7 +1386,7 @@ def _read_source_records_from_copy(load_path: _TemporaryWorkbookCopy, path: Path
 
 
 def _apply_source_region_processing(raw_ws, val_ws, sheet_name: str, settings: dict[str, Any],
-                                    path: Path, log: Callable[[str], None]):
+                                    path: Path, log: Callable[[str], None], used_last_row: int | None = None):
     """Apply source-scoped rules to an in-memory overlay; the original XLSX is never written."""
     overlay: dict[tuple[int, int], Any] = {}
     excluded_rows: set[int] = set()
@@ -1394,7 +1423,13 @@ def _apply_source_region_processing(raw_ws, val_ws, sheet_name: str, settings: d
             if str(rule.get("sheet", "")).strip() != sheet_name:
                 continue
             used_rules.add((operation_key, rule_idx - 1))
-            bounds = _parse_selected_area(rule["range"], f"第 {rule_idx} 条{label}")
+            if operation_key == "RegionFilter":
+                bounds, selection_kind = _parse_region_filter_area(rule["range"], f"第 {rule_idx} 条{label}")
+                if selection_kind == "column":
+                    last_row = used_last_row or _last_nonempty_source_row(raw_ws)[0] or 1
+                    bounds = (bounds[0], 1, bounds[2], last_row)
+            else:
+                bounds = _parse_selected_area(rule["range"], f"第 {rule_idx} 条{label}")
             _check_processing_area_size(bounds, f"第 {rule_idx} 条{label}")
             raw_matrix, matrix = matrices(bounds)
             if operation_key == "TextToColumns":
@@ -1793,11 +1828,17 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
             if str(rule.get("scope", "target")).strip().lower() != "target":
                 continue
             sheet_name = str(rule["sheet"]).strip()
-            bounds = _parse_selected_area(rule["range"], f"第 {rule_idx} 条{label}")
+            if operation_key == "RegionFilter":
+                bounds, selection_kind = _parse_region_filter_area(rule["range"], f"第 {rule_idx} 条{label}")
+            else:
+                bounds, selection_kind = _parse_selection_details(rule["range"], f"第 {rule_idx} 条{label}")
+            worksheet = workbook.Worksheets(sheet_name)
+            if operation_key == "RegionFilter" and selection_kind == "column":
+                used_last_row = _last_used_row_from_com(worksheet, f"第 {rule_idx} 条{label}")
+                bounds = (bounds[0], 1, bounds[2], used_last_row)
             _check_processing_area_size(bounds, f"第 {rule_idx} 条{label}")
             if any(_areas_overlap(bounds, protected) for protected in formula_areas.get(sheet_name, [])):
                 raise ProcessingError(f"第 {rule_idx} 条{label}规则区域 {sheet_name}!{_area_address(bounds)} 与本次填充的公式区域重叠；为避免删除保留公式，已停止。")
-            worksheet = workbook.Worksheets(sheet_name)
             source_range = worksheet.Range(_area_address(bounds))
             if operation_key == "TextToColumns":
                 values_matrix = _read_com_area(source_range, bounds)
@@ -3316,7 +3357,7 @@ class App:
         self.format_convert_tree = self._create_operation_tab(area_tabs, "格式转换", "FormatConvert",
             rule_columns + (("mode", "目标类型", 100),))
         self.workflow_tree = self._create_workflow_tab(area_tabs)
-        selector_help = ("范围选择：B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形。Excel 上限 XFD / 1048576 行。"
+        selector_help = ("范围选择：B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形。区域筛选可单填 A 表示 A 列，或小写 a1 表示 A1 单元格；也可填写 A1:F100。Excel 上限 XFD / 1048576 行。"
                          f"每条处理规则最多 {MAX_PROCESSING_CELLS:,} 格。筛选会在选定区域内保留匹配行并压缩该区域，表头可选择保留；源文件规则仅改变本次读取数据，不回写源文件。")
         ttk.Label(area_box, text=selector_help, foreground="#4b5563", wraplength=1180,
                   justify="left").grid(row=1, column=0, sticky="w", padx=4, pady=(4, 1))
@@ -3614,7 +3655,7 @@ class App:
                 ("column_formats", "结果列格式（text/number/date，逗号分隔）", "entry"))
             initial = {"scope": "target", "sheet": "", "range": "", "delimiter": ",", "output_start_col": "A", "column_formats": ["text"]}
         elif key == "RegionFilter":
-            fields = base_fields + (("range", "筛选区域", "entry"), ("has_header", "表头", "header"),
+            fields = base_fields + (("range", "筛选区域（如 A、a1、A1:F100）", "entry"), ("has_header", "表头", "header"),
                 ("filter_column", "条件列（绝对列名）", "entry"), ("operator", "筛选条件", "operator"), ("criteria", "条件值", "entry"))
             initial = {"scope": "target", "sheet": "", "range": "", "has_header": True,
                        "filter_column": "A", "operator": "equals", "criteria": ""}
