@@ -26,10 +26,14 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.formula.translate import Translator
 from openpyxl.utils.cell import column_index_from_string, get_column_letter, range_boundaries
 from openpyxl.utils.datetime import from_excel, WINDOWS_EPOCH
+from workflow import (DEFAULT_WORKFLOW, MODULE_LABELS, add_workflow_module, list_profiles,
+                      load_profile, matching_profiles, move_workflow_module,
+                      remove_workflow_module, save_profile, validate_workflow)
 
 APP_NAME = "WPS 表格多源汇总处理器"
 CONFIG_PATH = Path.home() / ".wps_sheet_automation.json"
-CONFIG_VERSION = 5
+PROFILE_DIR = Path.home() / ".wps_sheet_automation_profiles"
+CONFIG_VERSION = 6
 MAX_PROCESSING_CELLS = 500_000
 MAX_IMAGE_CELLS = 100_000
 MAX_IMAGE_ROWS = 2_000
@@ -43,6 +47,9 @@ MAX_XLSX_WORKSHEET_XML_BYTES = 64 * 1024 * 1024
 MAX_XLSX_METADATA_XML_BYTES = 8 * 1024 * 1024
 DEFAULT_SETTINGS: dict[str, Any] = {
     "config_version": CONFIG_VERSION,
+    "config_name": "",
+    "template_prefix_length": 5,
+    "workflow": list(DEFAULT_WORKFLOW),
     "template_path": "",
     "output_dir": "",
     "output_filename": "处理结果.xlsx",
@@ -290,6 +297,18 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(operation, dict):
             settings[key] = {"enabled": operation.get("enabled", False),
                              "rules": deepcopy(operation.get("rules", []))}
+    if settings.get("workflow") is None:
+        settings["workflow"] = list(DEFAULT_WORKFLOW)
+    if not isinstance(settings.get("workflow"), list):
+        raise ProcessingError("配置中的 workflow 必须是模块 ID 数组。")
+    try:
+        prefix_length = int(settings.get("template_prefix_length", 5))
+    except (TypeError, ValueError) as exc:
+        raise ProcessingError("模板匹配前缀长度 N 必须是整数。") from exc
+    if not 1 <= prefix_length <= 120:
+        raise ProcessingError("模板匹配前缀长度 N 必须介于 1 和 120。")
+    settings["template_prefix_length"] = prefix_length
+    settings["config_name"] = str(settings.get("config_name") or "").strip()
     settings.pop("sources", None)
     settings["config_version"] = CONFIG_VERSION
     return settings
@@ -297,6 +316,10 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
 
 def validate_static_settings(raw_settings: dict[str, Any]) -> None:
     settings = normalize_settings(raw_settings)
+    try:
+        validate_workflow(settings)
+    except ValueError as exc:
+        raise ProcessingError(str(exc)) from exc
     jobs = settings.get("jobs")
     if not isinstance(jobs, list) or not jobs:
         raise ProcessingError("至少需要配置一个目标工作表。")
@@ -453,6 +476,36 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
             else:
                 if str(rule.get("mode", "")).lower() not in ("text", "number", "date"):
                     raise ProcessingError(f"第 {idx} 条格式转换规则 mode 只能是 text、number 或 date。")
+
+    _validate_region_module_dependencies(settings)
+
+
+def _validate_region_module_dependencies(settings: dict[str, Any]) -> None:
+    workflow = settings.get("workflow", DEFAULT_WORKFLOW)
+    positions = {module_id: index for index, module_id in enumerate(workflow)}
+    split_operation = settings.get("TextToColumns", {})
+    if not split_operation.get("enabled", False) or "TextToColumns" not in positions:
+        return
+    for later_key in ("Deduplicate", "FormatConvert"):
+        operation = settings.get(later_key, {})
+        if not operation.get("enabled", False) or later_key not in positions:
+            continue
+        for split_idx, split_rule in enumerate(split_operation.get("rules", []), 1):
+            source = _parse_selected_area(split_rule["range"], f"第 {split_idx} 条文本分列")
+            formats = split_rule.get("column_formats", ["text"])
+            start_col = column_number(split_rule["output_start_col"])
+            target = (start_col, source[1], start_col + len(formats) - 1, source[3])
+            for rule_idx, rule in enumerate(operation.get("rules", []), 1):
+                if str(rule["sheet"]).strip() != str(split_rule["sheet"]).strip():
+                    continue
+                other = _parse_selected_area(rule["range"], f"第 {rule_idx} 条{MODULE_LABELS[later_key]}")
+                if _areas_overlap(source, other) or _areas_overlap(target, other):
+                    if positions["TextToColumns"] >= positions[later_key]:
+                        raise ProcessingError(
+                            f"工作流顺序无效：“文本分列”必须位于“{MODULE_LABELS[later_key]}”之前；"
+                            f"第 {split_idx} 条分列规则的输入/输出区域与第 {rule_idx} 条{MODULE_LABELS[later_key]}规则重叠，"
+                            "否则分列输入会先被修改，或分列目标会先被占用。"
+                        )
 
 
 def _resource_path(relative: str) -> Path:
@@ -1330,8 +1383,10 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
         formula_areas.setdefault(sheet_name, []).append((col_start, start_row, col_end, end_row))
 
     applied_any = False
-    # The three function families are deliberately independent in JSON and fixed in this execution order.
-    for operation_key, label in (("TextToColumns", "文本分列"), ("Deduplicate", "去重"), ("FormatConvert", "格式转换")):
+    operation_labels = {"TextToColumns": "文本分列", "Deduplicate": "去重", "FormatConvert": "格式转换"}
+    configured_order = settings.get("workflow", DEFAULT_WORKFLOW)
+    for operation_key in (module_id for module_id in configured_order if module_id in operation_labels):
+        label = operation_labels[operation_key]
         operation = settings.get(operation_key, {"enabled": False, "rules": []})
         if not operation.get("enabled", False):
             continue
@@ -1466,9 +1521,11 @@ def _calculate_in_wps(staging_path: Path, formula_jobs: list[tuple[str, int, int
             target_range.Value2 = tuple(tuple(row) for row in source_values)
             log(f"已应用后映射 {rule['source_sheet']}!{source_address} → {rule['target_sheet']}!{target_address}。")
 
-        step_settings = region_processing or {"TextToColumns": {"enabled": False, "rules": []},
-                                             "Deduplicate": {"enabled": False, "rules": []},
-                                             "FormatConvert": {"enabled": False, "rules": []}}
+        step_settings = dict(region_processing or {})
+        step_settings.setdefault("TextToColumns", {"enabled": False, "rules": []})
+        step_settings.setdefault("Deduplicate", {"enabled": False, "rules": []})
+        step_settings.setdefault("FormatConvert", {"enabled": False, "rules": []})
+        step_settings.setdefault("workflow", list(DEFAULT_WORKFLOW))
         applied_steps = _apply_region_processing(workbook, step_settings, formula_jobs, log)
 
         # Rebuild once after all post-mapping and region-processing writes so dependent formulas are current.
@@ -1859,8 +1916,12 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
 
         # WPS has saved all cell changes. These are terminal read/export steps; the workbook is never modified again.
         log("工作簿已保存；开始最后的图片 PNG 导出与文本区域读取（后续不再修改工作簿）。")
-        generated_images = _export_image_areas_wps(staging_path, settings.get("image_outputs", []), final_path.parent, log)
-        text_previews = _read_text_output_areas(staging_path, settings.get("text_outputs", []))
+        text_previews = []
+        for module_id in settings.get("workflow", DEFAULT_WORKFLOW):
+            if module_id == "image_output":
+                generated_images = _export_image_areas_wps(staging_path, settings.get("image_outputs", []), final_path.parent, log)
+            elif module_id == "text_output":
+                text_previews = _read_text_output_areas(staging_path, settings.get("text_outputs", []))
         for preview in text_previews:
             log(f"已读取文本区域 {preview['sheet']}!{preview['range']}，内容将在处理完成后显示并可复制。")
 
@@ -1903,9 +1964,12 @@ class App:
         self.job_vars: dict[str, Any] = {}
         self.operation_enabled: dict[str, Any] = {}
         self.active_job_index: int | None = None
+        self.active_profile_name = str(self.settings.get("config_name") or "")
         self._build()
         self._render_jobs()
         self._render_area_configs()
+        self._render_workflow()
+        self._refresh_profile_choices()
         self.root.after(150, self._drain_events)
 
     def _entry(self, parent, row, label, key, width=64, browse=None):
@@ -1937,8 +2001,11 @@ class App:
             self.vars[key] = var
             ttk.Entry(files, textvariable=var, width=12).grid(row=row, column=1, sticky="w", padx=4, pady=3)
             row += 1
-        ttk.Label(files, text="源工作表留空=默认首表；结束行留空时从起始行扫描，遇该表所有已用列均为空的整行即在上一行停止，无空边界则用最后非空行。复制范围内的空行仍会跳过并紧凑追加；数据中间若有全空行，请填写显式结束行或移除空行。",
-                  foreground="#4b5563", wraplength=1180, justify="left").grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=3)
+        ttk.Label(files, text="模板前缀匹配长度 N（1–120）").grid(row=5, column=0, sticky="w", padx=(8, 8), pady=3)
+        self.vars["template_prefix_length"] = self.tk.StringVar(value=str(self.settings.get("template_prefix_length", 5)))
+        ttk.Entry(files, textvariable=self.vars["template_prefix_length"], width=8).grid(row=5, column=1, sticky="w", padx=4, pady=3)
+        ttk.Label(files, text="选模板时按文件名（不含扩展名）前 N 个字符匹配已保存配置；无匹配时不会自动套用其他配置。",
+                  foreground="#4b5563", wraplength=1180, justify="left").grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=3)
 
         target_box = ttk.LabelFrame(outer, text="目标子表配置（可添加多个；源文件按列表顺序追加）", padding=7)
         target_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
@@ -2007,6 +2074,7 @@ class App:
             (("sheet", "工作表", 150), ("range", "处理范围", 120), ("has_header", "含表头", 80), ("key_mode", "判重方式", 100), ("key_columns", "关键列", 130)))
         self.format_convert_tree = self._create_operation_tab(area_tabs, "FormatConvert", "FormatConvert",
             (("sheet", "工作表", 150), ("range", "处理范围", 140), ("mode", "目标类型", 100)))
+        self.workflow_tree = self._create_workflow_tab(area_tabs)
         selector_help = ("范围选择（映射区保持普通矩形语法）：单格 A1=整表，A5=整行5，D1=整列D；"
                          "B3,B3=单格；两个不同端点如 D8,B3=自动规范化的矩形。Excel 上限 XFD / 1048576 行。"
                          f"图片限 {MAX_IMAGE_ROWS} 行、{MAX_IMAGE_COLUMNS} 列、{MAX_IMAGE_CELLS:,} 格；文本整行/整列/整表按工作表已用范围解析，"
@@ -2023,6 +2091,13 @@ class App:
         ttk.Button(controls, text="加载配置…", command=self._import_config).pack(side="left", padx=5)
         ttk.Button(controls, text="保存为默认配置", command=self._save_default).pack(side="left", padx=5)
         ttk.Button(controls, text="恢复默认", command=self._reset_config).pack(side="left", padx=5)
+        ttk.Label(controls, text="命名配置").pack(side="left", padx=(12, 3))
+        self.profile_choice = self.tk.StringVar(value=self.active_profile_name)
+        self.profile_combo = ttk.Combobox(controls, textvariable=self.profile_choice, state="readonly", width=18)
+        self.profile_combo.pack(side="left", padx=3)
+        ttk.Button(controls, text="新建并保存", command=self._new_profile).pack(side="left", padx=3)
+        ttk.Button(controls, text="保存当前", command=self._save_current_profile).pack(side="left", padx=3)
+        ttk.Button(controls, text="载入所选", command=self._load_selected_profile).pack(side="left", padx=3)
         self.progress = ttk.Progressbar(controls, mode="indeterminate", length=160)
         self.progress.pack(side="right", padx=5)
 
@@ -2042,6 +2117,106 @@ class App:
         self.log_text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self._log("为每个目标子表维护有序源文件列表；源工作表名留空默认首表，下一份源会紧接已复制记录追加。")
+
+    def _create_workflow_tab(self, notebook):
+        ttk = self.ttk
+        page = ttk.Frame(notebook, padding=6)
+        notebook.add(page, text="模块工作流")
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(1, weight=1)
+        ttk.Label(page, text="添加模块并用上移/下移定制执行顺序。核心依赖不可颠倒；分列、去重、格式转换可互换，图片与文本输出可互换。非法顺序会在保存或开始处理时给出具体原因。",
+                  wraplength=1080, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 5))
+        self.workflow_tree = ttk.Treeview(page, columns=("module", "label", "role"), show="headings", height=7, selectmode="browse")
+        for column, title, width in (("module", "模块 ID", 190), ("label", "模块名称", 190), ("role", "配置/依赖说明", 470)):
+            self.workflow_tree.heading(column, text=title)
+            self.workflow_tree.column(column, width=width, anchor="w")
+        self.workflow_tree.grid(row=1, column=0, sticky="nsew")
+        controls = ttk.Frame(page)
+        controls.grid(row=2, column=0, sticky="w", pady=(5, 0))
+        self.module_choice = self.tk.StringVar()
+        self.module_combo = ttk.Combobox(controls, textvariable=self.module_choice, state="readonly", width=34)
+        self.module_combo.pack(side="left", padx=2)
+        ttk.Button(controls, text="添加模块", command=self._add_workflow_module).pack(side="left", padx=2)
+        ttk.Button(controls, text="移除所选", command=self._remove_workflow_module).pack(side="left", padx=2)
+        ttk.Button(controls, text="上移", command=lambda: self._move_workflow_module(-1)).pack(side="left", padx=2)
+        ttk.Button(controls, text="下移", command=lambda: self._move_workflow_module(1)).pack(side="left", padx=2)
+        return self.workflow_tree
+
+    def _render_workflow(self):
+        for item in self.workflow_tree.get_children():
+            self.workflow_tree.delete(item)
+        workflow = self.settings.get("workflow", DEFAULT_WORKFLOW)
+        descriptions = {
+            "template_cleanup": "保留模板格式/公式种子，清理旧数据",
+            "pre_mapping": "读取模板原值并在源数据前写入",
+            "source_copy": "按目标表及源文件列表追加数据",
+            "formula_fill": "按复制数据行数填充公式",
+            "formula_recalc": "首次完整重算供结果映射读取",
+            "result_mapping": "把公式结果写到配置目标列",
+            "post_mapping": "公式结果映射后执行模板内部写入",
+            "TextToColumns": "区域处理阶段，可与另两项区域操作互换",
+            "Deduplicate": "区域处理阶段，可与另两项区域操作互换",
+            "FormatConvert": "区域处理阶段，可与另两项区域操作互换",
+            "final_recalc_save": "所有工作簿写入后最终完整重算并保存",
+            "image_output": "只读末端输出，必须在最终保存后",
+            "text_output": "只读末端输出，必须在最终保存后",
+        }
+        for index, module_id in enumerate(workflow):
+            self.workflow_tree.insert("", "end", iid=str(index),
+                                      values=(module_id, MODULE_LABELS.get(module_id, module_id), descriptions.get(module_id, "")))
+        available = [f"{key} — {label}" for key, label in MODULE_LABELS.items() if key not in workflow]
+        self.module_combo.configure(values=available)
+        if self.module_choice.get() not in available:
+            self.module_choice.set(available[0] if available else "")
+
+    def _change_workflow(self, candidate):
+        previous = list(self.settings.get("workflow", DEFAULT_WORKFLOW))
+        self.settings["workflow"] = candidate
+        try:
+            validate_workflow(self.settings)
+            _validate_region_module_dependencies(self.settings)
+        except (ValueError, ProcessingError) as exc:
+            self.settings["workflow"] = previous
+            self.messagebox.showerror(APP_NAME, str(exc))
+            return False
+        self._render_workflow()
+        return True
+
+    def _add_workflow_module(self):
+        selected = self.module_choice.get().split(" — ", 1)[0]
+        if selected in MODULE_LABELS and selected not in self.settings.get("workflow", []):
+            candidate = add_workflow_module(list(self.settings.get("workflow", [])), selected)
+            self._change_workflow(candidate)
+
+    def _remove_workflow_module(self):
+        selected = self.workflow_tree.selection()
+        if not selected:
+            return
+        index = int(selected[0])
+        candidate = remove_workflow_module(list(self.settings.get("workflow", DEFAULT_WORKFLOW)), index)
+        self._change_workflow(candidate)
+
+    def _move_workflow_module(self, direction):
+        selected = self.workflow_tree.selection()
+        if not selected:
+            return
+        index = int(selected[0])
+        destination = index + direction
+        previous = list(self.settings.get("workflow", DEFAULT_WORKFLOW))
+        if not 0 <= destination < len(previous):
+            return
+        candidate = move_workflow_module(previous, index, direction)
+        if self._change_workflow(candidate):
+            self.workflow_tree.selection_set(str(destination))
+            self.workflow_tree.focus(str(destination))
+
+    def _refresh_profile_choices(self):
+        names = list_profiles(PROFILE_DIR)
+        self.profile_combo.configure(values=names)
+        if self.active_profile_name in names:
+            self.profile_choice.set(self.active_profile_name)
+        elif self.profile_choice.get() not in names:
+            self.profile_choice.set("")
 
     def _create_area_tab(self, notebook, title, key, columns):
         ttk = self.ttk
@@ -2544,6 +2719,28 @@ class App:
         path = self.filedialog.askopenfilename(filetypes=[("Excel 工作簿（无宏）", "*.xlsx")])
         if path:
             self.vars["template_path"].set(path)
+            try:
+                prefix_length = int(self.vars["template_prefix_length"].get())
+                matches = matching_profiles(path, prefix_length, PROFILE_DIR)
+            except Exception as exc:
+                self.messagebox.showerror(APP_NAME, str(exc))
+                return
+            if not matches:
+                self.messagebox.showinfo(APP_NAME, f"没有已保存配置与模板名“{Path(path).stem}”前 {prefix_length} 个字符匹配。\n未自动载入其他配置；当前界面配置保持不变。")
+            elif len(matches) == 1:
+                name = matches[0]
+                if self.messagebox.askyesno(APP_NAME, f"找到唯一匹配配置“{name}”。是否载入？"):
+                    try:
+                        self._load_profile_named(name, selected_template_path=path)
+                    except Exception as exc:
+                        self.messagebox.showerror(APP_NAME, f"载入匹配配置失败：\n{exc}")
+            else:
+                name = self._choose_profile_dialog(matches)
+                if name:
+                    try:
+                        self._load_profile_named(name, selected_template_path=path)
+                    except Exception as exc:
+                        self.messagebox.showerror(APP_NAME, f"载入匹配配置失败：\n{exc}")
 
     def _browse_output_dir(self):
         path = self.filedialog.askdirectory()
@@ -2555,7 +2752,9 @@ class App:
             raise ProcessingError("当前目标表的保留标题行数和粘贴起始行必须是整数。")
         settings = {key: var.get().strip() for key, var in self.vars.items()}
         settings["config_version"] = CONFIG_VERSION
+        settings["config_name"] = self.active_profile_name
         settings["jobs"] = deepcopy(self.settings["jobs"])
+        settings["workflow"] = deepcopy(self.settings.get("workflow", DEFAULT_WORKFLOW))
         for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs"):
             settings[key] = deepcopy(self.settings.get(key, []))
         for key in ("TextToColumns", "Deduplicate", "FormatConvert"):
@@ -2572,6 +2771,87 @@ class App:
             self.messagebox.showinfo(APP_NAME, f"默认配置已保存：\n{CONFIG_PATH}")
         except Exception as exc:
             self.messagebox.showerror(APP_NAME, str(exc))
+
+    def _new_profile(self):
+        from tkinter import simpledialog
+        name = simpledialog.askstring(APP_NAME, "新配置名称：", parent=self.root)
+        if name is not None and name.strip():
+            self._save_profile_named(name.strip())
+
+    def _save_current_profile(self):
+        name = self.active_profile_name or self.profile_choice.get().strip()
+        if not name:
+            self._new_profile()
+            return
+        self._save_profile_named(name)
+
+    def _save_profile_named(self, name):
+        try:
+            settings = self._collect()
+            settings["config_name"] = name
+            validate_static_settings(settings)
+            if name in list_profiles(PROFILE_DIR) and not self.messagebox.askyesno(APP_NAME, f"配置“{name}”已存在，是否覆盖保存？"):
+                return
+            path = save_profile(settings, name, PROFILE_DIR)
+            self.settings = normalize_settings(settings)
+            self.active_profile_name = name
+            self.profile_choice.set(name)
+            self._refresh_profile_choices()
+            self.messagebox.showinfo(APP_NAME, f"已保存命名配置“{name}”：\n{path}")
+        except Exception as exc:
+            self.messagebox.showerror(APP_NAME, str(exc))
+
+    def _apply_settings_to_gui(self, settings, active_name=None):
+        normalized = normalize_settings(settings)
+        self.settings = normalized
+        self.active_profile_name = str(active_name if active_name is not None else normalized.get("config_name", ""))
+        for key, var in self.vars.items():
+            if key in normalized:
+                var.set(str(normalized.get(key, "")))
+        for key, var in self.operation_enabled.items():
+            var.set(bool(normalized.get(key, {}).get("enabled", False)))
+        self.profile_choice.set(self.active_profile_name)
+        self._render_jobs()
+        self._render_area_configs()
+        self._render_workflow()
+        self._refresh_profile_choices()
+
+    def _load_profile_named(self, name, selected_template_path=None):
+        settings = load_profile(name, PROFILE_DIR)
+        if selected_template_path:
+            settings["template_path"] = selected_template_path
+        validate_static_settings(settings)
+        self._apply_settings_to_gui(settings, name)
+
+    def _load_selected_profile(self):
+        name = self.profile_choice.get().strip()
+        if not name:
+            self.messagebox.showinfo(APP_NAME, "当前没有可载入的命名配置。")
+            return
+        try:
+            self._load_profile_named(name)
+        except Exception as exc:
+            self.messagebox.showerror(APP_NAME, f"载入配置失败：\n{exc}")
+
+    def _choose_profile_dialog(self, names):
+        dialog = self.tk.Toplevel(self.root)
+        dialog.title("选择匹配配置")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self.ttk.Label(dialog, text="模板前缀匹配到多份配置，请选择：").pack(anchor="w", padx=10, pady=(10, 4))
+        choice = self.tk.StringVar(value=names[0])
+        combo = self.ttk.Combobox(dialog, textvariable=choice, values=names, state="readonly", width=32)
+        combo.pack(padx=10, pady=4)
+        result = {"name": None}
+        buttons = self.ttk.Frame(dialog)
+        buttons.pack(pady=8)
+        def accept():
+            result["name"] = choice.get()
+            dialog.destroy()
+        self.ttk.Button(buttons, text="载入所选", command=accept).pack(side="left", padx=4)
+        self.ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="left", padx=4)
+        dialog.wait_window()
+        return result["name"]
 
     def _export_config(self):
         try:
@@ -2593,22 +2873,14 @@ class App:
         try:
             settings = load_settings(path)
             validate_static_settings(settings)
-            self.settings = settings
-            for key in ("template_path", "output_dir", "output_filename", "copy_start_col", "copy_end_col"):
-                self.vars[key].set(str(settings.get(key, "")))
-            self._render_jobs()
-            self._render_area_configs()
+            self._apply_settings_to_gui(settings)
         except Exception as exc:
             self.messagebox.showerror(APP_NAME, f"加载配置失败：\n{exc}")
 
     def _reset_config(self):
         if not self.messagebox.askyesno(APP_NAME, "恢复程序内置示例配置？不会删除已保存或导出的配置文件。"):
             return
-        self.settings = deepcopy(DEFAULT_SETTINGS)
-        for key in ("template_path", "output_dir", "output_filename", "copy_start_col", "copy_end_col"):
-            self.vars[key].set(str(self.settings.get(key, "")))
-        self._render_jobs()
-        self._render_area_configs()
+        self._apply_settings_to_gui(deepcopy(DEFAULT_SETTINGS), active_name="")
 
     def _log(self, message: str):
         self.log_text.configure(state="normal")

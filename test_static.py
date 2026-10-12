@@ -293,6 +293,10 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual(4, migrated["jobs"][0]["sources"][0]["copy_start_row"])
         self.assertEqual({"result_col": "EQ", "target_col": "DG", "write_as": "value"}, migrated["jobs"][1]["mappings"][0])
         main.validate_static_settings(migrated)
+        migrated_v5 = main.normalize_settings({"config_version": 5, "jobs": deepcopy(main.DEFAULT_SETTINGS["jobs"])})
+        self.assertEqual(6, migrated_v5["config_version"])
+        self.assertEqual(main.DEFAULT_WORKFLOW, migrated_v5["workflow"])
+        self.assertEqual(5, migrated_v5["template_prefix_length"])
 
     def test_ranges_and_mapping_validation(self):
         self.assertEqual(111, main.column_number("DG"))
@@ -319,6 +323,50 @@ class StaticConfigurationTests(unittest.TestCase):
         with self.assertRaises(main.ProcessingError):
             main.validate_static_settings(invalid)
 
+    def test_workflow_module_add_order_and_dependency_errors(self):
+        workflow = list(main.DEFAULT_SETTINGS["workflow"])
+        workflow.remove("TextToColumns")
+        added = main.add_workflow_module(workflow, "TextToColumns")
+        self.assertIn("TextToColumns", added)
+        self.assertLess(added.index("TextToColumns"), added.index("Deduplicate"))
+        with self.assertRaisesRegex(ValueError, "已在工作流中"):
+            main.add_workflow_module(added, "TextToColumns")
+        removed = main.remove_workflow_module(added, added.index("TextToColumns"))
+        self.assertNotIn("TextToColumns", removed)
+        removable_settings = deepcopy(main.DEFAULT_SETTINGS)
+        removable_settings["workflow"] = removed
+        main.validate_static_settings(removable_settings)
+        missing_core = main.remove_workflow_module(list(main.DEFAULT_SETTINGS["workflow"]),
+                                                   main.DEFAULT_SETTINGS["workflow"].index("formula_fill"))
+        with self.assertRaisesRegex(main.ProcessingError, "不能移除必需模块.*公式填充"):
+            main.validate_static_settings({**deepcopy(main.DEFAULT_SETTINGS), "workflow": missing_core})
+
+        reordered = list(main.DEFAULT_SETTINGS["workflow"])
+        reordered = main.move_workflow_module(reordered, reordered.index("FormatConvert"), -2)
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["workflow"] = reordered
+        main.validate_static_settings(settings)
+        self.assertLess(reordered.index("FormatConvert"), reordered.index("TextToColumns"))
+
+        invalid = deepcopy(main.DEFAULT_SETTINGS)
+        invalid["workflow"] = main.move_workflow_module(
+            list(invalid["workflow"]), invalid["workflow"].index("formula_fill"), 1
+        )
+        with self.assertRaisesRegex(main.ProcessingError, "公式填充.*首次完整重算"):
+            main.validate_static_settings(invalid)
+
+        invalid = deepcopy(main.DEFAULT_SETTINGS)
+        invalid["TextToColumns"] = {"enabled": True, "rules": [{
+            "sheet": "T", "range": "A1:A3", "delimiter": "|", "output_start_col": "H",
+            "column_formats": ["text", "text"]}]}
+        invalid["Deduplicate"] = {"enabled": True, "rules": [{
+            "sheet": "T", "range": "H1:I3", "has_header": False, "key_mode": "row", "key_columns": []}]}
+        invalid["workflow"] = main.move_workflow_module(
+            list(invalid["workflow"]), invalid["workflow"].index("Deduplicate"), -1
+        )
+        with self.assertRaisesRegex(main.ProcessingError, "输入/输出区域与.*重叠"):
+            main.validate_static_settings(invalid)
+
     def test_shared_area_selector_semantics_and_excel_limits(self):
         self.assertEqual(((1, 1, 16_384, 1_048_576), "sheet"), main._parse_selection_details("A1"))
         self.assertEqual(((1, 5, 16_384, 5), "row"), main._parse_selection_details("A5"))
@@ -341,6 +389,8 @@ class StaticConfigurationTests(unittest.TestCase):
         main.validate_static_settings(sample)
         self.assertEqual([3, 3, 4], [job["start_row"] for job in sample["jobs"]])
         self.assertEqual(["EB:EN", "EB:EU", "EB:FV"], [job["formula_range"] for job in sample["jobs"]])
+        self.assertEqual(main.DEFAULT_WORKFLOW, sample["workflow"])
+        self.assertEqual(6, sample["config_version"])
 
     def test_missing_source_path_is_located_and_reported_before_processing(self):
         settings = deepcopy(main.DEFAULT_SETTINGS)
@@ -376,12 +426,36 @@ class StaticConfigurationTests(unittest.TestCase):
             settings["TextToColumns"] = {"enabled": True, "rules": [{"sheet": "模板甲", "range": "A2:A8", "delimiter": "|", "output_start_col": "D", "column_formats": ["text", "number"]}]}
             settings["Deduplicate"] = {"enabled": True, "rules": [{"sheet": "模板乙", "range": "A1:C8", "has_header": True, "key_mode": "columns", "key_columns": ["A", "C"]}]}
             settings["FormatConvert"] = {"enabled": True, "rules": [{"sheet": "模板丙", "range": "D2:D8", "mode": "date"}]}
+            settings["config_name"] = "月度汇总配置"
+            settings["template_prefix_length"] = 7
             main.save_settings(settings, path)
             loaded = main.load_settings(path)
             self.assertEqual(settings["jobs"][0], loaded["jobs"][0])
             self.assertEqual(main.CONFIG_VERSION, loaded["config_version"])
-            for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs", "TextToColumns", "Deduplicate", "FormatConvert"):
+            for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs", "TextToColumns", "Deduplicate", "FormatConvert", "workflow", "config_name", "template_prefix_length"):
                 self.assertEqual(settings[key], loaded[key])
+
+    def test_named_profile_save_load_and_template_prefix_match_cardinality(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile_dir = Path(td) / "profiles"
+            daily = deepcopy(main.DEFAULT_SETTINGS)
+            daily.update({"config_name": "日报流程", "template_path": "C:/templates/AB日报模板.xlsx", "template_prefix_length": 4})
+            weekly = deepcopy(main.DEFAULT_SETTINGS)
+            weekly.update({"config_name": "周报流程", "template_path": "C:/templates/AB周报模板.xlsx", "template_prefix_length": 2})
+            main.save_profile(daily, "日报流程", profile_dir)
+            main.save_profile(weekly, "周报流程", profile_dir)
+            self.assertEqual(["周报流程", "日报流程"], main.list_profiles(profile_dir))
+            loaded = main.load_profile("日报流程", profile_dir)
+            self.assertEqual("日报流程", loaded["config_name"])
+            self.assertEqual(4, loaded["template_prefix_length"])
+            self.assertEqual("C:/templates/AB日报模板.xlsx", loaded["template_path"])
+
+            selected = "D:/input/AB日报_20261005.xlsx"
+            self.assertEqual([], main.matching_profiles("D:/input/ZZ库存.xlsx", 2, profile_dir))
+            self.assertEqual(["日报流程"], main.matching_profiles(selected, 4, profile_dir))
+            self.assertEqual(["周报流程", "日报流程"], main.matching_profiles(selected, 2, profile_dir))
+            with self.assertRaisesRegex(ValueError, "介于 1 和 120"):
+                main.matching_profiles(selected, 0, profile_dir)
 
     def test_pure_region_processing_and_text_area_format(self):
         split, columns = main.split_text_column(["001|2024-02-01", "002|2024-02-02"], "|", ["number", "date"])
@@ -651,6 +725,44 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertLess(convert_write, second_recalc)
             self.assertLess(second_recalc, save)
 
+    def test_independent_region_modules_execute_in_custom_workflow_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "custom-region-order.xlsx"
+            make_test_workbook(path, [("数据", {
+                1: {1: "x|y", 5: "dup", 9: "42"},
+                2: {5: "dup"},
+                3: {5: "keep"},
+            })])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["TextToColumns"] = {"enabled": True, "rules": [{
+                "sheet": "数据", "range": "A1:A1", "delimiter": "|", "output_start_col": "C",
+                "column_formats": ["text", "text"]}]}
+            settings["Deduplicate"] = {"enabled": True, "rules": [{
+                "sheet": "数据", "range": "E1:E3", "has_header": False, "key_mode": "row", "key_columns": []}]}
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "sheet": "数据", "range": "I1:I1", "mode": "number"}]}
+            order = list(settings["workflow"])
+            region_start = order.index("TextToColumns")
+            for module_id in ("TextToColumns", "Deduplicate", "FormatConvert"):
+                order.remove(module_id)
+            order[region_start:region_start] = ["FormatConvert", "Deduplicate", "TextToColumns"]
+            settings["workflow"] = order
+            main.validate_static_settings(settings)
+
+            events = []
+            fake_workbook = FakeComWorkbook(path, events)
+            logs = []
+            self.assertTrue(main._apply_region_processing(fake_workbook, settings, [], logs.append))
+            output = fake_workbook.workbook["数据"]
+            self.assertEqual(("x", "y"), (output["C1"].value, output["D1"].value))
+            self.assertEqual(("dup", "keep", None), (output["E1"].value, output["E2"].value, output["E3"].value))
+            self.assertEqual(42, output["I1"].value)
+            action_logs = [line for line in logs if line.startswith("已执行")]
+            self.assertIn("已执行格式转换", action_logs[0])
+            self.assertIn("已执行去重", action_logs[1])
+            self.assertIn("已执行文本分列", action_logs[2])
+            fake_workbook.workbook.close()
+
     def test_terminal_image_and_text_outputs_run_only_after_saved_workbook(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -660,6 +772,9 @@ class StaticConfigurationTests(unittest.TestCase):
                              "output_dir": str(fake / "output"), "output_filename": "terminal-outputs.xlsx",
                              "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}],
                              "text_outputs": [{"sheet": "2当天归档", "range": "A1:B2"}]})
+            settings["workflow"] = main.move_workflow_module(
+                list(settings["workflow"]), settings["workflow"].index("text_output"), -1
+            )
             for idx, job in enumerate(settings["jobs"], 1):
                 job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
                                    "copy_start_row": 2, "copy_end_row": 3}]
@@ -689,7 +804,7 @@ class StaticConfigurationTests(unittest.TestCase):
                  mock.patch.object(main, "_read_text_output_areas", side_effect=fake_text):
                 result = main.process_workbooks(settings, lambda _msg: None, previews.extend)
             self.assertTrue(result.is_file())
-            self.assertEqual(["workbook-save", "image-export", "text-read"], events)
+            self.assertEqual(["workbook-save", "text-read", "image-export"], events)
             self.assertEqual("preview", previews[0]["text"])
             self.assertEqual(b"FAKE-PNG", (fake / "output" / "simulated.png").read_bytes())
 
