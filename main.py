@@ -70,6 +70,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "template_path": "",
     "output_dir": "",
     "output_filename": "处理结果.xlsx",
+    "output_filename_custom": None,
     "copy_start_col": "A",
     "copy_end_col": "",
     "pre_mappings": [],
@@ -403,6 +404,24 @@ def _areas_overlap(first: tuple[int, int, int, int], second: tuple[int, int, int
             and first[1] <= second[3] and second[1] <= first[3])
 
 
+def _template_output_filename(template_path: Any) -> str:
+    """Return the template basename in a platform-independent way, including its suffix."""
+    raw = str(template_path or "").strip().replace("\\", "/")
+    return raw.rsplit("/", 1)[-1] if raw else ""
+
+
+def _filename_is_custom(raw_settings: dict[str, Any], filename: str) -> bool:
+    marker = raw_settings.get("output_filename_custom")
+    if marker is not None:
+        if isinstance(marker, str):
+            return marker.strip().lower() in ("1", "true", "yes", "on")
+        return bool(marker)
+    # Older configurations did not record whether the field was auto-generated.
+    # Treat the former generic default and the current template basename as automatic.
+    template_name = _template_output_filename(raw_settings.get("template_path"))
+    return bool(filename and filename not in ("处理结果.xlsx", template_name))
+
+
 def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
     """Return the current schema; migrate the fixed three-source v1 schema in memory."""
     if not isinstance(raw, dict):
@@ -479,6 +498,13 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
         raise ProcessingError("模板匹配前缀长度 N 必须介于 1 和 120。")
     settings["template_prefix_length"] = prefix_length
     settings["config_name"] = str(settings.get("config_name") or "").strip()
+    filename = str(settings.get("output_filename") or "").strip()
+    is_custom_filename = _filename_is_custom(raw, filename)
+    settings["output_filename_custom"] = is_custom_filename
+    if not is_custom_filename:
+        template_filename = _template_output_filename(settings.get("template_path"))
+        if template_filename:
+            settings["output_filename"] = template_filename
     settings.pop("sources", None)
     settings["config_version"] = CONFIG_VERSION
     return settings
@@ -1335,6 +1361,11 @@ def _validate_inputs(raw_settings: dict[str, Any]) -> tuple[Path, Path]:
     if not filename.lower().endswith(".xlsx"):
         filename += ".xlsx"
     final_path = (output_dir / filename).resolve()
+    if os.path.normcase(str(final_path)) == os.path.normcase(str(template_path)):
+        raise ProcessingError(
+            f"输出文件名与模板同名且位于同一目录，不能覆盖模板：\n{template_path}\n"
+            "请改名或选择其他输出目录。"
+        )
     if final_path.exists():
         raise ProcessingError(f"输出文件已存在，为防止覆盖任何文件已停止：\n{final_path}\n请更改输出文件名或选择其他输出目录。")
     if final_path in all_inputs:
@@ -1867,8 +1898,38 @@ def _publish_staging_workbook(staging_path: Path, final_path: Path) -> None:
             raise ProcessingError(f"输出文件在处理过程中被创建；为避免覆盖已停止：\n{final_path}") from exc
 
 
+def _pump_wps_messages(pythoncom, wait_seconds: float = 0.0) -> None:
+    if pythoncom is not None:
+        try:
+            pump = getattr(pythoncom, "PumpWaitingMessages", None)
+            if callable(pump):
+                pump()
+        except Exception:
+            pass
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+        if pythoncom is not None:
+            try:
+                pump = getattr(pythoncom, "PumpWaitingMessages", None)
+                if callable(pump):
+                    pump()
+            except Exception:
+                pass
+
+
+def _activate_wps_object(target) -> None:
+    if target is None:
+        return
+    try:
+        activate = getattr(target, "Activate", None)
+        if callable(activate):
+            activate()
+    except Exception:
+        pass
+
+
 def _export_image_areas_from_workbook(workbook, image_outputs: list[dict[str, Any]], output_dir: Path,
-                                      log: Callable[[str], None]) -> list[Path]:
+                                      log: Callable[[str], None], application=None, pythoncom=None) -> list[Path]:
     generated: list[Path] = []
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -1903,47 +1964,72 @@ def _export_image_areas_from_workbook(workbook, image_outputs: list[dict[str, An
             os.close(temp_handle)
             temp_path = Path(temp_name)
             temp_path.unlink(missing_ok=True)
-            chart_object = None
             try:
-                try:
+                copy_modes = ((1, 2), (1, -4147), (1, 2))
+                failures: list[tuple[str, str]] = []
+                exported = False
+                for attempt, (appearance, picture_format) in enumerate(copy_modes, 1):
+                    chart_object = None
+                    stage = "CopyPicture 阶段"
+                    temp_path.unlink(missing_ok=True)
                     try:
-                        picture_range.CopyPicture(Appearance=1, Format=2)
-                    except TypeError:
-                        picture_range.CopyPicture(1, 2)
-                except Exception as exc:
+                        if attempt > 1:
+                            _pump_wps_messages(pythoncom, 0.08 if pythoncom is not None else 0.0)
+                        _activate_wps_object(application)
+                        _activate_wps_object(workbook)
+                        _activate_wps_object(worksheet)
+                        try:
+                            select_range = getattr(picture_range, "Select", None)
+                            if callable(select_range):
+                                select_range()
+                        except Exception:
+                            pass
+
+                        try:
+                            picture_range.CopyPicture(Appearance=appearance, Format=picture_format)
+                        except TypeError:
+                            picture_range.CopyPicture(appearance, picture_format)
+                        _pump_wps_messages(pythoncom, 0.12 if pythoncom is not None else 0.0)
+
+                        stage = "图表创建阶段"
+                        chart_objects = worksheet.ChartObjects()
+                        chart_object = chart_objects.Add(
+                            0, 0, max(1.0, float(picture_range.Width)), max(1.0, float(picture_range.Height))
+                        )
+                        _activate_wps_object(chart_object)
+                        chart = chart_object.Chart
+                        stage = "图表粘贴阶段"
+                        chart.Paste()
+                        _pump_wps_messages(pythoncom, 0.12 if pythoncom is not None else 0.0)
+
+                        stage = "PNG 导出阶段"
+                        try:
+                            export_result = chart.Export(str(temp_path), "PNG")
+                        except TypeError:
+                            export_result = chart.Export(Filename=str(temp_path), FilterName="PNG")
+                        if export_result is False or not temp_path.is_file() or temp_path.stat().st_size == 0:
+                            raise RuntimeError("Chart.Export 未生成有效PNG文件")
+                        exported = True
+                        break
+                    except Exception as exc:
+                        failures.append((stage, f"{type(exc).__name__}: {exc}"))
+                    finally:
+                        if chart_object is not None:
+                            try:
+                                chart_object.Delete()
+                            except Exception:
+                                pass
+                        if not exported:
+                            temp_path.unlink(missing_ok=True)
+
+                if not exported:
+                    attempt_summary = "；".join(f"第 {i} 次 {stage}：{error}" for i, (stage, error) in enumerate(failures, 1))
+                    last_stage = failures[-1][0] if failures else "PNG 导出阶段"
+                    last_error = failures[-1][1] if failures else "未获得有效 PNG 文件"
                     raise ProcessingError(
-                        f"WPS 的 CopyPicture 阶段无法复制图片区域 {sheet_name}!{area}（配置范围 {configured_area}）："
-                        f"{type(exc).__name__}: {exc}。程序未临时取消隐藏或更改行列隐藏状态；请在 WPS 中检查该范围的合并布局、"
-                        "工作表保护及当前可见区域，并确认 WPS 能复制该范围。"
-                    ) from exc
-                try:
-                    chart_object = worksheet.ChartObjects().Add(
-                        0, 0, float(picture_range.Width), float(picture_range.Height)
-                    )
-                except Exception as exc:
-                    raise ProcessingError(
-                        f"WPS 无法为图片区域 {sheet_name}!{area} 创建临时图表容器："
-                        f"{type(exc).__name__}: {exc}。请确认工作表允许创建图表对象。"
-                    ) from exc
-                chart = chart_object.Chart
-                try:
-                    chart.Paste()
-                except Exception as exc:
-                    raise ProcessingError(
-                        f"WPS 无法将已复制的区域 {sheet_name}!{area} 粘贴到临时图表："
-                        f"{type(exc).__name__}: {exc}。请确认 WPS 剪贴板/图表对象可用后重试。"
-                    ) from exc
-                try:
-                    export_result = chart.Export(str(temp_path), "PNG")
-                except Exception as exc:
-                    raise ProcessingError(
-                        f"WPS 的 PNG 导出阶段失败，区域为 {sheet_name}!{area}（配置范围 {configured_area}）："
-                        f"{type(exc).__name__}: {exc}。请确认输出目录可写且 WPS 图表导出可用。"
-                    ) from exc
-                if export_result is False or not temp_path.is_file() or temp_path.stat().st_size == 0:
-                    raise ProcessingError(
-                        f"WPS 的 PNG 导出阶段未生成有效文件：区域 {sheet_name}!{area}（配置范围 {configured_area}）。"
-                        "请确认输出目录可写，并在 WPS 中检查该区域是否可复制/粘贴到图表；程序不会为导出而取消隐藏行列。"
+                        f"WPS 的 {last_stage}失败，图片导出重试结束，区域为 {sheet_name}!{area}（配置范围 {configured_area}）："
+                        f"{last_error}。尝试记录：{attempt_summary}。程序不会裁切合并区域，也未临时取消隐藏或更改行列隐藏状态；"
+                        "请确认 WPS 剪贴板/图表导出可用、该范围可复制且输出目录可写。"
                     )
 
                 collision = 1
@@ -1967,11 +2053,6 @@ def _export_image_areas_from_workbook(workbook, image_outputs: list[dict[str, An
                             collision += 1
                 log(f"已导出图片 {sheet_name}!{area}：{target.name}")
             finally:
-                if chart_object is not None:
-                    try:
-                        chart_object.Delete()
-                    except Exception:
-                        pass
                 temp_path.unlink(missing_ok=True)
         return generated
     except Exception:
@@ -1997,7 +2078,9 @@ def _export_image_areas_wps(workbook_path: Path, image_outputs: list[dict[str, A
                 pass
         workbook = app.Workbooks.Open(str(workbook_path), UpdateLinks=0, ReadOnly=False, AddToMru=False)
         log(f"已从已保存的工作簿启动图片输出阶段（WPS {progid}）；此后不再修改工作簿。")
-        return _export_image_areas_from_workbook(workbook, image_outputs, output_dir, log)
+        return _export_image_areas_from_workbook(
+            workbook, image_outputs, output_dir, log, application=app, pythoncom=pythoncom
+        )
     except ProcessingError:
         raise
     except Exception as exc:
@@ -2295,6 +2378,8 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.settings = load_settings()
+        self.output_filename_custom = bool(self.settings.get("output_filename_custom", False))
+        self._suppress_output_filename_trace = False
         startup_migration_notices = self.settings.pop("_migration_notices", [])
         self.vars: dict[str, Any] = {}
         self.job_vars: dict[str, Any] = {}
@@ -2338,10 +2423,31 @@ class App:
         self.ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(8, 8), pady=3)
         var = self.tk.StringVar(value=str(self.settings.get(key, "")))
         self.vars[key] = var
+        if key == "output_filename":
+            var.trace_add("write", self._on_output_filename_edited)
         self.ttk.Entry(parent, textvariable=var, width=width).grid(row=row, column=1, sticky="ew", padx=4, pady=3)
         if browse:
             self.ttk.Button(parent, text="浏览…", command=browse).grid(row=row, column=2, padx=4, pady=3)
         return var
+
+    def _on_output_filename_edited(self, *_args):
+        if not self._suppress_output_filename_trace:
+            self.output_filename_custom = True
+
+    def _set_output_filename(self, value: str, custom: bool):
+        self._suppress_output_filename_trace = True
+        try:
+            self.vars["output_filename"].set(str(value))
+        finally:
+            self._suppress_output_filename_trace = False
+        self.output_filename_custom = bool(custom)
+
+    def _set_template_selected(self, path: str):
+        self.vars["template_path"].set(str(path))
+        if not self.output_filename_custom:
+            default_name = _template_output_filename(path)
+            if default_name:
+                self._set_output_filename(default_name, custom=False)
 
     def _build(self):
         ttk = self.ttk
@@ -3117,7 +3223,7 @@ class App:
     def _browse_template(self):
         path = self.filedialog.askopenfilename(filetypes=[("Excel 工作簿（无宏）", "*.xlsx")])
         if path:
-            self.vars["template_path"].set(path)
+            self._set_template_selected(path)
             try:
                 prefix_length = int(self.vars["template_prefix_length"].get())
                 matches = matching_profiles(path, prefix_length, PROFILE_DIR)
@@ -3150,6 +3256,7 @@ class App:
         if not self._commit_job_editor(show_errors=False):
             raise ProcessingError("当前目标表的保留标题行数和粘贴起始行必须是整数。")
         settings = {key: var.get().strip() for key, var in self.vars.items()}
+        settings["output_filename_custom"] = bool(self.output_filename_custom)
         settings["config_version"] = CONFIG_VERSION
         settings["config_name"] = self.active_profile_name
         settings["jobs"] = deepcopy(self.settings["jobs"])
@@ -3205,9 +3312,14 @@ class App:
         normalized = normalize_settings(settings)
         self.settings = normalized
         self.active_profile_name = str(active_name if active_name is not None else normalized.get("config_name", ""))
-        for key, var in self.vars.items():
-            if key in normalized:
-                var.set(str(normalized.get(key, "")))
+        self.output_filename_custom = bool(normalized.get("output_filename_custom", False))
+        self._suppress_output_filename_trace = True
+        try:
+            for key, var in self.vars.items():
+                if key in normalized:
+                    var.set(str(normalized.get(key, "")))
+        finally:
+            self._suppress_output_filename_trace = False
         for key, var in self.operation_enabled.items():
             var.set(bool(normalized.get(key, {}).get("enabled", False)))
         self.profile_choice.set(self.active_profile_name)
@@ -3222,6 +3334,7 @@ class App:
         settings = load_profile(name, PROFILE_DIR)
         if selected_template_path:
             settings["template_path"] = selected_template_path
+        settings = normalize_settings(settings)
         validate_static_settings(settings)
         self._apply_settings_to_gui(settings, name)
 

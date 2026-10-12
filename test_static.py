@@ -128,17 +128,24 @@ class FakePythonCom:
     def CoUninitialize(self):
         self.events.append("co-uninitialize")
 
+    def PumpWaitingMessages(self):
+        self.events.append("pump-messages")
+
 
 class FakePictureChart:
-    def __init__(self, events, should_fail=False):
+    def __init__(self, events, should_fail=False, export_state=None):
         self.events = events
         self.should_fail = should_fail
+        self.export_state = export_state
 
     def Paste(self):
         self.events.append("picture-paste")
 
     def Export(self, path, file_format):
         self.events.append(("picture-export", Path(path).name, file_format))
+        if self.export_state and self.export_state["remaining"] > 0:
+            self.export_state["remaining"] -= 1
+            raise RuntimeError("fake transient picture export failure")
         if self.should_fail:
             raise RuntimeError("fake picture export failure")
         Path(path).write_bytes(b"FAKE-PNG")
@@ -146,36 +153,48 @@ class FakePictureChart:
 
 
 class FakePictureChartObject:
-    def __init__(self, events, should_fail=False):
+    def __init__(self, events, should_fail=False, export_state=None):
         self.events = events
-        self.Chart = FakePictureChart(events, should_fail)
+        self.Chart = FakePictureChart(events, should_fail, export_state)
+
+    def Activate(self):
+        self.events.append("chart-activate")
 
     def Delete(self):
         self.events.append("chart-delete")
 
 
 class FakePictureChartObjects:
-    def __init__(self, events, should_fail=False):
+    def __init__(self, events, should_fail=False, export_state=None):
         self.events = events
         self.should_fail = should_fail
+        self.export_state = export_state
 
     def Add(self, *_args):
         self.events.append("chart-add")
-        return FakePictureChartObject(self.events, self.should_fail)
+        return FakePictureChartObject(self.events, self.should_fail, self.export_state)
 
 
 class FakePictureRange:
     Width = 120
     Height = 60
 
-    def __init__(self, address, events, should_fail_copy=False):
+    def __init__(self, address, events, should_fail_copy=False, copy_fail_remaining=None):
         self.address = address
         self.events = events
         self.should_fail_copy = should_fail_copy
+        self.copy_fail_remaining = copy_fail_remaining if copy_fail_remaining is not None else {}
 
-    def CopyPicture(self, **_kwargs):
+    def Select(self):
+        self.events.append(("range-select", self.address))
+
+    def CopyPicture(self, *args, **kwargs):
+        picture_format = kwargs.get("Format", args[1] if len(args) > 1 else None)
         self.events.append(("copy-picture", self.address))
-        if self.should_fail_copy:
+        self.events.append(("copy-picture-format", picture_format))
+        if self.should_fail_copy or self.copy_fail_remaining.get(picture_format, 0) > 0:
+            if not self.should_fail_copy:
+                self.copy_fail_remaining[picture_format] -= 1
             raise RuntimeError("fake picture copy failure")
 
 
@@ -200,16 +219,22 @@ class FakePictureCell:
 
 
 class FakePictureWorksheet:
-    def __init__(self, title, events, should_fail=False, merges=None, copy_should_fail=False):
+    def __init__(self, title, events, should_fail=False, merges=None, copy_should_fail=False,
+                 copy_fail_remaining=None, export_state=None):
         self.title = title
         self.events = events
         self.should_fail = should_fail
         self.copy_should_fail = copy_should_fail
+        self.copy_fail_remaining = copy_fail_remaining if copy_fail_remaining is not None else {}
+        self.export_state = export_state
         self.merges = list(merges or [])
         self.hidden_state = {"columns": {"C": True, "E": True}, "rows": {3: True}}
 
     def Range(self, address):
-        return FakePictureRange(address, self.events, self.copy_should_fail)
+        return FakePictureRange(address, self.events, self.copy_should_fail, self.copy_fail_remaining)
+
+    def Activate(self):
+        self.events.append(("worksheet-activate", self.title))
 
     def Cells(self, row, col):
         for bounds in self.merges:
@@ -219,23 +244,41 @@ class FakePictureWorksheet:
         return FakePictureCell(None)
 
     def ChartObjects(self):
-        return FakePictureChartObjects(self.events, self.should_fail)
+        return FakePictureChartObjects(self.events, self.should_fail, self.export_state)
 
 
 class FakePictureWorkbook:
-    def __init__(self, events, should_fail=False, merges_by_sheet=None, copy_should_fail=False):
+    def __init__(self, events, should_fail=False, merges_by_sheet=None, copy_should_fail=False,
+                 copy_fail_formats=None, export_failures=0):
         self.events = events
         self.should_fail = should_fail
         self.merges_by_sheet = merges_by_sheet or {}
         self.copy_should_fail = copy_should_fail
+        self.copy_fail_remaining = dict(copy_fail_formats or {})
+        self.export_state = {"remaining": export_failures}
         self.worksheets = {}
+
+    def Activate(self):
+        self.events.append("workbook-activate")
 
     def Worksheets(self, name):
         if name not in self.worksheets:
             self.worksheets[name] = FakePictureWorksheet(
-                name, self.events, self.should_fail, self.merges_by_sheet.get(name, []), self.copy_should_fail
+                name, self.events, self.should_fail, self.merges_by_sheet.get(name, []), self.copy_should_fail,
+                self.copy_fail_remaining, self.export_state
             )
         return self.worksheets[name]
+
+
+class FakeOutputFilenameVar:
+    def __init__(self, value=""):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
 
 
 def make_test_workbook(path: Path, sheets: list[tuple[str, dict[int, dict[int, object]]]]) -> None:
@@ -574,6 +617,21 @@ class StaticConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(main.ProcessingError, '目标表“1当天派单”的第 1 份源工作簿尚未配置文件路径'):
                 main._validate_inputs(invalid)
 
+    def test_output_name_matching_template_in_same_directory_is_rejected_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = create_fake_data(Path(td) / "fake")
+            template = fake / "template.xlsx"
+            original = template.read_bytes()
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({"template_path": str(template), "output_dir": str(fake),
+                             "output_filename": template.name, "output_filename_custom": False,
+                             "copy_end_col": "C"})
+            for index, job in enumerate(settings["jobs"], 1):
+                job["sources"][0]["path"] = str(fake / f"{index}.xlsx")
+            with self.assertRaisesRegex(main.ProcessingError, "不能覆盖模板"):
+                main._validate_inputs(settings)
+            self.assertEqual(original, template.read_bytes())
+
     def test_save_load_reusable_configuration_round_trip(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "reusable.json"
@@ -620,6 +678,67 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertEqual(["周报流程", "日报流程"], main.matching_profiles(selected, 2, profile_dir))
             with self.assertRaisesRegex(ValueError, "介于 1 和 120"):
                 main.matching_profiles(selected, 0, profile_dir)
+
+    def test_template_selection_updates_automatic_name_but_keeps_explicit_custom_name(self):
+        app = main.App.__new__(main.App)
+        app.vars = {
+            "template_path": FakeOutputFilenameVar(""),
+            "output_filename": FakeOutputFilenameVar("处理结果.xlsx"),
+        }
+        app.output_filename_custom = False
+        app._suppress_output_filename_trace = False
+
+        app._set_template_selected("C:/templates/装移机在途通报V92026.10.5.xlsx")
+        self.assertEqual("装移机在途通报V92026.10.5.xlsx", app.vars["output_filename"].get())
+        app._set_template_selected("D:/templates/another.xlsx")
+        self.assertEqual("another.xlsx", app.vars["output_filename"].get())
+
+        app.vars["output_filename"].set("手动命名.xlsx")
+        app._on_output_filename_edited()
+        self.assertTrue(app.output_filename_custom)
+        app._set_template_selected("E:/templates/third.xlsx")
+        self.assertEqual("手动命名.xlsx", app.vars["output_filename"].get())
+        self.assertEqual("E:/templates/third.xlsx", app.vars["template_path"].get())
+
+    def test_profile_load_uses_selected_template_for_auto_name_and_keeps_profile_custom_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            profile_dir = Path(td) / "profiles"
+            auto = deepcopy(main.DEFAULT_SETTINGS)
+            auto.update({"config_name": "自动命名", "template_path": "C:/old/old.xlsx",
+                         "output_filename": "old.xlsx", "output_filename_custom": False})
+            custom = deepcopy(main.DEFAULT_SETTINGS)
+            custom.update({"config_name": "自定义命名", "template_path": "C:/old/old.xlsx",
+                           "output_filename": "保留名称.xlsx", "output_filename_custom": True})
+            main.save_profile(auto, "自动命名", profile_dir)
+            main.save_profile(custom, "自定义命名", profile_dir)
+
+            captured = {}
+            app = main.App.__new__(main.App)
+            app._apply_settings_to_gui = lambda settings, name: captured.update(settings=settings, name=name)
+            with mock.patch.object(main, "PROFILE_DIR", profile_dir):
+                app._load_profile_named("自动命名", selected_template_path="D:/selected/新模板.xlsx")
+                self.assertEqual("D:/selected/新模板.xlsx", captured["settings"]["template_path"])
+                self.assertEqual("新模板.xlsx", captured["settings"]["output_filename"])
+                self.assertFalse(captured["settings"]["output_filename_custom"])
+
+                app._load_profile_named("自定义命名", selected_template_path="D:/selected/另一模板.xlsx")
+                self.assertEqual("D:/selected/另一模板.xlsx", captured["settings"]["template_path"])
+                self.assertEqual("保留名称.xlsx", captured["settings"]["output_filename"])
+                self.assertTrue(captured["settings"]["output_filename_custom"])
+
+    def test_legacy_output_filename_migration_and_explicit_custom_marker(self):
+        legacy_auto = deepcopy(main.DEFAULT_SETTINGS)
+        legacy_auto.pop("output_filename_custom", None)
+        legacy_auto.update({"template_path": r"C:\\templates\\legacy.xlsx", "output_filename": "处理结果.xlsx"})
+        migrated_auto = main.normalize_settings(legacy_auto)
+        self.assertEqual("legacy.xlsx", migrated_auto["output_filename"])
+        self.assertFalse(migrated_auto["output_filename_custom"])
+
+        legacy_custom = deepcopy(legacy_auto)
+        legacy_custom["output_filename"] = "用户手动名称.xlsx"
+        migrated_custom = main.normalize_settings(legacy_custom)
+        self.assertEqual("用户手动名称.xlsx", migrated_custom["output_filename"])
+        self.assertTrue(migrated_custom["output_filename_custom"])
 
     def test_pure_region_processing_and_text_area_format(self):
         split, columns = main.split_text_column(["001|2024-02-01", "002|2024-02-02"], "|", ["number", "date"])
@@ -720,6 +839,37 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertEqual({path.name for path in paths}, {path.name for path in output_dir.iterdir()})
             self.assertEqual(2, events.count("chart-delete"))
 
+    def test_image_export_retries_with_alternate_copy_format_and_pumps_messages(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            events = []
+            workbook = FakePictureWorkbook(
+                events, merges_by_sheet={"统计": [(34, 1, 90, 1)]},
+                copy_fail_formats={2: 1}, export_failures=1,
+            )
+            worksheet = workbook.Worksheets("统计")
+            hidden_before = deepcopy(worksheet.hidden_state)
+            application = FakeWpsApplication(events, {})
+            pythoncom = FakePythonCom(events)
+            output = {"sheet": "统计", "range": "AH1:BO44"}
+            with mock.patch.object(main.time, "sleep", return_value=None):
+                paths = main._export_image_areas_from_workbook(
+                    workbook, [output], output_dir, lambda _msg: None,
+                    application=application, pythoncom=pythoncom,
+                )
+            formats = [event[1] for event in events if isinstance(event, tuple) and event[0] == "copy-picture-format"]
+            self.assertEqual([2, -4147, 2], formats)
+            self.assertEqual(2, sum(1 for event in events if isinstance(event, tuple) and event[0] == "picture-export"))
+            self.assertIn("workbook-activate", events)
+            self.assertIn(("worksheet-activate", "统计"), events)
+            self.assertIn(("range-select", "AH1:CL44"), events)
+            self.assertIn("chart-activate", events)
+            self.assertIn("pump-messages", events)
+            self.assertEqual(hidden_before, worksheet.hidden_state)
+            self.assertEqual("AH1:BO44", output["range"])
+            self.assertEqual("统计_AH1-CL44_001.png", paths[0].name)
+            self.assertEqual(b"FAKE-PNG", paths[0].read_bytes())
+
     def test_image_export_expands_repeatedly_to_merged_area_closure_without_changing_hidden_state(self):
         with tempfile.TemporaryDirectory() as td:
             output_dir = Path(td)
@@ -752,13 +902,20 @@ class StaticConfigurationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             output_dir = Path(td)
             events = []
-            with self.assertRaisesRegex(main.ProcessingError, "CopyPicture 阶段.*S!B2.*fake picture copy failure"):
-                main._export_image_areas_from_workbook(
-                    FakePictureWorkbook(events, copy_should_fail=True),
-                    [{"sheet": "S", "range": "B2"}], output_dir, lambda _msg: None
-                )
+            workbook = FakePictureWorkbook(
+                events, copy_should_fail=True, merges_by_sheet={"S": [(2, 2, 4, 2)]}
+            )
+            output = {"sheet": "S", "range": "B2:C2"}
+            hidden_before = deepcopy(workbook.Worksheets("S").hidden_state)
+            with self.assertRaisesRegex(
+                main.ProcessingError,
+                "CopyPicture 阶段.*S!B2:D2.*配置范围 B2:C2.*fake picture copy failure",
+            ):
+                main._export_image_areas_from_workbook(workbook, [output], output_dir, lambda _msg: None)
             self.assertEqual([], list(output_dir.iterdir()))
             self.assertFalse(any(event == "chart-add" for event in events))
+            self.assertEqual("B2:C2", output["range"])
+            self.assertEqual(hidden_before, workbook.Worksheets("S").hidden_state)
 
     def test_image_export_avoids_overwrite_and_cleans_temp_files_on_failure(self):
         with tempfile.TemporaryDirectory() as td:
