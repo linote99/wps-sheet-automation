@@ -1,5 +1,13 @@
 # 测试结果（WPS 表格多源汇总处理器）
 
+## v25 合并版本与配置提醒（配置 v18）
+
+当前 Linux 环境通过 Python 语法编译、`python3 main.py --self-check` 及完整静态/授权回归：**128 项通过、0 项失败**。Xvfb 下构建完整 Tk 主界面，验证启动时只有一个合并提醒窗口；版本和配置提醒可分别静默，单独的配置弹窗也有“不再提醒”勾选框，选择后会保存偏好并抑制后续同类提醒。
+
+main-only ZIP 解压副本单独通过编译、自检及静态回归：**116 项通过、0 项失败**。压缩包清单不含签发器源码、插件或私钥文件，并包含 Inno Setup `.iss` 安装定义与调用 `ISCC.exe` 的构建脚本。
+
+用户提供的 v24 Windows 构建日志包含两次 main-only 构建记录：两次均为 **114 项测试通过**，PyInstaller 均显示 `Build complete!` 并输出 `dist` 目录；但日志没有执行 Inno Setup `ISCC.exe` 的记录，因此只证明程序目录构建成功，不能证明生成了 Windows 安装器。当前 Linux 环境无 Inno Setup 编译器，尚未实际产出或运行 v25 Windows Setup EXE；须在 Windows 安装 Inno Setup 6 或 7 后执行新脚本验收。原日志没有 `FAILED` 或异常终止记录，仅有非致命 `ResourceWarning`。
+
 ## v24 Lino 笔记品牌图标、关于页与版本提醒（配置 v18）
 
 当前 Linux 环境已通过 Python 语法编译、`python3 main.py --self-check` 及完整静态/授权回归：**126 项通过、0 项失败**。Xvfb 下实际构建 Tk 主窗口、Lino 图标、关于页和版本提醒；勾选“不再提示”并关闭弹窗后，偏好正确保存在独立 UI 偏好文件。图标 PNG/ICO 均可读取，Windows 打包命令已加入 EXE 图标和界面图片资源。

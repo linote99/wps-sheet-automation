@@ -34,7 +34,7 @@ from wps_automation_workflow import (DEFAULT_WORKFLOW, MODULE_LABELS, add_workfl
                                     remove_workflow_module, save_profile, validate_workflow)
 
 APP_NAME = "WPS 表格多源汇总处理器"
-APP_VERSION = "v24"
+APP_VERSION = "v25"
 LINO_HOME_URL = "https://www.linote.top/"
 GITHUB_PROFILE_URL = "https://github.com/linote99"
 PROJECT_REPOSITORY_URL = "https://github.com/linote99/wps-sheet-automation"
@@ -67,18 +67,40 @@ def load_ui_preferences(path: Path | str | None = None) -> dict[str, bool]:
         raw = {}
     if not isinstance(raw, dict):
         raw = {}
-    return {"dont_show_version_notice": raw.get("dont_show_version_notice", False) is True}
+    return {
+        "dont_show_version_notice": raw.get("dont_show_version_notice", False) is True,
+        "dont_show_configuration_notice": raw.get("dont_show_configuration_notice", False) is True,
+    }
 
 
-def save_ui_preferences(dont_show_version_notice: bool,
-                        path: Path | str | None = None) -> None:
+def save_ui_preferences(dont_show_version_notice: bool | None = None,
+                        path: Path | str | None = None,
+                        dont_show_configuration_notice: bool | None = None) -> None:
     target = Path(path) if path is not None else UI_PREFERENCES_PATH
+    preferences = load_ui_preferences(target)
+    if dont_show_version_notice is not None:
+        preferences["dont_show_version_notice"] = bool(dont_show_version_notice)
+    if dont_show_configuration_notice is not None:
+        preferences["dont_show_configuration_notice"] = bool(dont_show_configuration_notice)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
-    temporary.write_text(json.dumps({
-        "dont_show_version_notice": bool(dont_show_version_notice),
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(preferences, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(target)
+
+
+def format_startup_notice(include_version_notice: bool, migration_notices: list[str]) -> str:
+    """Combine the release note and any configuration-migration notes into one message."""
+    sections = []
+    if include_version_notice:
+        sections.append(
+            f"{APP_NAME} {APP_VERSION}\n\n本次更新：\n"
+            "• 版本提醒与配置迁移说明合并到同一个窗口；\n"
+            "• 保留“不再提示”选项，偏好仍单独保存在本机。\n\n"
+            "可在“设置 → 关于”查看工具介绍和相关链接。"
+        )
+    if migration_notices:
+        sections.append("配置迁移说明：\n" + "\n\n".join(str(note) for note in migration_notices))
+    return "\n\n".join(sections)
 
 
 def set_application_icon(window, tk_module) -> Any | None:
@@ -4280,7 +4302,7 @@ class App:
         self.settings = load_settings()
         self.output_filename_custom = bool(self.settings.get("output_filename_custom", False))
         self._suppress_output_filename_trace = False
-        startup_migration_notices = self.settings.pop("_migration_notices", [])
+        self.startup_migration_notices = self.settings.pop("_migration_notices", [])
         self.vars: dict[str, Any] = {}
         self.job_vars: dict[str, Any] = {}
         self.operation_enabled: dict[str, Any] = {}
@@ -4294,8 +4316,6 @@ class App:
         self._render_area_configs()
         self._render_workflow()
         self._refresh_profile_choices()
-        if startup_migration_notices:
-            self.root.after(200, self._show_configuration_migration_notices, startup_migration_notices)
         self.root.after(150, self._drain_events)
 
     def _on_close(self):
@@ -5162,7 +5182,81 @@ class App:
         self.job_vars["formula_template_row"].set(value)
 
     def _show_configuration_migration_notices(self, notices):
-        self.messagebox.showinfo(APP_NAME, "\n\n".join(notices))
+        if load_ui_preferences().get("dont_show_configuration_notice", False):
+            return
+        self._show_notice_dialog(notices, include_version_notice=False)
+
+    def _show_startup_notices(self):
+        preferences = load_ui_preferences()
+        migration_notices = self.startup_migration_notices
+        if preferences.get("dont_show_configuration_notice", False):
+            migration_notices = []
+        include_version_notice = not preferences.get("dont_show_version_notice", False)
+        if not include_version_notice and not migration_notices:
+            return
+        self._show_notice_dialog(migration_notices, include_version_notice=include_version_notice)
+
+    def _show_notice_dialog(self, migration_notices, include_version_notice):
+        has_migration_notices = bool(migration_notices)
+        if include_version_notice and has_migration_notices:
+            title = "版本与配置提醒"
+        elif include_version_notice:
+            title = "版本提醒"
+        else:
+            title = "配置提醒"
+
+        dialog = self.tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("680x470")
+        dialog.minsize(560, 360)
+        dialog.resizable(True, True)
+        dialog.transient(self.root)
+        frame = self.ttk.Frame(dialog, padding=18)
+        frame.pack(fill="both", expand=True)
+        self.ttk.Label(frame, text=title, font=("Microsoft YaHei UI", 14, "bold")).pack(
+            anchor="w", pady=(0, 10))
+
+        body = self.ttk.Frame(frame)
+        body.pack(fill="both", expand=True, pady=(0, 12))
+        scrollbar = self.ttk.Scrollbar(body, orient="vertical")
+        text = self.tk.Text(body, wrap="word", height=14, yscrollcommand=scrollbar.set,
+                            font=("Microsoft YaHei UI", 10))
+        scrollbar.configure(command=text.yview)
+        text.insert("1.0", format_startup_notice(include_version_notice, migration_notices))
+        text.configure(state="disabled")
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        dont_show_version = self.tk.BooleanVar(value=False)
+        dont_show_configuration = self.tk.BooleanVar(value=False)
+        if include_version_notice:
+            version_label = "不再提醒版本更新" if has_migration_notices else "不再提示"
+            self.ttk.Checkbutton(frame, text=version_label, variable=dont_show_version).pack(
+                anchor="w", pady=(0, 12))
+        if has_migration_notices:
+            configuration_label = "不再提醒配置迁移" if include_version_notice else "不再提醒"
+            self.ttk.Checkbutton(frame, text=configuration_label,
+                                 variable=dont_show_configuration).pack(
+                anchor="w", pady=(0, 12))
+
+        def close_notice():
+            save_preferences = {}
+            if include_version_notice and dont_show_version.get():
+                save_preferences["dont_show_version_notice"] = True
+            if has_migration_notices and dont_show_configuration.get():
+                save_preferences["dont_show_configuration_notice"] = True
+            if save_preferences:
+                try:
+                    save_ui_preferences(**save_preferences)
+                except OSError as exc:
+                    self.messagebox.showwarning("提醒设置", f"无法保存“不再提醒”设置：{exc}",
+                                                parent=dialog)
+            dialog.destroy()
+
+        self.ttk.Button(frame, text="知道了", command=close_notice).pack(anchor="e")
+        dialog.protocol("WM_DELETE_WINDOW", close_notice)
+        dialog.grab_set()
+        dialog.focus_set()
 
     def _refresh_job_row(self, index):
         if not (0 <= index < len(self.settings["jobs"])):
@@ -5606,44 +5700,6 @@ class App:
         self._build_profile_management_tab(config_page)
         self._build_about_tab(about_page)
 
-    def _show_version_notice(self):
-        if load_ui_preferences().get("dont_show_version_notice", False):
-            return
-        dialog = self.tk.Toplevel(self.root)
-        dialog.title("版本提醒")
-        dialog.geometry("560x360")
-        dialog.minsize(500, 330)
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        frame = self.ttk.Frame(dialog, padding=18)
-        frame.pack(fill="both", expand=True)
-        self.ttk.Label(frame, text=f"{APP_NAME} {APP_VERSION}",
-                       font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w", pady=(0, 12))
-        notice = (
-            "本次更新：\n"
-            "• 主程序窗口改用 Lino 笔记图标；\n"
-            "• 设置中新增“关于”页，说明运行方式与适用范围，并提供 Lino 笔记和 GitHub 链接。\n\n"
-            "可在“设置 → 关于”查看工具介绍和相关链接。"
-        )
-        self.ttk.Label(frame, text=notice, wraplength=510, justify="left").pack(
-            anchor="w", fill="x", pady=(0, 16))
-        dont_show = self.tk.BooleanVar(value=False)
-        self.ttk.Checkbutton(frame, text="不再提示", variable=dont_show).pack(anchor="w", pady=(0, 16))
-
-        def close_notice():
-            if dont_show.get():
-                try:
-                    save_ui_preferences(True)
-                except OSError as exc:
-                    self.messagebox.showwarning("版本提醒", f"无法保存“不再提示”设置：{exc}",
-                                                parent=dialog)
-            dialog.destroy()
-
-        self.ttk.Button(frame, text="知道了", command=close_notice).pack(anchor="e")
-        dialog.protocol("WM_DELETE_WINDOW", close_notice)
-        dialog.grab_set()
-        dialog.focus_set()
-
     def _build_license_settings_tab(self, parent):
         from datetime import date
         from licensing import (LicensingError, evaluate_authorization, install_license,
@@ -6081,7 +6137,7 @@ def main() -> int:
         stage = "构建主界面"
         app = App(root)
         root.deiconify()
-        root.after(300, app._show_version_notice)
+        root.after(300, app._show_startup_notices)
         _write_startup_log("主界面已显示")
         stage = "运行主界面消息循环"
         root.mainloop()

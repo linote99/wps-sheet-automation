@@ -286,7 +286,10 @@ class WindowsLaunchPackagingTests(unittest.TestCase):
         module_path = self.project_dir / "wps_automation_workflow.py"
         legacy_module_path = self.project_dir / "workflow.py"
         main_source = (self.project_dir / "main.py").read_text(encoding="utf-8")
-        installer = (self.project_dir / "install_and_build.bat").read_text(encoding="utf-8")
+        installer_path = self.project_dir / "install_and_build.bat"
+        if not installer_path.is_file():
+            installer_path = self.project_dir / "install_and_build_main_only.bat"
+        installer = installer_path.read_text(encoding="utf-8")
 
         self.assertTrue(module_path.is_file())
         self.assertFalse(legacy_module_path.exists())
@@ -304,7 +307,10 @@ class WindowsLaunchPackagingTests(unittest.TestCase):
         )
 
     def test_installer_pins_runtime_commands_to_venv_and_checks_com_first(self):
-        installer = (self.project_dir / "install_and_build.bat").read_text(encoding="utf-8").lower()
+        installer_path = self.project_dir / "install_and_build.bat"
+        if not installer_path.is_file():
+            installer_path = self.project_dir / "install_and_build_main_only.bat"
+        installer = installer_path.read_text(encoding="utf-8").lower()
         self.assertIn('set "venv_py=%~dp0.venv\\scripts\\python.exe"', installer)
         self.assertTrue(any(f'set "log_file=%~dp0{name}"' in installer for name in ("install_and_build.log", "build_main.log")))
         self.assertIn('"%venv_py%" -c "import sys, importlib.metadata as metadata, pythoncom, win32com.client;', installer)
@@ -3307,13 +3313,39 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
             self.assertTrue(main.load_ui_preferences(path)["dont_show_version_notice"])
             self.assertFalse(path.with_name(path.name + ".tmp").exists())
 
+    def test_configuration_notice_preference_is_independent(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ui_preferences.json"
+            main.save_ui_preferences(True, path)
+            main.save_ui_preferences(dont_show_configuration_notice=True, path=path)
+            preferences = main.load_ui_preferences(path)
+            self.assertTrue(preferences["dont_show_version_notice"])
+            self.assertTrue(preferences["dont_show_configuration_notice"])
+
+            main.save_ui_preferences(False, path)
+            preferences = main.load_ui_preferences(path)
+            self.assertFalse(preferences["dont_show_version_notice"])
+            self.assertTrue(preferences["dont_show_configuration_notice"])
+
     def test_malformed_ui_preferences_default_to_showing_notice(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "ui_preferences.json"
             path.write_text("{not-json", encoding="utf-8")
             self.assertFalse(main.load_ui_preferences(path)["dont_show_version_notice"])
+            self.assertFalse(main.load_ui_preferences(path)["dont_show_configuration_notice"])
             path.write_text('{"dont_show_version_notice":"false"}', encoding="utf-8")
             self.assertFalse(main.load_ui_preferences(path)["dont_show_version_notice"])
+
+    def test_version_and_configuration_notices_share_one_message(self):
+        message = main.format_startup_notice(True, ["配置已升级到 v18：迁移提醒测试。"])
+        self.assertIn("v25", message)
+        self.assertIn("本次更新", message)
+        self.assertIn("配置迁移说明", message)
+        self.assertIn("迁移提醒测试", message)
+
+        migration_only = main.format_startup_notice(False, ["仅配置提醒。"])
+        self.assertNotIn("本次更新", migration_only)
+        self.assertIn("仅配置提醒", migration_only)
 
     def test_lino_branding_assets_and_about_links_are_available(self):
         for relative_path in (
@@ -3322,14 +3354,29 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
             "assets/linote-logo.ico",
         ):
             self.assertTrue(main.app_resource_path(relative_path).is_file(), relative_path)
-        self.assertEqual("v24", main.APP_VERSION)
+        self.assertEqual("v25", main.APP_VERSION)
         self.assertEqual("https://www.linote.top/", main.LINO_HOME_URL)
         self.assertEqual("https://github.com/linote99", main.GITHUB_PROFILE_URL)
         self.assertEqual("https://github.com/linote99/wps-sheet-automation", main.PROJECT_REPOSITORY_URL)
         source = Path(main.__file__).read_text(encoding="utf-8")
-        installer = (Path(main.__file__).resolve().parent / "install_and_build.bat").read_text(
+        project_dir = Path(main.__file__).resolve().parent
+        installer_path = project_dir / "install_and_build_main_only.bat"
+        if not installer_path.is_file():
+            installer_path = installer_path.with_name("install_and_build.bat")
+        installer = installer_path.read_text(encoding="utf-8").lower()
+        installer_definition = (project_dir / "WpsSheetAutomation.iss").read_text(
             encoding="utf-8").lower()
-        self.assertIn('text="不再提示"', source)
-        self.assertIn("root.after(300, app._show_version_notice)", source)
+        self.assertIn('version_label = "不再提醒版本更新" if has_migration_notices else "不再提示"', source)
+        self.assertIn('else "不再提醒"', source)
+        self.assertIn("dont_show_configuration_notice", source)
+        self.assertIn("root.after(300, app._show_startup_notices)", source)
+        self.assertNotIn("root.after(200, self._show_configuration_migration_notices", source)
         self.assertIn('--icon="assets\\linote-logo.ico"', installer)
         self.assertIn('--add-data "assets\\linote-logo.png;assets"', installer)
+        self.assertIn("iscc.exe", installer)
+        self.assertIn("wpssheetautomation.iss", installer)
+        self.assertIn("wpssheetautomation_setup_v25.exe", installer)
+        self.assertIn("outputbasefilename=wpssheetautomation_setup_v25", installer_definition)
+        self.assertIn('source: "dist\\wpssheetautomation\\*"', installer_definition)
+        self.assertNotIn("issuer_private_key.pem", installer)
+        self.assertNotIn("WpsSheetAutomation_KeyGen", installer)

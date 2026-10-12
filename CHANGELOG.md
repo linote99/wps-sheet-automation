@@ -1,3 +1,11 @@
+## 2026-10-12：合并启动版本与配置提醒（v25，配置 v18）
+
+- 将版本更新说明与旧配置迁移提示合并到同一启动窗口；多条迁移说明可在窗口内滚动查看，避免连续弹窗。
+- 版本提醒与配置迁移提醒各自保留独立的“不再提醒”复选框，并分别保存本机 UI 偏好。
+- 新增 `WpsSheetAutomation.iss` 和 Inno Setup 6/7 编译步骤；main-only 构建脚本在 PyInstaller 后生成 `dist/WpsSheetAutomation_Setup_v25.exe`，内部授权工具构建流程保留，普通发布包不含签发器或签名私钥。
+- 构建开始时检查 Inno Setup `ISCC.exe`；缺少编译器时明确提示安装要求，不再将 PyInstaller 主程序目录误认为 Windows 安装包。
+- 新增合并提醒和安全构建脚本回归检查；仍需目标 Windows + WPS 环境验收。
+
 ## 2026-10-12：Lino 笔记品牌图标、关于页与版本提醒（v24，配置 v18）
 
 - 主窗口及 Windows EXE 图标改用 Lino 笔记标志；打包时包含 Tk 窗口图标和关于页品牌图。
