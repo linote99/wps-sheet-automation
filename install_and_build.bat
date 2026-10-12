@@ -55,8 +55,8 @@ if defined ISCC_EXE (
   set "FAIL_STEP=Inno Setup installer compilation"
   "%ISCC_EXE%" /Qp "%~dp0WpsSheetAutomation.iss" >>"%LOG_FILE%" 2>&1
   if errorlevel 1 goto failed
-  echo Installer built: "%~dp0dist\WpsSheetAutomation_Setup_v17.exe"
-  >>"%LOG_FILE%" echo Installer built: "%~dp0dist\WpsSheetAutomation_Setup_v17.exe"
+  echo Installer built: "%~dp0dist\WpsSheetAutomation_Setup_v18.exe"
+  >>"%LOG_FILE%" echo Installer built: "%~dp0dist\WpsSheetAutomation_Setup_v18.exe"
 ) else (
   echo Inno Setup 6 was not found. The app folder is built, but no Setup EXE was created.
   echo Install Inno Setup 6 and rerun this script to create the installer.

@@ -1,5 +1,5 @@
 #define MyAppName "WPS 表格多源汇总处理器"
-#define MyAppVersion "17"
+#define MyAppVersion "18"
 #define MyAppExeName "WpsSheetAutomation.exe"
 
 [Setup]
@@ -12,7 +12,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=dist
-OutputBaseFilename=WpsSheetAutomation_Setup_v17
+OutputBaseFilename=WpsSheetAutomation_Setup_v18
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

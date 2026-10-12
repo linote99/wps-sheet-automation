@@ -195,6 +195,15 @@ def load_profile(name: str, profile_dir: Path | str) -> dict[str, Any]:
     return result
 
 
+def delete_profile(name: str, profile_dir: Path | str) -> Path:
+    """Delete exactly one named profile file and return the removed path."""
+    target = Path(profile_dir) / profile_filename(name)
+    if not target.is_file():
+        raise ValueError(f"找不到已保存配置“{name}”。")
+    target.unlink()
+    return target
+
+
 def _template_stem(value: str) -> str:
     # Saved paths are commonly Windows paths even during Linux static tests.
     return Path(str(value).replace("\\", "/")).stem

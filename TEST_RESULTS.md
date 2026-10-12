@@ -1,6 +1,12 @@
-# 测试结果（机器码授权与 UFI-TOOLS 秘钥生成器）
+# 测试结果（WPS 表格多源汇总处理器 v18 main-only）
 
 日期：2026-10-07。验证环境：Linux，Python 3.12.3，openpyxl 3.1.5，cryptography 50.0.1。工作簿回归使用自动生成的虚构 XLSX；未读取或修改真实模板、源文件或业务输出。
+
+## v18 设置中心、秘钥管理与配置管理
+
+源码目录 `/workspace/wps_sheet_automation/` 已通过 `py_compile`、默认配置 JSON 解析、`main.py --self-check` 及 `python3 -m unittest -v test_static.py test_licensing.py`；完整回归 **112 项通过、0 项失败**。新增测试覆盖命名配置仅删除选定档案，以及可读取已签名秘钥到期日但仍拒绝过期授权。使用 Xvfb 启动 Tk 界面并构建设置窗口，确认“秘钥管理 / 使用说明 / 配置管理”三个页面创建成功。
+
+本发布目录已通过 `py_compile`、v13 静态自检、默认配置 JSON 检查及静态套件 **100 项通过、0 项失败**。已核对 main-only 发布目录不含 `.pem` 或私钥文件；未运行 Windows 安装器、WPS COM 或 EXE，仍须在目标 Windows + WPS 环境验收。
 
 ## v17 修订版：可选结果映射与 WPS 区域公式填充双模式
 

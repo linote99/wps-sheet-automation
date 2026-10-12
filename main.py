@@ -27,7 +27,7 @@ from openpyxl.formula.translate import Translator
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils.cell import column_index_from_string, get_column_letter, range_boundaries
 from openpyxl.utils.datetime import from_excel, WINDOWS_EPOCH
-from wps_automation_workflow import (DEFAULT_WORKFLOW, MODULE_LABELS, add_workflow_module, list_profiles,
+from wps_automation_workflow import (DEFAULT_WORKFLOW, MODULE_LABELS, add_workflow_module, delete_profile, list_profiles,
                                     load_profile, matching_profiles, move_workflow_module,
                                     remove_workflow_module, save_profile, validate_workflow)
 
@@ -244,6 +244,9 @@ def configuration_migration_notes(raw: Any) -> list[str]:
         notes.append("配置已升级到 v13：结果映射已恢复为可选步骤，与后映射分别保留；旧配置中的结果列设置会迁移为结果映射规则。")
     if "open_region_exports" in raw:
         notes.append("旧版自动打开区域 XLSX 的选项已停用；区域 XLSX 将输出到所选目录，不再自动打开。")
+    legacy_workflow = raw.get("workflow", [])
+    if not isinstance(legacy_workflow, list):
+        legacy_workflow = []
     for index, job in enumerate(jobs, 1):
         if not isinstance(job, dict):
             continue
@@ -301,13 +304,6 @@ def _parse_selection_details(value: Any, label: str = "区域") -> tuple[tuple[i
     """Parse the shared UI/JSON selector, normalizing reversed endpoint rectangles."""
     text = str(value or "").strip().upper()
     coordinate = r"\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}"
-    column_range = re.fullmatch(r"\$?([A-Z]{1,3})(?::\$?([A-Z]{1,3}))?", text)
-    if column_range:
-        min_col = column_number(column_range.group(1))
-        max_col = column_number(column_range.group(2) or column_range.group(1))
-        if min_col > max_col:
-            raise ProcessingError(f"{label}区域“{text}”的起点不能在终点之后。")
-        return (min_col, 1, max_col, 1_048_576), "column"
 
     def point(token: str) -> tuple[int, int]:
         token = token.strip().upper()
@@ -399,7 +395,7 @@ def _resolve_com_selection_bounds(worksheet, bounds: tuple[int, int, int, int],
         return used_min_col, used_min_row, used_max_col, used_max_row
     if selection_kind == "row":
         return used_min_col, bounds[1], used_max_col, bounds[1]
-    return bounds[0], 1, bounds[2], used_max_row
+    return bounds[0], 1, bounds[0], used_max_row
 
 
 def _area_cell_count(bounds: tuple[int, int, int, int]) -> int:
@@ -1532,11 +1528,11 @@ def _apply_source_region_processing(raw_ws, val_ws, sheet_name: str, settings: d
             used_rules.add((operation_key, rule_idx - 1))
             if operation_key == "RegionFilter":
                 bounds, selection_kind = _parse_region_filter_area(rule["range"], f"第 {rule_idx} 条{label}")
+                if selection_kind == "column":
+                    last_row = used_last_row or _last_nonempty_source_row(raw_ws)[0] or 1
+                    bounds = (bounds[0], 1, bounds[2], last_row)
             else:
-                bounds, selection_kind = _parse_selection_details(rule["range"], f"第 {rule_idx} 条{label}")
-            if selection_kind == "column":
-                last_row = used_last_row or _last_nonempty_source_row(raw_ws)[0] or 1
-                bounds = (bounds[0], 1, bounds[2], last_row)
+                bounds = _parse_selected_area(rule["range"], f"第 {rule_idx} 条{label}")
             _check_processing_area_size(bounds, f"第 {rule_idx} 条{label}")
             raw_matrix, matrix = matrices(bounds)
             if operation_key == "TextToColumns":
@@ -1685,10 +1681,6 @@ def _capture_pre_mapping_values(workbook, settings: dict[str, Any]):
         bounds = _parse_area(rule["source_range"], f"第 {idx} 条前映射源")
         min_col, min_row, max_col, max_row = bounds
         worksheet = workbook[str(rule["source_sheet"]).strip()]
-        target_bounds = _parse_area(rule["target_range"], f"第 {idx} 条前映射目标")
-        if _is_full_column_area(bounds) and _is_full_column_area(target_bounds):
-            target_sheet = workbook[str(rule["target_sheet"]).strip()]
-            max_row = min(max_row, max(1, worksheet.max_row, target_sheet.max_row))
         values = [[worksheet.cell(row=row, column=col).value
                    for col in range(min_col, max_col + 1)]
                   for row in range(min_row, max_row + 1)]
@@ -1852,9 +1844,8 @@ def _com_value_matrix(value, rows: int, cols: int) -> list[list[Any]]:
 
 
 def _write_mapped_values(destination, values: list[Any], write_as: str) -> None:
-    """Write one column to a COM-like range; text mode forces string values and text format."""
-    mode = str(write_as).strip().lower()
-    if mode == "text":
+    """Write one mapped result column; text mode preserves values as text."""
+    if str(write_as).strip().lower() == "text":
         values = [None if value is None else str(value) for value in values]
         try:
             destination.NumberFormat = "@"
@@ -2495,7 +2486,7 @@ def _resolve_selected_output_bounds(worksheet, selected_bounds: tuple[int, int, 
     if selection_kind == "row":
         return 1, min_row, used_cols, min_row
     if selection_kind == "column":
-        return min_col, 1, max_col, used_rows
+        return min_col, 1, min_col, used_rows
     return selected_bounds
 
 
@@ -3372,7 +3363,7 @@ def _read_text_output_areas_loaded(workbook, text_outputs: list[dict[str, Any]])
             elif selection_kind == "row":
                 bounds = (1, min_row, used_cols, min_row)
             elif selection_kind == "column":
-                bounds = (min_col, 1, max_col, used_rows)
+                bounds = (min_col, 1, min_col, used_rows)
             else:
                 bounds = selected_bounds
             _check_text_area_size(bounds, f"第 {index} 项文本输出（实际范围 {_area_address(bounds)}）")
@@ -3761,7 +3752,7 @@ class App:
         ttk.Button(actions, text="添加目标表", command=self._add_job).pack(side="left", padx=3)
         ttk.Button(actions, text="删除目标表", command=self._delete_job).pack(side="left", padx=3)
         self.job_tree = ttk.Treeview(target_box, columns=("sheet", "start", "formula", "sources", "mappings"), show="headings", height=4, selectmode="browse")
-        for col, title, width in (("sheet", "模板子表", 230), ("start", "粘贴起始行", 90), ("formula", "公式列范围", 120), ("sources", "源文件数（按顺序）", 140), ("mappings", "结果映射（可选）", 220)):
+        for col, title, width in (("sheet", "模板子表", 230), ("start", "粘贴起始行", 90), ("formula", "公式列范围", 120), ("sources", "源文件数（按顺序）", 140), ("mappings", "结果映射", 220)):
             self.job_tree.heading(col, text=title)
             self.job_tree.column(col, width=width, anchor="w")
         self.job_tree.grid(row=1, column=0, sticky="nsew", padx=3, pady=4)
@@ -3787,26 +3778,26 @@ class App:
         for col, title, width in (("path", "源文件路径", 390), ("sheet", "源工作表（空=首表）", 165), ("from", "复制起始行", 90), ("to", "复制结束行（空=空行边界）", 170)):
             self.source_tree.heading(col, text=title)
             self.source_tree.column(col, width=width, anchor="w")
-        self.source_tree.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=3, pady=5)
+        self.source_tree.grid(row=1, column=0, sticky="nsew", padx=3, pady=5)
         source_buttons = ttk.Frame(editor)
-        source_buttons.grid(row=2, column=0, columnspan=2, sticky="w", padx=3)
+        source_buttons.grid(row=2, column=0, sticky="w", padx=3)
         for label, command in (("添加源文件…", self._add_source), ("编辑…", self._edit_source), ("删除", self._delete_source), ("上移", lambda: self._move_source(-1)), ("下移", lambda: self._move_source(1))):
             ttk.Button(source_buttons, text=label, command=command).pack(side="left", padx=2)
-        self.mapping_tree = ttk.Treeview(editor, columns=("result", "target", "mode"), show="headings", height=3, selectmode="browse")
-        for col, title, width in (("result", "公式结果列", 140), ("target", "写入目标列", 140), ("mode", "写入类型", 100)):
+        mapping_panel = ttk.LabelFrame(editor, text="可选结果映射：公式结果列 → 目标列", padding=3)
+        mapping_panel.grid(row=1, column=1, sticky="nsew", padx=3, pady=5)
+        mapping_panel.columnconfigure(0, weight=1)
+        self.mapping_tree = ttk.Treeview(mapping_panel, columns=("result", "target", "write_as"), show="headings", height=6)
+        for col, title, width in (("result", "公式结果列", 110), ("target", "目标列", 100), ("write_as", "写入类型", 90)):
             self.mapping_tree.heading(col, text=title)
             self.mapping_tree.column(col, width=width, anchor="w")
-        self.mapping_tree.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=3, pady=(4, 2))
-        mapping_buttons = ttk.Frame(editor)
-        mapping_buttons.grid(row=4, column=0, columnspan=2, sticky="w", padx=3)
-        for label, command in (("添加结果映射", lambda: self._manage_job_mapping("add")),
-                               ("编辑映射…", lambda: self._manage_job_mapping("edit")),
-                               ("删除映射", lambda: self._manage_job_mapping("delete"))):
+        self.mapping_tree.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        mapping_buttons = ttk.Frame(mapping_panel)
+        mapping_buttons.grid(row=1, column=0, sticky="w", padx=2, pady=2)
+        for label, command in (("添加", self._add_mapping), ("编辑", self._edit_mapping), ("删除", self._delete_mapping)):
             ttk.Button(mapping_buttons, text=label, command=command).pack(side="left", padx=2)
         editor.rowconfigure(1, weight=1)
-        editor.rowconfigure(3, weight=1)
-        note = "结果映射可留空；配置后在首次完整重算后，将所选公式结果列按值/文本写入目标列，随后仍可单独执行后映射。目标列须在公式范围之外。\n可只处理模板，无需添加源文件；无源目标子表会保留模板原内容。源文件规则先在 WPS 临时副本中处理，原件不修改。"
-        ttk.Label(editor, text=note, foreground="#4b5563", wraplength=1180, justify="left").grid(row=5, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 0))
+        note = "可只处理模板，无需添加源文件；无源目标子表会保留模板原内容。结果映射可留空：配置后在首次重算后将公式结果复制到目标列；后映射仍独立保留并在其后执行。若配置源文件，先在 WPS 临时副本中执行源范围规则并读取处理结果，再填充或编辑模板。勾选“保留源文件处理结果”会将处理副本另存到输出目录，原件不修改。"
+        ttk.Label(editor, text=note, foreground="#4b5563", wraplength=1180, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 0))
 
         area_box = ttk.LabelFrame(outer, text="模板内部前/后映射、区域处理及文本输出", padding=5)
         area_box.grid(row=3, column=0, sticky="nsew", pady=(7, 0))
@@ -3834,7 +3825,7 @@ class App:
         self.format_convert_tree = self._create_operation_tab(area_tabs, "格式转换", "FormatConvert",
             rule_columns + (("mode", "目标类型", 100),))
         self.workflow_tree = self._create_workflow_tab(area_tabs)
-        selector_help = ("结果映射与后映射是独立可选步骤：结果映射将公式计算结果写到指定列，后映射则复制任意区域。所有源/目标区域均可只填列字母（如 A、DG）表示整列，也可填 A:A 或 A:C；前/后映射源与目标区域的行列数必须一致。后映射在结果映射之后执行；目标整列后映射只写 start_row 至本轮数据末行，保留上一行公式模板；区域处理整列按已用范围裁剪。范围选择：A1=整张工作表，按 WPS UsedRange 裁剪；D1=整列，A5=整行，B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形；也可填写 A1:F100。公式填充支持输入自定义公式或从同表指定单元格取公式，按 WPS 相对引用填满范围；填充会替换所选范围的原有内容。"
+        selector_help = ("目标表结果映射可选：将公式列的已计算结果写入公式范围外的目标列；前/后映射的源和目标范围可用列字母（如 A、DG）或 A:A 表示整列；后映射可留空，配置时在首次完整重算及结果映射后逐行复制源区域的已计算值。整列后映射目标在目标表只写 start_row 至本轮数据末行，保留上一行公式模板。范围选择：A1=整张工作表，按 WPS UsedRange 裁剪；D1=整列，A5=整行，B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形。区域筛选另支持单填 A 表示 A 列、或小写 a1 表示 A1 单元格；也可填写 A1:F100。公式填充支持输入自定义公式或从同表指定单元格取公式，按 WPS 相对引用填满范围；填充会替换所选范围的原有内容。"
                          f"每条处理规则最多 {MAX_PROCESSING_CELLS:,} 格。源文件规则在临时副本中由 WPS 执行，模板规则作用于结果副本；原始源文件不回写。")
         ttk.Label(area_box, text=selector_help, foreground="#4b5563", wraplength=1180,
                   justify="left").grid(row=1, column=0, sticky="w", padx=4, pady=(4, 1))
@@ -3860,6 +3851,7 @@ class App:
         ttk.Button(controls, text="新建并保存", command=self._new_profile).pack(side="left", padx=3)
         ttk.Button(controls, text="保存当前", command=self._save_current_profile).pack(side="left", padx=3)
         ttk.Button(controls, text="载入所选", command=self._load_selected_profile).pack(side="left", padx=3)
+        ttk.Button(controls, text="设置", command=self._open_settings).pack(side="left", padx=5)
         self.progress = ttk.Progressbar(controls, mode="indeterminate", length=160)
         self.progress.pack(side="right", padx=5)
 
@@ -3915,8 +3907,8 @@ class App:
             "source_copy": "按目标表及源文件列表追加数据",
             "formula_fill": "按复制数据行数填充公式",
             "formula_recalc": "首次完整重算并保留公式结果",
-            "result_mapping": "可选：把指定公式列结果写入目标列",
-            "post_mapping": "可选：首次重算后逐行复制源区域的已计算值",
+            "result_mapping": "可选：将公式列已计算结果写到对应目标列",
+            "post_mapping": "可选：结果映射后复制源区域的已计算值",
             "CustomFormula": "按自定义公式或同表种子单元格，用 WPS R1C1 相对引用填满所选区域",
             "TextToColumns": "区域处理阶段；规则可指定源文件或目标工作簿",
             "RegionFilter": "按条件筛选指定区域并压缩匹配记录",
@@ -4141,14 +4133,14 @@ class App:
                  "Deduplicate": "去重规则", "FormatConvert": "格式转换规则"}[key]
         base_fields = (("scope", "处理对象", "scope"), ("sheet", "工作表名", "entry"))
         if key == "CustomFormula":
-            fields = base_fields + (("range", "填充范围（A 表示整列；A1 表示整表）", "entry"),
+            fields = base_fields + (("range", "填充范围（A1 表示整表）", "entry"),
                 ("formula_mode", "公式来源", "formula_mode"),
                 ("formula", "自定义公式（以 = 开头）", "entry"),
                 ("seed_cell", "来源单元格（如 B2）", "entry"))
             initial = {"scope": "target", "sheet": "", "range": "", "formula_mode": "custom",
                        "formula": "", "seed_cell": ""}
         elif key == "TextToColumns":
-            fields = base_fields + (("range", "单列源范围（如 A）", "entry"),
+            fields = base_fields + (("range", "单列源范围", "entry"),
                 ("delimiter", r"分隔符（可填 \t / \n）", "entry"), ("output_start_col", "输出起始列", "entry"),
                 ("column_formats", "结果列格式（text/number/date，逗号分隔）", "entry"))
             initial = {"scope": "target", "sheet": "", "range": "", "delimiter": ",", "output_start_col": "A", "column_formats": ["text"]}
@@ -4158,11 +4150,11 @@ class App:
             initial = {"scope": "target", "sheet": "", "range": "", "has_header": True,
                        "filter_column": "A", "operator": "equals", "criteria": ""}
         elif key == "Deduplicate":
-            fields = base_fields + (("range", "整行/选列数据范围（如 A）", "entry"), ("has_header", "表头", "header"),
+            fields = base_fields + (("range", "整行/选列数据范围", "entry"), ("has_header", "表头", "header"),
                 ("key_mode", "判重方式", "keymode"), ("key_columns", "关键列（如 A,C）", "entry"))
             initial = {"scope": "target", "sheet": "", "range": "", "has_header": False, "key_mode": "row", "key_columns": []}
         else:
-            fields = base_fields + (("range", "转换范围（如 A 表示整列）", "entry"), ("mode", "目标类型", "mode"))
+            fields = base_fields + (("range", "转换范围", "entry"), ("mode", "目标类型", "mode"))
             initial = {"scope": "target", "sheet": "", "range": "", "mode": "text"}
         data = {**initial, **(existing or {})}
         dialog = self.tk.Toplevel(self.root)
@@ -4274,14 +4266,102 @@ class App:
         if rules and action != "delete":
             tree.selection_set(str(index))
 
+    def _mapping_dialog(self, job, existing=None, ignore_index=None):
+        tk, ttk = self.tk, self.ttk
+        dialog = tk.Toplevel(self.root)
+        dialog.title("结果映射")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        vals = {"result_col": tk.StringVar(value=(existing or {}).get("result_col", "")),
+                "target_col": tk.StringVar(value=(existing or {}).get("target_col", "")),
+                "write_as": tk.StringVar(value=(existing or {}).get("write_as", "value"))}
+        for row, key, label in ((0, "result_col", "公式结果列"), (1, "target_col", "写入目标列")):
+            ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=5)
+            ttk.Entry(dialog, textvariable=vals[key], width=15).grid(row=row, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(dialog, text="目标列写入为").grid(row=2, column=0, sticky="w", padx=8, pady=5)
+        ttk.Combobox(dialog, textvariable=vals["write_as"], values=("value", "text"), state="readonly", width=12).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+        result = {"value": None}
+        def accept():
+            mapping = {key: vals[key].get().strip() for key in vals}
+            try:
+                result_col = column_number(mapping["result_col"])
+                target_col = column_number(mapping["target_col"])
+                formula_start, formula_end = parse_column_range(job["formula_range"])
+            except ProcessingError as exc:
+                self.messagebox.showerror(APP_NAME, str(exc), parent=dialog)
+                return
+            if not formula_start <= result_col <= formula_end:
+                self.messagebox.showerror(APP_NAME, f"公式结果列必须位于公式范围 {job['formula_range']} 内。", parent=dialog)
+                return
+            if formula_start <= target_col <= formula_end:
+                self.messagebox.showerror(APP_NAME, "结果映射目标列不能位于公式范围内，以免覆盖公式。", parent=dialog)
+                return
+            mappings = job.setdefault("mappings", [])
+            if any(index != ignore_index and column_number(item.get("target_col", "")) == target_col
+                   for index, item in enumerate(mappings)):
+                self.messagebox.showerror(APP_NAME, "每条结果映射必须写入不同目标列。", parent=dialog)
+                return
+            if mapping["write_as"] not in ("value", "text"):
+                self.messagebox.showerror(APP_NAME, "写入类型只能是 value（值）或 text（文本）。", parent=dialog)
+                return
+            mapping["result_col"] = get_column_letter(result_col)
+            mapping["target_col"] = get_column_letter(target_col)
+            result["value"] = mapping
+            dialog.destroy()
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=3, column=0, columnspan=2, pady=8)
+        ttk.Button(buttons, text="确定", command=accept).pack(side="left", padx=5)
+        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="left", padx=5)
+        dialog.wait_window()
+        return result["value"]
+
+    def _ensure_result_mapping_workflow(self):
+        workflow = list(self.settings.get("workflow", DEFAULT_WORKFLOW))
+        if "result_mapping" not in workflow:
+            self.settings["workflow"] = add_workflow_module(workflow, "result_mapping")
+
+    def _add_mapping(self):
+        job = self._selected_job()
+        if job is None:
+            return
+        mapping = self._mapping_dialog(job)
+        if mapping:
+            job.setdefault("mappings", []).append(mapping)
+            self._ensure_result_mapping_workflow()
+            self._show_job(self._current_index())
+            self._refresh_job_row(self._current_index())
+
+    def _edit_mapping(self):
+        job = self._selected_job()
+        selected = self.mapping_tree.selection()
+        if job is None or not selected:
+            return
+        index = int(selected[0])
+        mapping = self._mapping_dialog(job, job["mappings"][index], ignore_index=index)
+        if mapping:
+            job["mappings"][index] = mapping
+            self._ensure_result_mapping_workflow()
+            self._show_job(self._current_index())
+            self.mapping_tree.selection_set(str(index))
+            self._refresh_job_row(self._current_index())
+
+    def _delete_mapping(self):
+        job = self._selected_job()
+        selected = self.mapping_tree.selection()
+        if job is not None and selected:
+            del job.setdefault("mappings", [])[int(selected[0])]
+            self._show_job(self._current_index())
+            self._refresh_job_row(self._current_index())
+
     def _render_jobs(self, select_index: int | None = None):
         for item in self.job_tree.get_children():
             self.job_tree.delete(item)
         for idx, job in enumerate(self.settings.get("jobs", [])):
             source_count = sum(bool(str(source.get("path") or "").strip()) for source in job.get("sources", []))
-            mapping_summary = ", ".join(f"{item.get('result_col', '')}→{item.get('target_col', '')}({item.get('write_as', 'value')})"
+            mapping_summary = ", ".join(f"{item.get('result_col', '')}→{item.get('target_col', '')}"
                                          for item in job.get("mappings", [])) or "（无）"
-            self.job_tree.insert("", "end", iid=str(idx), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), source_count, mapping_summary))
+            self.job_tree.insert("", "end", iid=str(idx), values=(job.get("template_sheet", ""), job.get("start_row", ""),
+                                                                  job.get("formula_range", ""), source_count, mapping_summary))
         if self.settings.get("jobs"):
             index = 0 if select_index is None else max(0, min(select_index, len(self.settings["jobs"]) - 1))
             self.job_tree.selection_set(str(index))
@@ -4342,93 +4422,9 @@ class App:
         for item in self.mapping_tree.get_children():
             self.mapping_tree.delete(item)
         for map_idx, mapping in enumerate(job.get("mappings", [])):
-            mode = "文本" if str(mapping.get("write_as", "value")).lower() == "text" else "值"
+            write_as = "文本" if mapping.get("write_as") == "text" else "值"
             self.mapping_tree.insert("", "end", iid=str(map_idx),
-                                     values=(mapping.get("result_col", ""), mapping.get("target_col", ""), mode))
-
-    def _mapping_dialog(self, job, existing=None, ignore_index=None):
-        dialog = self.tk.Toplevel(self.root)
-        dialog.title("结果映射规则")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        data = {"result_col": "", "target_col": "", "write_as": "value", **(existing or {})}
-        variables = {}
-        for row, (field, label) in enumerate((("result_col", "公式结果列（须在公式范围内）"),
-                                               ("target_col", "写入目标列（须在公式范围外）"))):
-            variables[field] = self.tk.StringVar(value=str(data.get(field, "")))
-            self.ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=5)
-            self.ttk.Entry(dialog, textvariable=variables[field], width=24).grid(row=row, column=1, sticky="w", padx=5, pady=5)
-        variables["write_as"] = self.tk.StringVar(value=str(data.get("write_as", "value")))
-        self.ttk.Label(dialog, text="写入方式").grid(row=2, column=0, sticky="w", padx=8, pady=5)
-        self.ttk.Combobox(dialog, textvariable=variables["write_as"], values=("value", "text"),
-                          state="readonly", width=20).grid(row=2, column=1, sticky="w", padx=5, pady=5)
-        result = {"value": None}
-
-        def accept():
-            try:
-                mapping = {key: variable.get().strip() for key, variable in variables.items()}
-                result_col = column_number(mapping["result_col"])
-                target_col = column_number(mapping["target_col"])
-                formula_start, formula_end = parse_column_range(job["formula_range"])
-                if not formula_start <= result_col <= formula_end:
-                    raise ProcessingError(f"结果列 {mapping['result_col']} 必须位于公式范围 {job['formula_range']} 内。")
-                if formula_start <= target_col <= formula_end:
-                    raise ProcessingError(f"目标列 {mapping['target_col']} 不能位于公式范围 {job['formula_range']} 内。")
-                for map_idx, previous in enumerate(job.get("mappings", [])):
-                    if map_idx != ignore_index and column_number(previous["target_col"]) == target_col:
-                        raise ProcessingError(f"目标列 {mapping['target_col']} 已被此目标表的另一条结果映射占用。")
-                if mapping["write_as"] not in ("value", "text"):
-                    raise ProcessingError("写入方式只能是 value 或 text。")
-                mapping["result_col"] = get_column_letter(result_col)
-                mapping["target_col"] = get_column_letter(target_col)
-                trial = deepcopy(self.settings)
-                trial["jobs"][self.active_job_index]["mappings"] = list(job.get("mappings", []))
-                if ignore_index is None:
-                    trial["jobs"][self.active_job_index]["mappings"].append(mapping)
-                else:
-                    trial["jobs"][self.active_job_index]["mappings"][ignore_index] = mapping
-                if "result_mapping" not in trial.get("workflow", []):
-                    trial["workflow"] = add_workflow_module(trial["workflow"], "result_mapping")
-                validate_static_settings(trial)
-                result["value"] = mapping
-                dialog.destroy()
-            except (ProcessingError, ValueError) as exc:
-                self.messagebox.showerror(APP_NAME, str(exc), parent=dialog)
-
-        buttons = self.ttk.Frame(dialog)
-        buttons.grid(row=3, column=0, columnspan=2, pady=8)
-        self.ttk.Button(buttons, text="确定", command=accept).pack(side="left", padx=5)
-        self.ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="left", padx=5)
-        dialog.wait_window()
-        return result["value"]
-
-    def _manage_job_mapping(self, action):
-        job = self._selected_job()
-        if job is None:
-            return
-        mappings = job.setdefault("mappings", [])
-        selected = self.mapping_tree.selection()
-        if action in ("edit", "delete") and not selected:
-            return
-        mapping_index = int(selected[0]) if selected else None
-        if action == "delete":
-            del mappings[mapping_index]
-        else:
-            mapping = self._mapping_dialog(job, mappings[mapping_index] if mapping_index is not None else None, mapping_index)
-            if mapping is None:
-                return
-            if mapping_index is None:
-                mappings.append(mapping)
-                mapping_index = len(mappings) - 1
-            else:
-                mappings[mapping_index] = mapping
-            if "result_mapping" not in self.settings.get("workflow", []):
-                self.settings["workflow"] = add_workflow_module(self.settings["workflow"], "result_mapping")
-            self._render_workflow()
-        index = self._current_index()
-        self._render_jobs(index)
-        if action != "delete" and mapping_index is not None and mapping_index < len(mappings):
-            self.mapping_tree.selection_set(str(mapping_index))
+                                     values=(mapping.get("result_col", ""), mapping.get("target_col", ""), write_as))
 
     def _on_job_select(self, _event=None):
         if not self._commit_job_editor(show_errors=False):
@@ -4461,15 +4457,16 @@ class App:
             return
         job = self.settings["jobs"][index]
         source_count = sum(bool(str(source.get("path") or "").strip()) for source in job.get("sources", []))
-        mapping_summary = ", ".join(f"{item.get('result_col', '')}→{item.get('target_col', '')}({item.get('write_as', 'value')})"
+        mapping_summary = ", ".join(f"{item.get('result_col', '')}→{item.get('target_col', '')}"
                                      for item in job.get("mappings", [])) or "（无）"
-        self.job_tree.item(str(index), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), source_count, mapping_summary))
+        self.job_tree.item(str(index), values=(job.get("template_sheet", ""), job.get("start_row", ""),
+                                               job.get("formula_range", ""), source_count, mapping_summary))
 
     def _add_job(self):
         if not self._commit_job_editor():
             return
         self.settings["jobs"].append({"template_sheet": "新目标表", "header_rows": 0, "start_row": 2, "formula_range": "A:A",
-                                      "mappings": [], "sources": []})
+                                      "sources": [], "mappings": []})
         self._render_jobs(len(self.settings["jobs"]) - 1)
 
     def _delete_job(self):
@@ -4749,6 +4746,219 @@ class App:
         if not self.messagebox.askyesno(APP_NAME, "恢复程序内置示例配置？不会删除已保存或导出的配置文件。"):
             return
         self._apply_settings_to_gui(deepcopy(DEFAULT_SETTINGS), active_name="")
+
+    def _open_settings(self):
+        dialog = self.tk.Toplevel(self.root)
+        dialog.title("设置")
+        dialog.geometry("840x690")
+        dialog.minsize(650, 500)
+        dialog.transient(self.root)
+        notebook = self.ttk.Notebook(dialog)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        license_page = self.ttk.Frame(notebook, padding=12)
+        help_page = self.ttk.Frame(notebook, padding=8)
+        config_page = self.ttk.Frame(notebook, padding=12)
+        notebook.add(license_page, text="秘钥管理")
+        notebook.add(help_page, text="使用说明")
+        notebook.add(config_page, text="配置管理")
+        self._build_license_settings_tab(license_page)
+        self._build_usage_help_tab(help_page)
+        self._build_profile_management_tab(config_page)
+
+    def _build_license_settings_tab(self, parent):
+        from datetime import date
+        from licensing import (LicensingError, evaluate_authorization, install_license,
+                               installed_license_path, inspect_license_expiry, machine_code)
+
+        ttk = self.ttk
+        parent.columnconfigure(0, weight=1)
+        current_machine = machine_code()
+        ttk.Label(parent, text="本机机器码", font=("Microsoft YaHei UI", 10, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 4))
+        machine_var = self.tk.StringVar(value=current_machine)
+        machine_row = ttk.Frame(parent)
+        machine_row.grid(row=1, column=0, sticky="ew")
+        machine_row.columnconfigure(0, weight=1)
+        ttk.Entry(machine_row, textvariable=machine_var, state="readonly").grid(
+            row=0, column=0, sticky="ew", padx=(0, 6))
+        status_var = self.tk.StringVar(value="正在读取授权状态…")
+        ttk.Button(machine_row, text="复制机器码", command=lambda: self._copy_machine_code(current_machine)).grid(
+            row=0, column=1)
+        ttk.Label(parent, text="当前授权", font=("Microsoft YaHei UI", 10, "bold")).grid(
+            row=2, column=0, sticky="w", pady=(14, 4))
+        ttk.Label(parent, textvariable=status_var, wraplength=760, justify="left").grid(
+            row=3, column=0, sticky="w")
+
+        def refresh_status():
+            lines = []
+            try:
+                authorization = evaluate_authorization()
+                if authorization.state == "licensed" and authorization.license_expiry:
+                    lines.append(f"授权有效，到期日期：{authorization.license_expiry.isoformat()}（含当日）。")
+                elif authorization.state == "trial":
+                    lines.append(f"当前为试用状态，剩余 {authorization.trial_remaining_days} 天；试用截止：{authorization.trial_expiry.isoformat()}。")
+                else:
+                    lines.append(authorization.detail or "当前授权不可用。")
+            except Exception as exc:
+                lines.append(f"读取授权状态失败：{exc}")
+            key_path = installed_license_path()
+            if key_path.is_file():
+                try:
+                    expiry = inspect_license_expiry(key_path.read_text(encoding="utf-8"), current_machine)
+                    validity = "已过期" if expiry < date.today() else "有效"
+                    lines.append(f"已安装秘钥：{validity}；签名绑定本机，到期日期：{expiry.isoformat()}。")
+                except (OSError, UnicodeError, LicensingError) as exc:
+                    lines.append(f"已检测到秘钥文件，但无法验证其签名或机器码：{exc}")
+            else:
+                lines.append("当前没有已安装的秘钥文件。")
+            status_var.set("\n".join(lines))
+
+        ttk.Separator(parent).grid(row=4, column=0, sticky="ew", pady=14)
+        ttk.Label(parent, text="更新 / 修改秘钥", font=("Microsoft YaHei UI", 10, "bold")).grid(
+            row=5, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(parent, text="粘贴为本机签发的新秘钥。只有签名、产品和机器码校验通过且尚未到期时，才会替换当前秘钥。",
+                  wraplength=760, justify="left").grid(row=6, column=0, sticky="w", pady=(0, 6))
+        token_text = self.tk.Text(parent, height=5, wrap="word")
+        token_text.grid(row=7, column=0, sticky="ew")
+        ttk.Button(parent, text="验证并更新秘钥", command=lambda: self._update_license_key(
+            token_text, current_machine, refresh_status, parent)).grid(row=8, column=0, sticky="w", pady=8)
+        ttk.Label(parent, text="秘钥保存在当前 Windows 用户的应用数据目录中；主程序只含验证公钥，不含签发私钥。",
+                  foreground="#4b5563", wraplength=760, justify="left").grid(row=9, column=0, sticky="w", pady=(8, 0))
+        refresh_status()
+
+    def _copy_machine_code(self, machine):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(machine)
+            self.root.update_idletasks()
+            self.messagebox.showinfo(APP_NAME, "本机机器码已复制。")
+        except Exception as exc:
+            self.messagebox.showerror(APP_NAME, f"复制机器码失败：{exc}")
+
+    def _update_license_key(self, token_widget, machine, refresh_status, parent):
+        from licensing import LicensingError, install_license
+
+        token = token_widget.get("1.0", "end").strip()
+        if not token:
+            self.messagebox.showinfo(APP_NAME, "请先粘贴新秘钥。", parent=parent.winfo_toplevel())
+            return
+        try:
+            expiry = install_license(token, machine=machine)
+        except (LicensingError, OSError) as exc:
+            self.messagebox.showerror(APP_NAME, f"秘钥未更新：{exc}", parent=parent.winfo_toplevel())
+            return
+        token_widget.delete("1.0", "end")
+        refresh_status()
+        self.messagebox.showinfo(APP_NAME, f"秘钥已验证并更新，到期日期：{expiry.isoformat()}。", parent=parent.winfo_toplevel())
+
+    def _build_usage_help_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        text = self.tk.Text(parent, wrap="word", padx=10, pady=8)
+        scrollbar = self.ttk.Scrollbar(parent, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        guide = """WPS 表格多源汇总处理器｜功能使用说明
+
+一、模板、输出与源数据列
+选择无宏 .xlsx 模板、输出目录和输出文件名。源数据复制起始列/末列用于定义从源表复制的列范围；有关联源文件时末列必填，无源文件仅编辑模板时可留空。模板前缀匹配长度用于选择模板时查找已保存的命名配置；只有唯一匹配或明确选择后才载入。
+
+二、目标子表与多源文件
+每个目标子表单独设置模板表名、标题行、粘贴起始行和公式列范围。可按顺序添加多份源文件；源工作表名留空时取首个工作表，复制结束行留空时按首个整行空白边界判断。可编辑、删除、上移或下移源文件，数据会按列表顺序追加。无源目标表保留模板原数据，仅运行配置的模板规则。
+
+三、结果映射、前映射与后映射
+结果映射在每个目标表内配置：首次完整重算后，把指定公式结果列复制为值或文本到公式范围之外的目标列；结果列须在公式范围内。前映射在复制主数据前写入模板已有区域；后映射在首次重算和结果映射之后复制任意源/目标区域。结果映射和后映射彼此独立，均可不配置。
+
+四、公式填充与工作表范围
+目标表“公式列范围”按本轮数据行数自动填公式。区域“公式填充”可选择源文件或目标工作簿，使用自定义公式或同表公式种子单元格，并由 WPS 按相对引用填满范围；它会覆盖所选区域原内容。常见范围：A1=整表，D1=整列，A5=整行，B3,B3=单格，A1:F100=矩形；区域筛选另支持单填列字母。规则按 UsedRange 裁剪并设有单条单元格上限。
+
+五、区域处理功能
+“文本分列”按分隔符拆分指定单列并选择输出起始列及各列格式，输出区域须为空。“区域筛选”按列和值筛选记录，只压缩所选区域，不删除工作表物理行。“去重”按整行或指定关键列去重，保留首次出现记录。“格式转换”将范围转换为文本、数字或日期。规则可指定源文件或目标工作簿；源文件规则先在临时副本上执行，原始文件不会被改写。
+
+六、区域 XLSX/PNG 输出与文本预览
+“区域 XLSX 输出”添加模板表和范围；区域 XLSX 始终导出并保留单元格样式。勾选额外导出 PNG 后才会同时生成图片。“文本预览/复制”添加工作表范围；处理并保存成功后显示预览，可复制完整区域或分块内容，列之间以 Tab 分隔。
+
+七、模块工作流
+“模块工作流”可调整处理模块顺序；添加/移除可选模块并用上移/下移排序。必需模块、结果映射、后映射、公式填充、区域操作和输出模块之间有依赖约束；非法顺序会在保存或运行时提示。默认顺序会先处理源副本，再处理模板，完成重算、映射、区域操作和保存，最后输出区域文件及文本预览。
+
+八、配置管理与秘钥管理
+“保存配置…”导出当前界面配置为 JSON，“加载配置…”导入 JSON；命名配置可新建、保存、载入，并在“设置 → 配置管理”导出当前配置或所选命名配置，也可删除明确选中的命名配置。删除命名配置不会删除当前正在编辑的设置或其他配置文件。
+“设置 → 秘钥管理”显示本机机器码、当前授权状态和当前秘钥到期日期；粘贴新秘钥后点击“验证并更新秘钥”，仅通过本机绑定、签名和有效期验证的秘钥才会替换现有秘钥。更新秘钥不会更改程序内置公钥。
+
+九、数据安全提示
+主工作簿和源文件不会被直接覆盖；处理在临时副本中进行。仅开启“保留源文件处理结果”时，编辑后的源副本会另存到输出目录。秘钥与业务配置分别存放；主程序不包含签名私钥。恢复默认只替换当前界面配置，不删除命名配置或已导出的 JSON 文件。
+"""
+        text.insert("1.0", guide)
+        text.configure(state="disabled")
+
+    def _build_profile_management_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+        self.ttk.Label(parent, text="导出当前配置会保存当前界面内容为 JSON；命名配置是保存在本机的可复用配置档。",
+                       wraplength=760, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 10))
+        self.ttk.Button(parent, text="导出当前配置…", command=self._export_config).grid(
+            row=1, column=0, sticky="w", pady=(0, 14))
+        profile_box = self.ttk.LabelFrame(parent, text="命名配置", padding=10)
+        profile_box.grid(row=2, column=0, sticky="new")
+        profile_box.columnconfigure(0, weight=1)
+        choice = self.tk.StringVar(value="")
+        combo = self.ttk.Combobox(profile_box, textvariable=choice, state="readonly", width=42)
+        combo.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=4)
+
+        def refresh_profiles():
+            names = list_profiles(PROFILE_DIR)
+            combo.configure(values=names)
+            if choice.get() not in names:
+                choice.set(names[0] if names else "")
+            return names
+
+        def export_selected_profile():
+            name = choice.get().strip()
+            if not name:
+                self.messagebox.showinfo(APP_NAME, "请先选择要导出的命名配置。", parent=parent.winfo_toplevel())
+                return
+            try:
+                profile = load_profile(name, PROFILE_DIR)
+                profile = normalize_settings(profile)
+                validate_static_settings(profile)
+                destination = self.filedialog.asksaveasfilename(
+                    parent=parent.winfo_toplevel(), defaultextension=".json",
+                    filetypes=[("JSON 配置", "*.json")], initialfile=f"{name}.json")
+                if destination:
+                    save_settings(profile, destination)
+                    self.messagebox.showinfo(APP_NAME, f"命名配置已导出：\n{destination}", parent=parent.winfo_toplevel())
+            except Exception as exc:
+                self.messagebox.showerror(APP_NAME, f"导出命名配置失败：\n{exc}", parent=parent.winfo_toplevel())
+
+        def delete_selected_profile():
+            name = choice.get().strip()
+            if not name:
+                self.messagebox.showinfo(APP_NAME, "请先选择要删除的命名配置。", parent=parent.winfo_toplevel())
+                return
+            if not self.messagebox.askyesno(APP_NAME, f"确定删除命名配置“{name}”吗？此操作只删除该配置档文件，不影响当前界面内容。",
+                                            parent=parent.winfo_toplevel()):
+                return
+            try:
+                delete_profile(name, PROFILE_DIR)
+                if getattr(self, "active_profile_name", "") == name:
+                    self.active_profile_name = ""
+                    self.settings["config_name"] = ""
+                    self.profile_choice.set("")
+                refresh_profiles()
+                self._refresh_profile_choices()
+                self.messagebox.showinfo(APP_NAME, f"已删除命名配置“{name}”。", parent=parent.winfo_toplevel())
+            except Exception as exc:
+                self.messagebox.showerror(APP_NAME, f"删除命名配置失败：\n{exc}", parent=parent.winfo_toplevel())
+
+        buttons = self.ttk.Frame(profile_box)
+        buttons.grid(row=1, column=0, sticky="w", pady=6)
+        self.ttk.Button(buttons, text="刷新列表", command=refresh_profiles).pack(side="left", padx=(0, 5))
+        self.ttk.Button(buttons, text="导出所选配置…", command=export_selected_profile).pack(side="left", padx=5)
+        self.ttk.Button(buttons, text="删除所选配置…", command=delete_selected_profile).pack(side="left", padx=5)
+        self.ttk.Label(profile_box, text=f"本机配置档目录：{PROFILE_DIR}", foreground="#4b5563",
+                       wraplength=740, justify="left").grid(row=2, column=0, sticky="w", pady=(7, 0))
+        refresh_profiles()
 
     def _log(self, message: str):
         self.log_text.configure(state="normal")

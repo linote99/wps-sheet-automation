@@ -135,9 +135,8 @@ def generate_license(machine: str, expires: date | str, private_key_pem: bytes |
     return _b64url_encode(payload) + "." + _b64url_encode(raw_signature)
 
 
-def verify_license(token: str, machine: str, public_key_b64: str = PUBLIC_KEY_B64,
-                   today: date | None = None) -> date:
-    """Verify signature, product, exact machine binding, and inclusive expiry date."""
+def inspect_license_expiry(token: str, machine: str, public_key_b64: str = PUBLIC_KEY_B64) -> date:
+    """Verify a license's signature and machine binding, then return its expiry even if expired."""
     pieces = str(token or "").strip().split(".")
     if len(pieces) != 2:
         raise LicensingError("秘钥格式不正确。")
@@ -174,6 +173,13 @@ def verify_license(token: str, machine: str, public_key_b64: str = PUBLIC_KEY_B6
         raise LicensingError("秘钥中的机器码或到期日期无效。") from exc
     if claim_machine != normalize_machine_code(machine):
         raise LicensingError("此秘钥绑定了另一台电脑的机器码。")
+    return expiry
+
+
+def verify_license(token: str, machine: str, public_key_b64: str = PUBLIC_KEY_B64,
+                   today: date | None = None) -> date:
+    """Verify signature, product, exact machine binding, and inclusive expiry date."""
+    expiry = inspect_license_expiry(token, machine, public_key_b64)
     if (today or date.today()) > expiry:
         raise LicensingError(f"授权已于 {expiry.isoformat()} 到期。")
     return expiry
