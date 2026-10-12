@@ -168,34 +168,74 @@ class FakePictureRange:
     Width = 120
     Height = 60
 
-    def __init__(self, address, events):
+    def __init__(self, address, events, should_fail_copy=False):
         self.address = address
         self.events = events
+        self.should_fail_copy = should_fail_copy
 
     def CopyPicture(self, **_kwargs):
         self.events.append(("copy-picture", self.address))
+        if self.should_fail_copy:
+            raise RuntimeError("fake picture copy failure")
+
+
+class FakeComCount:
+    def __init__(self, count):
+        self.Count = count
+
+
+class FakeMergedRange:
+    def __init__(self, bounds):
+        self.min_col, self.min_row, self.max_col, self.max_row = bounds
+        self.Column = self.min_col
+        self.Row = self.min_row
+        self.Columns = FakeComCount(self.max_col - self.min_col + 1)
+        self.Rows = FakeComCount(self.max_row - self.min_row + 1)
+
+
+class FakePictureCell:
+    def __init__(self, merge_bounds):
+        self.MergeCells = merge_bounds is not None
+        self.MergeArea = FakeMergedRange(merge_bounds) if merge_bounds is not None else None
 
 
 class FakePictureWorksheet:
-    def __init__(self, title, events, should_fail=False):
+    def __init__(self, title, events, should_fail=False, merges=None, copy_should_fail=False):
         self.title = title
         self.events = events
         self.should_fail = should_fail
+        self.copy_should_fail = copy_should_fail
+        self.merges = list(merges or [])
+        self.hidden_state = {"columns": {"C": True, "E": True}, "rows": {3: True}}
 
     def Range(self, address):
-        return FakePictureRange(address, self.events)
+        return FakePictureRange(address, self.events, self.copy_should_fail)
+
+    def Cells(self, row, col):
+        for bounds in self.merges:
+            min_col, min_row, max_col, max_row = bounds
+            if min_col <= col <= max_col and min_row <= row <= max_row:
+                return FakePictureCell(bounds)
+        return FakePictureCell(None)
 
     def ChartObjects(self):
         return FakePictureChartObjects(self.events, self.should_fail)
 
 
 class FakePictureWorkbook:
-    def __init__(self, events, should_fail=False):
+    def __init__(self, events, should_fail=False, merges_by_sheet=None, copy_should_fail=False):
         self.events = events
         self.should_fail = should_fail
+        self.merges_by_sheet = merges_by_sheet or {}
+        self.copy_should_fail = copy_should_fail
+        self.worksheets = {}
 
     def Worksheets(self, name):
-        return FakePictureWorksheet(name, self.events, self.should_fail)
+        if name not in self.worksheets:
+            self.worksheets[name] = FakePictureWorksheet(
+                name, self.events, self.should_fail, self.merges_by_sheet.get(name, []), self.copy_should_fail
+            )
+        return self.worksheets[name]
 
 
 def make_test_workbook(path: Path, sheets: list[tuple[str, dict[int, dict[int, object]]]]) -> None:
@@ -272,6 +312,109 @@ def make_sortstate_workbook(path: Path) -> None:
     corrupt_sortstate_ref(path, "xl/worksheets/sheet1.xml", "A1:B3", "3:393")
 
 
+class WindowsLaunchPackagingTests(unittest.TestCase):
+    project_dir = Path(__file__).resolve().parent
+
+    def test_requirements_declare_windows_pywin32(self):
+        requirements = (self.project_dir / "requirements.txt").read_text(encoding="utf-8")
+        self.assertRegex(
+            requirements,
+            r"(?im)^\s*pywin32\s*>=\s*306\s*;\s*platform_system\s*==\s*['\"]Windows['\"]",
+        )
+
+    def test_installer_pins_runtime_commands_to_venv_and_checks_com_first(self):
+        installer = (self.project_dir / "install_and_build.bat").read_text(encoding="utf-8").lower()
+        self.assertIn('set "venv_py=%~dp0.venv\\scripts\\python.exe"', installer)
+        self.assertIn('set "log_file=%~dp0install_and_build.log"', installer)
+        self.assertIn('"%venv_py%" -c "import sys, importlib.metadata as metadata, pythoncom, win32com.client;', installer)
+        self.assertIn('"%venv_py%" -m pip install -r "%~dp0requirements.txt"', installer)
+        self.assertIn('"%venv_py%" -m pyinstaller', installer)
+        self.assertIn("--hidden-import=pythoncom", installer)
+        self.assertIn("--hidden-import=pywintypes", installer)
+        self.assertIn("--hidden-import=win32timezone", installer)
+        self.assertIn("--hidden-import=win32com.client", installer)
+        self.assertIn("--collect-all win32com", installer)
+        self.assertIn("goto failed", installer)
+        self.assertIn("endlocal & exit /b 1", installer)
+        self.assertIn("endlocal & exit /b 0", installer)
+        self.assertIn("if errorlevel 1 goto failed", installer)
+        self.assertNotIn("call \".venv\\scripts\\activate.bat\"", installer)
+
+        python_lines = [
+            line.strip() for line in installer.splitlines()
+            if any(marker in line for marker in (
+                "-m pip", "-m py_compile", " main.py --self-check", "-m unittest", "-m pyinstaller",
+                "-c \"import sys, importlib.metadata",
+            ))
+        ]
+        self.assertGreaterEqual(len(python_lines), 6)
+        self.assertTrue(all(line.startswith('"%venv_py%"') for line in python_lines), python_lines)
+        self.assertLess(installer.index("import sys, importlib.metadata"), installer.index("-m py_compile"))
+        self.assertLess(installer.index("import sys, importlib.metadata"), installer.index("-m pyinstaller"))
+
+    def test_run_app_resolves_its_directory_and_launches_with_venv_python(self):
+        launcher = (self.project_dir / "run_app.bat").read_text(encoding="utf-8").lower()
+        self.assertIn('cd /d "%~dp0"', launcher)
+        self.assertIn('set "venv_py=%~dp0.venv\\scripts\\python.exe"', launcher)
+        self.assertIn('"%venv_py%" -c "import sys, pythoncom, win32com.client;', launcher)
+        self.assertIn('"%venv_py%" "%~dp0main.py" %*', launcher)
+        self.assertIn("install_and_build.log", launcher)
+        self.assertNotRegex(launcher, r"(?m)^\s*python(?:\.exe)?\s")
+
+    def test_missing_pywin32_guidance_identifies_wrong_interpreter_and_launcher(self):
+        with mock.patch.object(main.sys, "executable", r"C:\Program Files\Python312\python.exe"):
+            message = main._pywin32_import_error_message(ModuleNotFoundError("No module named 'pythoncom'"))
+        self.assertIn(r"C:\Program Files\Python312\python.exe", message)
+        self.assertIn("run_app.bat", message)
+        self.assertIn("不要直接双击 main.py", message)
+        self.assertIn("install_and_build.log", message)
+
+
+class WindowSizingTests(unittest.TestCase):
+    def test_default_size_and_display_limits(self):
+        self.assertEqual((1500, 960), main.normalize_window_size(None))
+        self.assertEqual((1024, 680, 1318, 688), main.window_size_limits(1366, 768))
+        self.assertEqual((1318, 688), main.normalize_window_size(
+            {"width": 1500, "height": 960}, 1366, 768
+        ))
+        self.assertEqual((1024, 680), main.normalize_window_size(
+            {"width": 800, "height": 600}, 1366, 768
+        ))
+
+    def test_invalid_saved_dimensions_fall_back_to_defaults(self):
+        invalid_values = (
+            None,
+            {},
+            {"width": True, "height": 900},
+            {"width": "wide", "height": 900},
+            {"width": 100, "height": 900},
+            {"width": 1200, "height": 20_000},
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                self.assertEqual((1500, 960), main.normalize_window_size(value))
+        self.assertEqual((1318, 688), main.normalize_window_size(
+            {"width": "not-a-number", "height": 960}, 1366, 768
+        ))
+
+    def test_tiny_display_is_bounded_without_display_access(self):
+        min_width, min_height, max_width, max_height = main.window_size_limits(300, 200)
+        width, height = main.normalize_window_size({"width": 900, "height": 700}, 300, 200)
+        self.assertLessEqual(min_width, max_width)
+        self.assertLessEqual(min_height, max_height)
+        self.assertLessEqual(width, 300)
+        self.assertLessEqual(height, 200)
+
+    def test_window_state_file_contains_only_width_and_height(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "window_size.json"
+            self.assertTrue(main.save_window_size(1280, 820, path, 1920, 1080))
+            self.assertEqual((1280, 820), main.load_window_size(path, 1920, 1080))
+            self.assertEqual({"width": 1280, "height": 820}, json.loads(path.read_text(encoding="utf-8")))
+            path.write_text("{broken", encoding="utf-8")
+            self.assertEqual((1500, 960), main.load_window_size(path))
+
+
 class StaticConfigurationTests(unittest.TestCase):
     def test_default_and_legacy_configuration(self):
         main.validate_static_settings(main.DEFAULT_SETTINGS)
@@ -294,9 +437,26 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual({"result_col": "EQ", "target_col": "DG", "write_as": "value"}, migrated["jobs"][1]["mappings"][0])
         main.validate_static_settings(migrated)
         migrated_v5 = main.normalize_settings({"config_version": 5, "jobs": deepcopy(main.DEFAULT_SETTINGS["jobs"])})
-        self.assertEqual(6, migrated_v5["config_version"])
+        self.assertEqual(7, migrated_v5["config_version"])
         self.assertEqual(main.DEFAULT_WORKFLOW, migrated_v5["workflow"])
         self.assertEqual(5, migrated_v5["template_prefix_length"])
+
+    def test_v6_v7_formula_seed_fields_are_ignored_and_migration_is_explained(self):
+        for version in (6, 7):
+            with self.subTest(version=version):
+                legacy = deepcopy(main.DEFAULT_SETTINGS)
+                legacy["config_version"] = version
+                legacy["jobs"] = [deepcopy(legacy["jobs"][0])]
+                legacy["jobs"][0].update({"start_row": 4, "formula_seed_row": 4})
+                migrated = main.normalize_settings(legacy)
+                self.assertEqual(7, migrated["config_version"])
+                self.assertEqual(4, migrated["jobs"][0]["start_row"])
+                self.assertNotIn("formula_seed_row", migrated["jobs"][0])
+                self.assertEqual(3, main._formula_template_row(migrated["jobs"][0]))
+                notes = " ".join(main.configuration_migration_notes(legacy))
+                self.assertIn("start_row - 1", notes)
+                self.assertIn("formula_seed_row=4", notes)
+                self.assertIn("不会用于选取公式", notes)
 
     def test_ranges_and_mapping_validation(self):
         self.assertEqual(111, main.column_number("DG"))
@@ -322,6 +482,10 @@ class StaticConfigurationTests(unittest.TestCase):
         invalid["jobs"][0]["sources"][0]["copy_end_row"] = 1
         with self.assertRaises(main.ProcessingError):
             main.validate_static_settings(invalid)
+        invalid_start = deepcopy(main.DEFAULT_SETTINGS)
+        invalid_start["jobs"][0].update({"header_rows": 0, "start_row": 1})
+        with self.assertRaisesRegex(main.ProcessingError, "至少为第 2 行"):
+            main.validate_static_settings(invalid_start)
 
     def test_workflow_module_add_order_and_dependency_errors(self):
         workflow = list(main.DEFAULT_SETTINGS["workflow"])
@@ -390,7 +554,7 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual([3, 3, 4], [job["start_row"] for job in sample["jobs"]])
         self.assertEqual(["EB:EN", "EB:EU", "EB:FV"], [job["formula_range"] for job in sample["jobs"]])
         self.assertEqual(main.DEFAULT_WORKFLOW, sample["workflow"])
-        self.assertEqual(6, sample["config_version"])
+        self.assertEqual(7, sample["config_version"])
 
     def test_missing_source_path_is_located_and_reported_before_processing(self):
         settings = deepcopy(main.DEFAULT_SETTINGS)
@@ -521,6 +685,17 @@ class StaticConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(main.ProcessingError, "前映射目标.*与主数据复制区域.*冲突"):
             main._validate_pre_mapping_conflicts(settings, records)
 
+    def test_pre_mapping_cannot_overwrite_formula_template_row(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["copy_end_col"] = "C"
+        settings["jobs"] = [deepcopy(settings["jobs"][0])]
+        settings["jobs"][0]["start_row"] = 3
+        settings["pre_mappings"] = [{
+            "source_sheet": "源", "source_range": "A1", "target_sheet": "1当天派单", "target_range": "EB2"
+        }]
+        with self.assertRaisesRegex(main.ProcessingError, "前映射目标.*与公式模板区域.*冲突"):
+            main._validate_pre_mapping_conflicts(settings, [[ ["DATA"] ]])
+
     def test_text_and_value_mapping_writer(self):
         text_range = FakeComRange()
         main._write_mapped_values(text_range, [12, None, "001"], "text")
@@ -545,6 +720,46 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertEqual({path.name for path in paths}, {path.name for path in output_dir.iterdir()})
             self.assertEqual(2, events.count("chart-delete"))
 
+    def test_image_export_expands_repeatedly_to_merged_area_closure_without_changing_hidden_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            events = []
+            # B2:C3 first reaches B2:D2, then D3:E4 and B4:B5 via the expanded rectangle.
+            merges = [(2, 2, 4, 2), (4, 3, 5, 4), (2, 4, 2, 5)]
+            workbook = FakePictureWorkbook(events, merges_by_sheet={"S": merges})
+            worksheet = workbook.Worksheets("S")
+            hidden_before = deepcopy(worksheet.hidden_state)
+            output = {"sheet": "S", "range": "B2:C3"}
+            logs = []
+
+            paths = main._export_image_areas_from_workbook(workbook, [output], output_dir, logs.append)
+
+            self.assertEqual(["S_B2-E5_001.png"], [path.name for path in paths])
+            self.assertIn(("copy-picture", "B2:E5"), events)
+            self.assertEqual("B2:C3", output["range"], "导出闭包不得写回用户配置")
+            self.assertEqual(hidden_before, worksheet.hidden_state, "不得临时取消隐藏或改变隐藏状态")
+            self.assertTrue(any("自动扩展为 B2:E5" in message for message in logs))
+
+    def test_image_export_rechecks_safety_limit_after_merged_area_expansion(self):
+        with tempfile.TemporaryDirectory() as td:
+            workbook = FakePictureWorkbook([], merges_by_sheet={"S": [(2, 2, 4, 2 + main.MAX_IMAGE_ROWS)]})
+            with self.assertRaisesRegex(main.ProcessingError, "WPS 图片安全上限"):
+                main._export_image_areas_from_workbook(
+                    workbook, [{"sheet": "S", "range": "B2"}], Path(td), lambda _msg: None
+                )
+
+    def test_image_export_copy_picture_failure_names_stage_and_area(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            events = []
+            with self.assertRaisesRegex(main.ProcessingError, "CopyPicture 阶段.*S!B2.*fake picture copy failure"):
+                main._export_image_areas_from_workbook(
+                    FakePictureWorkbook(events, copy_should_fail=True),
+                    [{"sheet": "S", "range": "B2"}], output_dir, lambda _msg: None
+                )
+            self.assertEqual([], list(output_dir.iterdir()))
+            self.assertFalse(any(event == "chart-add" for event in events))
+
     def test_image_export_avoids_overwrite_and_cleans_temp_files_on_failure(self):
         with tempfile.TemporaryDirectory() as td:
             output_dir = Path(td)
@@ -559,7 +774,7 @@ class StaticConfigurationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             output_dir = Path(td)
             events = []
-            with self.assertRaisesRegex(RuntimeError, "fake picture export failure"):
+            with self.assertRaisesRegex(main.ProcessingError, "PNG 导出阶段失败.*fake picture export failure"):
                 main._export_image_areas_from_workbook(
                     FakePictureWorkbook(events, should_fail=True), [{"sheet": "S", "range": "A1,A1"}], output_dir, lambda _msg: None
                 )
@@ -808,6 +1023,148 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertEqual("preview", previews[0]["text"])
             self.assertEqual(b"FAKE-PNG", (fake / "output" / "simulated.png").read_bytes())
 
+    def test_png_failure_preserves_valid_wps_saved_xlsx_and_reports_exact_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({"copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
+                             "output_dir": str(fake / "output"), "output_filename": "png-failure.xlsx",
+                             "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}]})
+            for idx, job in enumerate(settings["jobs"], 1):
+                job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
+                                   "copy_start_row": 2, "copy_end_row": 3}]
+            final_path = Path(settings["output_dir"]) / settings["output_filename"]
+
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _region_processing):
+                workbook = load_workbook(path, data_only=False)
+                workbook["1当天派单"]["A3"] = "SAVED-BY-FAKE-WPS"
+                workbook.save(path)
+                workbook.close()
+
+            with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
+                 mock.patch.object(main, "_export_image_areas_wps",
+                                   side_effect=main.ProcessingError("WPS 的 PNG 导出阶段失败，区域为 1当天派单!A1:B2：模拟导出异常")):
+                with self.assertRaises(main.ProcessingError) as caught:
+                    main.process_workbooks(settings, lambda _msg: None)
+
+            message = str(caught.exception)
+            self.assertIn("图片 PNG 输出失败", message)
+            self.assertIn("WPS 已完成计算并成功保存 XLSX", message)
+            self.assertIn(str(final_path), message)
+            self.assertTrue(final_path.is_file())
+            saved = load_workbook(final_path, data_only=False, read_only=True)
+            try:
+                self.assertEqual("SAVED-BY-FAKE-WPS", saved["1当天派单"]["A3"].value)
+            finally:
+                saved.close()
+            self.assertEqual([final_path], list(Path(settings["output_dir"]).iterdir()))
+
+    def test_text_output_failure_keeps_existing_no_final_publish_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({"copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
+                             "output_dir": str(fake / "output"), "output_filename": "text-failure.xlsx",
+                             "text_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}]})
+            for idx, job in enumerate(settings["jobs"], 1):
+                job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
+                                   "copy_start_row": 2, "copy_end_row": 3}]
+
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _region_processing):
+                workbook = load_workbook(path, data_only=False)
+                workbook.save(path)
+                workbook.close()
+
+            with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
+                 mock.patch.object(main, "_read_text_output_areas",
+                                   side_effect=main.ProcessingError("模拟文本输出失败")):
+                with self.assertRaisesRegex(main.ProcessingError, "模拟文本输出失败"):
+                    main.process_workbooks(settings, lambda _msg: None)
+            self.assertEqual([], list(Path(settings["output_dir"]).iterdir()))
+
+    def test_workbook_publish_never_overwrites_existing_destination(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            staging = root / "staging.xlsx"
+            final_path = root / "result.xlsx"
+            staging.write_bytes(b"NEW-WORKBOOK")
+            final_path.write_bytes(b"EXISTING-USER-FILE")
+
+            with self.assertRaises(main.ProcessingError) as caught:
+                main._publish_staging_workbook(staging, final_path)
+
+            self.assertIn("为避免覆盖", str(caught.exception))
+            self.assertIn(str(final_path), str(caught.exception))
+            self.assertEqual(b"EXISTING-USER-FILE", final_path.read_bytes())
+            self.assertEqual(b"NEW-WORKBOOK", staging.read_bytes())
+
+    def test_formula_templates_use_previous_row_and_fill_only_pasted_rows(self):
+        for start_row in (3, 4):
+            with self.subTest(start_row=start_row), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                template_path = root / "template.xlsx"
+                template = Workbook()
+                ws = template.active
+                ws.title = "模板"
+                template_row = start_row - 1
+                ws.cell(template_row, 1).value = f"KEEP-TEMPLATE-ROW-{template_row}"
+                original_formulas = {}
+                for col in (column_index_from_string("EB"), column_index_from_string("EC")):
+                    letter = get_column_letter(col)
+                    formula = f'=IF($A{template_row}="", "", $A{template_row}&"-{letter}")'
+                    ws.cell(template_row, col).value = formula
+                    original_formulas[letter] = formula
+                template.save(template_path)
+                template.close()
+
+                settings = deepcopy(main.DEFAULT_SETTINGS)
+                settings["jobs"] = [deepcopy(settings["jobs"][0])]
+                settings["jobs"][0].update({
+                    "template_sheet": "模板", "header_rows": 0, "start_row": start_row,
+                    "formula_range": "EB:EC",
+                    "mappings": [{"result_col": "EB", "target_col": "DG", "write_as": "value"}],
+                })
+                records = [[f"DATA-{start_row}-1"], [f"DATA-{start_row}-2"], [f"DATA-{start_row}-3"]]
+                staging_path = root / "staging.xlsx"
+                formula_jobs = main._create_staging_workbook(
+                    template_path, settings, [records], staging_path, lambda _msg: None
+                )
+                self.assertEqual([("模板", start_row, start_row + len(records) - 1,
+                                   [{"result_col": "EB", "target_col": "DG", "write_as": "value"}])], formula_jobs)
+
+                result = load_workbook(staging_path, data_only=False)
+                try:
+                    result_ws = result["模板"]
+                    self.assertEqual(f"KEEP-TEMPLATE-ROW-{template_row}", result_ws.cell(template_row, 1).value)
+                    for letter, seed_formula in original_formulas.items():
+                        self.assertEqual(seed_formula, result_ws[f"{letter}{template_row}"].value)
+                        for target_row in range(start_row, start_row + len(records)):
+                            expected = main.Translator(seed_formula, origin=f"{letter}{template_row}").translate_formula(
+                                f"{letter}{target_row}"
+                            )
+                            self.assertEqual(expected, result_ws[f"{letter}{target_row}"].value)
+                    self.assertEqual(records[0][0], result_ws.cell(start_row, 1).value)
+                    self.assertEqual(records[-1][0], result_ws.cell(start_row + len(records) - 1, 1).value)
+                finally:
+                    result.close()
+
+    def test_formula_template_missing_columns_are_reported_together(self):
+        workbook = Workbook()
+        ws = workbook.active
+        ws.title = "模板"
+        ws["EB2"] = "=A2"
+        ws["ED2"] = "=C2"
+        with self.assertRaisesRegex(main.ProcessingError, r"第 2 行.*EC、EE"):
+            main._get_formula_templates(
+                workbook,
+                {"template_sheet": "模板", "start_row": 3, "formula_range": "EB:EE"},
+                1,
+                3,
+            )
+        workbook.close()
+
     def test_source_bounds_multi_source_order_and_formula_seed_fill(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -836,7 +1193,7 @@ class StaticConfigurationTests(unittest.TestCase):
             for job in settings["jobs"]:
                 ws = wb[job["template_sheet"]]
                 first, last = main.parse_column_range(job["formula_range"])
-                row = job["start_row"]
+                row = job["start_row"] - 1
                 for col in range(first, last + 1):
                     ws.cell(row=row, column=col).value = f'=IF($A{row}="", "", $A{row}&"-演示")'
             wb.save(template_path)
@@ -867,6 +1224,8 @@ class StaticConfigurationTests(unittest.TestCase):
                     self.assertEqual(records[0][0], ws.cell(start, 1).value)
                     self.assertEqual(records[-1][0], ws.cell(last, 1).value)
                     first_formula_col, _ = main.parse_column_range(job["formula_range"])
+                    template_row = start - 1
+                    self.assertTrue(ws.cell(template_row, first_formula_col).value.startswith("=IF("))
                     self.assertTrue(ws.cell(start, first_formula_col).value.startswith("=IF("))
                     self.assertTrue(ws.cell(last, first_formula_col).value.startswith("=IF("))
                     self.assertIn(f"${get_column_letter(1)}{last}", ws.cell(last, first_formula_col).value)
@@ -924,7 +1283,7 @@ class StaticConfigurationTests(unittest.TestCase):
             ws = template[job["template_sheet"]]
             formula_start, formula_end = main.parse_column_range(job["formula_range"])
             for col in range(formula_start, formula_end + 1):
-                ws.cell(row=5, column=col).value = '=IF($A5="", "", $A5&"-演示")'
+                ws.cell(row=4, column=col).value = '=IF($A4="", "", $A4&"-演示")'
             template.save(settings["template_path"])
             template.close()
             main.validate_static_settings(settings)
@@ -945,6 +1304,7 @@ class StaticConfigurationTests(unittest.TestCase):
                 self.assertEqual(["SRC1-1", "SRC1-2", "SRC2-1", "SRC2-2"],
                                  [out_ws.cell(row=row, column=1).value for row in range(5, 9)])
                 self.assertIsNone(out_ws.cell(row=9, column=1).value)
+                self.assertEqual('=IF($A4="", "", $A4&"-演示")', out_ws.cell(4, formula_start).value)
             finally:
                 output.close()
 
@@ -991,7 +1351,7 @@ class StaticConfigurationTests(unittest.TestCase):
                 main.process_workbooks(settings, lambda _msg: None)
             self.assertEqual([], list((fake / "output").iterdir()))
 
-    def test_processing_failure_leaves_no_final_or_staging_file(self):
+    def test_failure_before_wps_save_leaves_no_final_or_staging_file(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             fake = create_fake_data(root / "fake")
@@ -1194,6 +1554,131 @@ class StaticConfigurationTests(unittest.TestCase):
                 self.assertEqual("A1:C10", prepared["2当天归档"].auto_filter.sortState.ref)
             finally:
                 prepared.close()
+
+    def test_temporary_copy_closes_source_and_template_workbooks_before_unlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "source.xlsx"
+            make_test_workbook(source_path, [("数据", {1: {1: "标题"}, 2: {1: "FAKE-1"}})])
+            fake = create_fake_data(root / "fake")
+            template_path = fake / "template.xlsx"
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [deepcopy(settings["jobs"][0])]
+            settings["template_path"] = str(template_path)
+
+            def expect_processing_error(operation):
+                with self.assertRaises(main.ProcessingError):
+                    operation()
+
+            def assert_close_precedes_unlink(operation, expected_book_count):
+                events = []
+                real_load = main.load_workbook
+                real_unlink = Path.unlink
+
+                def observed_load(path, *args, **kwargs):
+                    workbook = real_load(path, *args, **kwargs)
+                    if Path(path).name.startswith("wps_sheet_autofilter_"):
+                        original_close = workbook.close
+
+                        def observed_close():
+                            events.append("close")
+                            return original_close()
+
+                        workbook.close = observed_close
+                    return workbook
+
+                def observed_unlink(path, *args, **kwargs):
+                    if path.name.startswith("wps_sheet_autofilter_"):
+                        events.append("unlink")
+                    return real_unlink(path, *args, **kwargs)
+
+                with mock.patch.object(main, "load_workbook", side_effect=observed_load), \
+                     mock.patch.object(Path, "unlink", new=observed_unlink):
+                    operation()
+                self.assertEqual(["close"] * expected_book_count + ["unlink"], events)
+
+            assert_close_precedes_unlink(
+                lambda: main._read_source_records(source_path, "数据", 2, 1, 1, lambda _msg: None, end_row=2),
+                2,
+            )
+            assert_close_precedes_unlink(
+                lambda: expect_processing_error(
+                    lambda: main._read_source_records(source_path, "不存在", 2, 1, 1, lambda _msg: None, end_row=2)
+                ),
+                2,
+            )
+            assert_close_precedes_unlink(
+                lambda: main._create_staging_workbook(
+                    template_path, settings, [[["FAKE-ROW", "x", 1]]], root / "staging.xlsx", lambda _msg: None
+                ),
+                1,
+            )
+            broken_settings = deepcopy(settings)
+            broken_settings["jobs"][0]["template_sheet"] = "不存在"
+            assert_close_precedes_unlink(
+                lambda: expect_processing_error(
+                    lambda: main._create_staging_workbook(
+                        template_path, broken_settings, [[["FAKE-ROW", "x", 1]]], root / "broken-staging.xlsx", lambda _msg: None
+                    )
+                ),
+                1,
+            )
+
+    def test_locked_temporary_copy_retries_and_warns_without_masking_read_result(self):
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.xlsx"
+            make_test_workbook(source_path, [("数据", {1: {1: "标题"}, 2: {1: "FAKE-1"}})])
+            real_unlink = Path.unlink
+
+            for requested_sheet, expected_success in (("数据", True), ("不存在", False)):
+                with self.subTest(expected_success=expected_success):
+                    messages = []
+                    attempts = []
+                    locked_paths = []
+
+                    def locked_unlink(path, *args, **kwargs):
+                        if path.name.startswith("wps_sheet_autofilter_"):
+                            attempts.append(path)
+                            locked_paths.append(path)
+                            raise PermissionError(13, "simulated sharing violation", str(path))
+                        return real_unlink(path, *args, **kwargs)
+
+                    with mock.patch.object(Path, "unlink", new=locked_unlink), \
+                         mock.patch.object(main.time, "sleep"):
+                        if expected_success:
+                            records = main._read_source_records(
+                                source_path, requested_sheet, 2, 1, 1, messages.append, end_row=2
+                            )
+                            self.assertEqual([["FAKE-1"]], records)
+                        else:
+                            with self.assertRaises(main.ProcessingError) as caught:
+                                main._read_source_records(
+                                    source_path, requested_sheet, 2, 1, 1, messages.append, end_row=2
+                                )
+                            self.assertIn("找不到配置的工作表", str(caught.exception))
+                            self.assertNotIn("无法清理", str(caught.exception))
+
+                    self.assertEqual(len(main._TEMP_COPY_CLEANUP_RETRY_DELAYS) + 1, len(attempts))
+                    self.assertTrue(locked_paths[-1].exists())
+                    warning = next(message for message in messages if "临时读取副本" in message and "无法清理" in message)
+                    self.assertIn(str(locked_paths[-1]), warning)
+                    self.assertIn("手动删除", warning)
+                    if expected_success:
+                        self.assertIn("读取/处理已成功", warning)
+                        self.assertNotIn("Traceback", warning)
+                    else:
+                        self.assertIn("读取/处理本身已失败", warning)
+                    real_unlink(locked_paths[-1])
+
+    def test_temporary_copy_names_remain_unique(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "source.xlsx"
+            make_test_workbook(path, [("数据", {1: {1: "FAKE"}})])
+            with main._temporary_workbook_copy(path, "测试工作簿", lambda _msg: None) as first:
+                with main._temporary_workbook_copy(path, "测试工作簿", lambda _msg: None) as second:
+                    self.assertNotEqual(first.path, second.path)
+                    self.assertTrue(first.path.name.startswith("wps_sheet_autofilter_"))
+                    self.assertTrue(second.path.name.startswith("wps_sheet_autofilter_"))
 
     def test_invalid_sortstate_ref_fails_explicitly_without_deleting_sort_info(self):
         with tempfile.TemporaryDirectory() as td:

@@ -33,7 +33,24 @@ from workflow import (DEFAULT_WORKFLOW, MODULE_LABELS, add_workflow_module, list
 APP_NAME = "WPS 表格多源汇总处理器"
 CONFIG_PATH = Path.home() / ".wps_sheet_automation.json"
 PROFILE_DIR = Path.home() / ".wps_sheet_automation_profiles"
-CONFIG_VERSION = 6
+DEFAULT_WINDOW_WIDTH = 1500
+DEFAULT_WINDOW_HEIGHT = 960
+MIN_WINDOW_WIDTH = 1024
+MIN_WINDOW_HEIGHT = 680
+
+
+def _window_size_path() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return base / "WpsSheetAutomation" / "window_size.json"
+    xdg_config = os.environ.get("XDG_CONFIG_HOME", "")
+    base = Path(xdg_config) if xdg_config and Path(xdg_config).is_absolute() else Path.home() / ".config"
+    return base / "wps_sheet_automation" / "window_size.json"
+
+
+WINDOW_SIZE_PATH = _window_size_path()
+CONFIG_VERSION = 7
+LEGACY_FORMULA_ROW_KEYS = ("formula_seed_row", "formula_template_row", "formula_row", "seed_row")
 MAX_PROCESSING_CELLS = 500_000
 MAX_IMAGE_CELLS = 100_000
 MAX_IMAGE_ROWS = 2_000
@@ -82,6 +99,78 @@ class ProcessingError(RuntimeError):
     """An actionable error safe to show to the user."""
 
 
+def window_size_limits(screen_width: Any = None, screen_height: Any = None) -> tuple[int, int, int, int]:
+    """Return minimum and maximum window dimensions, safely bounded to the display."""
+    def positive_dimension(value: Any, fallback: int) -> int:
+        try:
+            dimension = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+        return dimension if dimension > 0 else fallback
+
+    screen_width = positive_dimension(screen_width, DEFAULT_WINDOW_WIDTH + 64)
+    screen_height = positive_dimension(screen_height, DEFAULT_WINDOW_HEIGHT + 96)
+    max_width = screen_width - 48 if screen_width >= 400 else screen_width
+    max_height = screen_height - 80 if screen_height >= 320 else screen_height
+    max_width, max_height = max(1, max_width), max(1, max_height)
+    return (min(MIN_WINDOW_WIDTH, max_width), min(MIN_WINDOW_HEIGHT, max_height), max_width, max_height)
+
+
+def normalize_window_size(saved: Any, screen_width: Any = None,
+                          screen_height: Any = None) -> tuple[int, int]:
+    """Validate saved width/height and clamp them to the current display."""
+    min_width, min_height, max_width, max_height = window_size_limits(screen_width, screen_height)
+
+    def parse_dimension(value: Any, minimum: int) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            dimension = value
+        elif isinstance(value, str) and re.fullmatch(r"[0-9]{1,5}", value.strip()):
+            dimension = int(value.strip())
+        else:
+            return None
+        return dimension if minimum <= dimension <= 16_384 else None
+
+    width = height = None
+    if isinstance(saved, dict):
+        width = parse_dimension(saved.get("width"), 320)
+        height = parse_dimension(saved.get("height"), 240)
+    if width is None or height is None:
+        width, height = DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT
+    return (min(max(width, min_width), max_width), min(max(height, min_height), max_height))
+
+
+def load_window_size(path: Path | str | None = None, screen_width: Any = None,
+                     screen_height: Any = None) -> tuple[int, int]:
+    """Load only the prior window dimensions; malformed or missing state uses defaults."""
+    state_path = Path(path) if path is not None else WINDOW_SIZE_PATH
+    try:
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        saved = None
+    return normalize_window_size(saved, screen_width, screen_height)
+
+
+def save_window_size(width: Any, height: Any, path: Path | str | None = None,
+                     screen_width: Any = None, screen_height: Any = None) -> bool:
+    """Persist only validated dimensions, atomically; return False on I/O failure."""
+    state_path = Path(path) if path is not None else WINDOW_SIZE_PATH
+    size = normalize_window_size({"width": width, "height": height}, screen_width, screen_height)
+    temporary = state_path.with_name(state_path.name + ".tmp")
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps({"width": size[0], "height": size[1]}), encoding="utf-8")
+        os.replace(temporary, state_path)
+        return True
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def column_number(value: str) -> int:
     value = str(value).strip().upper()
     if not re.fullmatch(r"[A-Z]{1,3}", value):
@@ -118,6 +207,49 @@ def _positive_row(value: Any, label: str, allow_zero: bool = False) -> int:
     if result < lower or result > 1_048_576:
         raise ProcessingError(f"{label}必须介于 {lower} 和 1048576。")
     return result
+
+
+def _formula_template_row(job: dict[str, Any]) -> int:
+    """Formula templates always come from the row immediately above pasted data."""
+    start_row = _positive_row(job.get("start_row"), "粘贴起始行")
+    if start_row <= 1:
+        raise ProcessingError("公式填充要求粘贴起始行至少为第 2 行；公式模板行自动取粘贴起始行的上一行。")
+    return start_row - 1
+
+
+def configuration_migration_notes(raw: Any) -> list[str]:
+    """Explain legacy row semantics without trusting any saved seed-row field."""
+    if not isinstance(raw, dict):
+        return []
+    try:
+        version = int(raw.get("config_version", 1))
+    except (TypeError, ValueError):
+        version = 1
+    jobs = raw.get("jobs", [])
+    if not isinstance(jobs, list):
+        jobs = []
+    notes: list[str] = []
+    if version < CONFIG_VERSION:
+        notes.append(
+            f"旧配置版本 v{version} 已按 v{CONFIG_VERSION} 规则迁移：每个目标表的 start_row 保持为粘贴起始行，"
+            "公式模板行自动取 start_row - 1；旧版本中将起始行当作公式种子行的含义不再沿用。"
+        )
+    for index, job in enumerate(jobs, 1):
+        if not isinstance(job, dict):
+            continue
+        legacy_values = [(key, job[key]) for key in LEGACY_FORMULA_ROW_KEYS if key in job]
+        if not legacy_values:
+            continue
+        try:
+            template_row = _formula_template_row(job)
+        except ProcessingError:
+            template_row = "无法计算（粘贴起始行必须至少为 2）"
+        old_fields = "、".join(f"{key}={value!r}" for key, value in legacy_values)
+        notes.append(
+            f"第 {index} 个目标表的旧公式行字段（{old_fields}）不会用于选取公式；"
+            f"实际公式模板行按 start_row - 1 自动确定为 {template_row}。"
+        )
+    return notes
 
 
 def _validate_sheet_name(value: Any, label: str) -> str:
@@ -230,6 +362,42 @@ def _area_address(bounds: tuple[int, int, int, int]) -> str:
     return first if first == last else f"{first}:{last}"
 
 
+def _merge_area_bounds(merge_area) -> tuple[int, int, int, int]:
+    """Read a COM MergeArea as worksheet-local bounds without changing the sheet."""
+    min_col = int(merge_area.Column)
+    min_row = int(merge_area.Row)
+    max_col = min_col + int(merge_area.Columns.Count) - 1
+    max_row = min_row + int(merge_area.Rows.Count) - 1
+    bounds = (min_col, min_row, max_col, max_row)
+    if (min_col < 1 or min_row < 1 or max_col > 16_384 or max_row > 1_048_576
+            or min_col > max_col or min_row > max_row):
+        raise ProcessingError("WPS 返回的合并单元格区域超出 Excel 工作表边界。")
+    return bounds
+
+
+def _expand_image_bounds_for_merged_cells(worksheet, bounds: tuple[int, int, int, int],
+                                          label: str) -> tuple[int, int, int, int]:
+    """Expand an image rectangle to the closure of every intersecting merged area."""
+    expanded = bounds
+    checked_cells: set[tuple[int, int]] = set()
+    while True:
+        scan_bounds = expanded
+        for row in range(scan_bounds[1], scan_bounds[3] + 1):
+            for col in range(scan_bounds[0], scan_bounds[2] + 1):
+                if (col, row) in checked_cells:
+                    continue
+                checked_cells.add((col, row))
+                cell = worksheet.Cells(row, col)
+                if not bool(cell.MergeCells):
+                    continue
+                merged = _merge_area_bounds(cell.MergeArea)
+                expanded = (min(expanded[0], merged[0]), min(expanded[1], merged[1]),
+                            max(expanded[2], merged[2]), max(expanded[3], merged[3]))
+                _check_image_area_size(expanded, f"{label}完整包含合并单元格后的 {_area_address(expanded)}")
+        if expanded == scan_bounds:
+            return expanded
+
+
 def _areas_overlap(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> bool:
     return (first[0] <= second[2] and second[0] <= first[2]
             and first[1] <= second[3] and second[1] <= first[3])
@@ -240,7 +408,7 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ProcessingError("配置根节点必须是 JSON 对象。")
     settings = deepcopy(DEFAULT_SETTINGS)
-    settings.update({k: deepcopy(v) for k, v in raw.items() if k != "jobs"})
+    settings.update({k: deepcopy(v) for k, v in raw.items() if k not in ("jobs", "_migration_notices")})
     raw_jobs = raw.get("jobs", settings["jobs"])
     if not isinstance(raw_jobs, list):
         raise ProcessingError("配置中的 jobs 必须是数组。")
@@ -268,6 +436,8 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
             normalized_jobs.append(original)
             continue
         job = deepcopy(original)
+        for legacy_key in LEGACY_FORMULA_ROW_KEYS:
+            job.pop(legacy_key, None)
         if "mappings" not in job:
             result_col = job.pop("result_col", "")
             target_col = job.pop("target_col", "")
@@ -345,7 +515,9 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
             raise ProcessingError(f"第 {idx} 个目标工作表名称不符合 Excel 工作表命名规则。")
         names.append(sheet_name)
         header_rows = _positive_row(job["header_rows"], f"第 {idx} 项保留标题行数", allow_zero=True)
-        start_row = _positive_row(job["start_row"], f"第 {idx} 项目标粘贴/公式起始行")
+        start_row = _positive_row(job["start_row"], f"第 {idx} 项目标粘贴起始行")
+        if start_row <= 1:
+            raise ProcessingError(f"第 {idx} 项目标粘贴起始行必须至少为第 2 行；公式模板行自动取其上一行。")
         if start_row <= header_rows:
             raise ProcessingError(f"第 {idx} 项目标起始行必须大于保留标题行数。")
         formula_range = parse_column_range(job["formula_range"])
@@ -520,6 +692,9 @@ def load_settings(path: Path | str | None = None) -> dict[str, Any]:
         try:
             saved = json.loads(source_path.read_text(encoding="utf-8"))
             settings = normalize_settings(saved)
+            notices = configuration_migration_notes(saved)
+            if notices:
+                settings["_migration_notices"] = notices
         except Exception as exc:
             raise ProcessingError(f"读取配置失败：{source_path}\n{exc}") from exc
     return settings
@@ -819,9 +994,58 @@ def _preprocess_worksheet_xml(data: bytes, sheet_name: str) -> tuple[bytes, list
     return b"".join(output), invalid_filter_refs, normalized_refs
 
 
+class _TemporaryWorkbookCopy:
+    """Path-like temporary copy that owns every openpyxl workbook loaded from it."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.workbooks = []
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+    def load_workbook(self, *args, **kwargs):
+        workbook = load_workbook(self.path, *args, **kwargs)
+        self.workbooks.append(workbook)
+        return workbook
+
+    def close_workbooks(self) -> list[str]:
+        errors = []
+        for workbook in reversed(self.workbooks):
+            try:
+                workbook.close()
+            except Exception as exc:
+                errors.append(str(exc))
+        self.workbooks.clear()
+        return errors
+
+
+_TEMP_COPY_CLEANUP_RETRY_DELAYS = (0.05, 0.1, 0.2)
+
+
+def _remove_temporary_workbook_copy(path: Path) -> OSError | None:
+    for attempt in range(len(_TEMP_COPY_CLEANUP_RETRY_DELAYS) + 1):
+        try:
+            path.unlink(missing_ok=True)
+            return None
+        except OSError as exc:
+            transient_lock = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (32, 33)
+            if not transient_lock or attempt == len(_TEMP_COPY_CLEANUP_RETRY_DELAYS):
+                return exc
+            time.sleep(_TEMP_COPY_CLEANUP_RETRY_DELAYS[attempt])
+    return None
+
+
+def _log_temporary_copy_warning(log: Callable[[str], None], message: str) -> None:
+    try:
+        log(message)
+    except Exception:
+        print(message, file=sys.stderr)
+
+
 @contextmanager
 def _temporary_workbook_copy(path: Path, label: str, log: Callable[[str], None]):
-    """Create a bounded temporary XLSX copy and safely prepare worksheet sort/filter metadata."""
+    """Prepare a unique XLSX copy and close all tracked workbooks before deleting it."""
     try:
         fd, temp_name = tempfile.mkstemp(prefix="wps_sheet_autofilter_", suffix=".xlsx")
     except OSError as exc:
@@ -831,6 +1055,8 @@ def _temporary_workbook_copy(path: Path, label: str, log: Callable[[str], None])
         ) from exc
     os.close(fd)
     temp_path = Path(temp_name)
+    temporary_copy = _TemporaryWorkbookCopy(temp_path)
+    operation_error = None
     try:
         try:
             with zipfile.ZipFile(path, "r") as source:
@@ -906,15 +1132,26 @@ def _temporary_workbook_copy(path: Path, label: str, log: Callable[[str], None])
                 f"无法安全检查或准备{label}“{path.name}”的临时副本。请在 WPS 中打开该文件的副本，"
                 f"检查并修正工作表排序/筛选区域引用后另存为 XLSX 再试；不要直接删除排序定义，原文件未修改。\n原因：{exc}"
             ) from exc
-        yield temp_path
+        yield temporary_copy
+    except BaseException as exc:
+        operation_error = exc
+        raise
     finally:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError as exc:
-            raise ProcessingError(
-                f"无法清理{label}“{path.name}”的临时读取副本：{temp_path}。"
-                f"请关闭占用该文件的程序后删除临时副本；原工作簿未修改。\n原因：{exc}"
-            ) from exc
+        close_errors = temporary_copy.close_workbooks()
+        if close_errors:
+            _log_temporary_copy_warning(
+                log,
+                f"警告：{label}“{path.name}”临时读取副本中的 openpyxl 工作簿关闭时发生错误："
+                f"{temp_path}；请确认该文件未被其他程序占用。原因：{'；'.join(close_errors)}",
+            )
+        cleanup_error = _remove_temporary_workbook_copy(temp_path)
+        if cleanup_error is not None:
+            state = "读取/处理已成功，但临时读取副本无法清理" if operation_error is None else "读取/处理本身已失败，且临时读取副本也无法清理"
+            _log_temporary_copy_warning(
+                log,
+                f"警告：{state}：{temp_path}。请关闭占用该文件的程序后手动删除；原工作簿未修改。"
+                f"清理原因：{cleanup_error}",
+            )
 
 
 def _find_external_formula(formula: str) -> bool:
@@ -946,21 +1183,29 @@ def _missing_source_path_message(settings: dict[str, Any], location: tuple[int, 
             "请在源文件列表中编辑该项并选择或填写 .xlsx 路径。")
 
 
-def _get_formula_templates(workbook, job: dict[str, Any], index: int, formula_row: int) -> tuple[int, int, dict[int, str]]:
+def _get_formula_templates(workbook, job: dict[str, Any], index: int, start_row: int) -> tuple[int, int, dict[int, str]]:
     sheet_name = str(job["template_sheet"]).strip()
     if sheet_name not in workbook.sheetnames:
         raise ProcessingError(f"模板中找不到第 {index} 个目标工作表“{sheet_name}”。")
     ws = workbook[sheet_name]
+    formula_row = _formula_template_row({**job, "start_row": start_row})
     col_start, col_end = parse_column_range(job["formula_range"])
     formulas: dict[int, str] = {}
+    missing: list[str] = []
     for col in range(col_start, col_end + 1):
         value = ws.cell(row=formula_row, column=col).value
         if not (isinstance(value, str) and value.startswith("=")):
-            letter = get_column_letter(col)
-            raise ProcessingError(f"模板“{sheet_name}”的公式种子单元格 {letter}{formula_row} 不是公式；请修正模板或配置。")
+            missing.append(get_column_letter(col))
+            continue
         if _find_external_formula(value):
             raise ProcessingError(f"模板公式 {sheet_name}!{get_column_letter(col)}{formula_row} 包含外部引用或外部访问函数，已拒绝重算。")
         formulas[col] = value
+    if missing:
+        columns = "、".join(missing)
+        raise ProcessingError(
+            f"模板“{sheet_name}”的公式模板行是第 {formula_row} 行（由粘贴起始行 {start_row} 自动确定），"
+            f"以下公式列缺少公式：{columns}。请补齐该模板行中的公式。"
+        )
     return col_start, col_end, formulas
 
 
@@ -988,13 +1233,12 @@ def _read_source_records(path: Path, sheet_name: str, start_row: int, col_start:
         return _read_source_records_from_copy(load_path, path, sheet_name, start_row, col_start, col_end, log, end_row)
 
 
-def _read_source_records_from_copy(load_path: Path, path: Path, sheet_name: str, start_row: int,
+def _read_source_records_from_copy(load_path: _TemporaryWorkbookCopy, path: Path, sheet_name: str, start_row: int,
                                    col_start: int, col_end: int, log: Callable[[str], None],
                                    end_row: int | None = None) -> list[list[Any]]:
-    values_book = formula_book = None
     try:
-        values_book = load_workbook(load_path, read_only=True, data_only=True, keep_links=False)
-        formula_book = load_workbook(load_path, read_only=True, data_only=False, keep_links=False)
+        values_book = load_path.load_workbook(read_only=True, data_only=True, keep_links=False)
+        formula_book = load_path.load_workbook(read_only=True, data_only=False, keep_links=False)
         requested_sheet = str(sheet_name or "").strip()
         if not values_book.sheetnames or not formula_book.sheetnames:
             raise ProcessingError(f"源工作簿“{path.name}”没有可读取的工作表。")
@@ -1056,13 +1300,6 @@ def _read_source_records_from_copy(load_path: Path, path: Path, sheet_name: str,
         raise
     except Exception as exc:
         raise ProcessingError(f"读取源工作簿“{path.name}”失败：{exc}") from exc
-    finally:
-        for wb in (values_book, formula_book):
-            if wb is not None:
-                try:
-                    wb.close()
-                except Exception:
-                    pass
 
 
 def _validate_inputs(raw_settings: dict[str, Any]) -> tuple[Path, Path]:
@@ -1179,6 +1416,8 @@ def _validate_pre_mapping_conflicts(settings: dict[str, Any], source_records: li
         protected.setdefault(sheet, []).append(("主数据复制", (copy_start, start_row, copy_end, end_row)))
         formula_start, formula_end = parse_column_range(job["formula_range"])
         protected[sheet].append(("公式填充", (formula_start, start_row, formula_end, end_row)))
+        template_row = _formula_template_row(job)
+        protected[sheet].append(("公式模板", (1, template_row, 16_384, template_row)))
         for mapping in job["mappings"]:
             col = column_number(mapping["target_col"])
             protected[sheet].append(("结果映射", (col, start_row, col, end_row)))
@@ -1204,13 +1443,12 @@ def _create_staging_workbook(template_path: Path, raw_settings: dict[str, Any], 
         return _create_staging_workbook_from_copy(template_path, load_path, raw_settings, source_records, staging_path, log)
 
 
-def _create_staging_workbook_from_copy(template_path: Path, load_path: Path, raw_settings: dict[str, Any],
+def _create_staging_workbook_from_copy(template_path: Path, load_path: _TemporaryWorkbookCopy, raw_settings: dict[str, Any],
                                        source_records: list[list[list[Any]]], staging_path: Path,
                                        log: Callable[[str], None]) -> list[tuple[str, int, int, list[dict[str, str]]]]:
     settings = normalize_settings(raw_settings)
-    wb = None
     try:
-        wb = load_workbook(load_path, keep_links=False, data_only=False)
+        wb = load_path.load_workbook(keep_links=False, data_only=False)
         captured_pre_mappings = _capture_pre_mapping_values(wb, settings)
         for ws in wb.worksheets:
             for cell in ws._cells.values():
@@ -1235,19 +1473,19 @@ def _create_staging_workbook_from_copy(template_path: Path, load_path: Path, raw
 
         # Cleanup is deliberately a separate pass so every pre-map source was captured first.
         for job, ws, start_row, _end_row, header_rows, formulas, _records in job_ranges:
-            formula_columns = set(formulas)
+            template_row = _formula_template_row(job)
             cleared = 0
             for cell in list(ws._cells.values()):
                 if isinstance(cell, MergedCell) or cell.row <= header_rows:
                     continue
-                if cell.row == start_row and cell.column in formula_columns:
+                if cell.row == template_row:
                     continue
                 if cell.value is not None or cell.hyperlink is not None or cell.comment is not None:
                     cell.value = None
                     cell.hyperlink = None
                     cell.comment = None
                     cleared += 1
-            log(f"已清理“{job['template_sheet']}”第 {header_rows + 1} 行起的旧内容（{cleared} 个单元格），保留格式和公式种子。")
+            log(f"已清理“{job['template_sheet']}”第 {header_rows + 1} 行起的旧内容（{cleared} 个单元格），保留第 {template_row} 行公式模板及其行内容。")
 
         _apply_pre_mapping_values(wb, captured_pre_mappings, log)
 
@@ -1258,7 +1496,7 @@ def _create_staging_workbook_from_copy(template_path: Path, load_path: Path, raw
                 for col_offset, value in enumerate(values):
                     ws.cell(row=target_row, column=copy_start + col_offset).value = value
             for col, formula in formulas.items():
-                origin = f"{get_column_letter(col)}{start_row}"
+                origin = f"{get_column_letter(col)}{_formula_template_row(job)}"
                 for target_row in range(start_row, end_row + 1):
                     target = f"{get_column_letter(col)}{target_row}"
                     try:
@@ -1276,12 +1514,6 @@ def _create_staging_workbook_from_copy(template_path: Path, load_path: Path, raw
         raise
     except Exception as exc:
         raise ProcessingError(f"创建中间工作簿失败：{exc}") from exc
-    finally:
-        if wb is not None:
-            try:
-                wb.close()
-            except Exception:
-                pass
 
 
 def _write_mapped_values(destination, values: list[Any], write_as: str) -> None:
@@ -1381,6 +1613,8 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
         sheet_name, start_row, end_row, _mappings = formula_job
         col_start, col_end = parse_column_range(job["formula_range"])
         formula_areas.setdefault(sheet_name, []).append((col_start, start_row, col_end, end_row))
+        template_row = _formula_template_row(job)
+        formula_areas[sheet_name].append((1, template_row, 16_384, template_row))
 
     applied_any = False
     operation_labels = {"TextToColumns": "文本分列", "Deduplicate": "去重", "FormatConvert": "格式转换"}
@@ -1445,6 +1679,18 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
     return applied_any
 
 
+def _pywin32_import_error_message(exc: ImportError) -> str:
+    return (
+        "无法导入 Windows COM 依赖 pywin32（pythoncom/win32com）。\n"
+        f"当前 Python 解释器：{sys.executable}\n"
+        "请从本程序目录双击 run_app.bat，它会使用本项目 .venv 中的 Python。"
+        "不要直接双击 main.py，也不要用系统 Python 运行。\n"
+        "如果 run_app.bat 仍提示缺少依赖，请先运行 install_and_build.bat；"
+        "安装失败诊断保存在 install_and_build.log。\n"
+        f"导入错误详情：{type(exc).__name__}: {exc}"
+    )
+
+
 def _connect_wps(log: Callable[[str], None]):
     if sys.platform != "win32":
         raise ProcessingError("WPS 自动重算只能在安装了 Windows 版 WPS 表格的 Windows 环境运行；当前环境不是 Windows，未生成输出文件。")
@@ -1452,7 +1698,7 @@ def _connect_wps(log: Callable[[str], None]):
         import pythoncom
         import win32com.client
     except ImportError as exc:
-        raise ProcessingError("缺少 Windows COM 依赖 pywin32。请在 Windows 运行 install_and_build.bat 安装依赖后重试。") from exc
+        raise ProcessingError(_pywin32_import_error_message(exc)) from exc
     try:
         pythoncom.CoInitialize()
     except Exception as exc:
@@ -1564,6 +1810,8 @@ def _validate_post_mapping_conflicts(settings: dict[str, Any], source_records: l
         end_row = start_row + len(records) - 1
         c1, c2 = parse_column_range(job["formula_range"])
         formula_areas.setdefault(sheet, []).append((c1, start_row, c2, end_row))
+        template_row = _formula_template_row(job)
+        formula_areas[sheet].append((1, template_row, 16_384, template_row))
         for mapping in job["mappings"]:
             col = column_number(mapping["target_col"])
             column_map_areas.setdefault(sheet, []).append((col, start_row, col, end_row))
@@ -1585,9 +1833,10 @@ def _sanitize_filename_fragment(value: str) -> str:
     return sanitized[:80] or "区域"
 
 
-def _image_filename(output: dict[str, Any], index: int, collision: int = 1) -> str:
+def _image_filename(output: dict[str, Any], index: int, collision: int = 1,
+                    bounds: tuple[int, int, int, int] | None = None) -> str:
     sheet = _sanitize_filename_fragment(str(output["sheet"]))
-    bounds = _parse_selected_area(output["range"], "图片输出")
+    bounds = bounds or _parse_selected_area(output["range"], "图片输出")
     area = _sanitize_filename_fragment(_area_address(bounds).replace(":", "-"))
     suffix = "" if collision == 1 else f"_{collision}"
     return f"{sheet}_{area}_{index:03d}{suffix}.png"
@@ -1605,6 +1854,19 @@ def _copy_file_exclusive(source: Path, destination: Path) -> None:
         raise
 
 
+def _publish_staging_workbook(staging_path: Path, final_path: Path) -> None:
+    """Publish a completed workbook without replacing a pre-existing file."""
+    try:
+        os.link(staging_path, final_path)
+    except FileExistsError as exc:
+        raise ProcessingError(f"输出文件在处理过程中被创建；为避免覆盖已停止：\n{final_path}") from exc
+    except OSError:
+        try:
+            _copy_file_exclusive(staging_path, final_path)
+        except FileExistsError as exc:
+            raise ProcessingError(f"输出文件在处理过程中被创建；为避免覆盖已停止：\n{final_path}") from exc
+
+
 def _export_image_areas_from_workbook(workbook, image_outputs: list[dict[str, Any]], output_dir: Path,
                                       log: Callable[[str], None]) -> list[Path]:
     generated: list[Path] = []
@@ -1612,11 +1874,31 @@ def _export_image_areas_from_workbook(workbook, image_outputs: list[dict[str, An
     try:
         for index, output in enumerate(image_outputs, 1):
             sheet_name = str(output["sheet"]).strip()
-            bounds = _parse_selected_area(output["range"], f"第 {index} 项图片输出")
-            _check_image_area_size(bounds, f"第 {index} 项图片输出")
-            area = _area_address(bounds)
+            configured_bounds = _parse_selected_area(output["range"], f"第 {index} 项图片输出")
+            _check_image_area_size(configured_bounds, f"第 {index} 项图片输出")
             worksheet = workbook.Worksheets(sheet_name)
-            picture_range = worksheet.Range(area)
+            try:
+                bounds = _expand_image_bounds_for_merged_cells(
+                    worksheet, configured_bounds, f"第 {index} 项图片输出"
+                )
+            except ProcessingError:
+                raise
+            except Exception as exc:
+                raise ProcessingError(
+                    f"WPS 无法读取工作表“{sheet_name}”中配置区域 {_area_address(configured_bounds)} "
+                    f"的合并单元格范围（{type(exc).__name__}: {exc}）；请确认工作表可访问且工作簿未处于受保护/异常状态。"
+                ) from exc
+            area = _area_address(bounds)
+            configured_area = _area_address(configured_bounds)
+            if bounds != configured_bounds:
+                log(f"图片区域配置 {sheet_name}!{configured_area} 与合并单元格相交；本次只读导出范围自动扩展为 {area}，配置保持不变。")
+            try:
+                picture_range = worksheet.Range(area)
+            except Exception as exc:
+                raise ProcessingError(
+                    f"WPS 无法构建图片区域 {sheet_name}!{area}（配置范围 {configured_area}）："
+                    f"{type(exc).__name__}: {exc}。请确认工作表仍存在且区域地址有效。"
+                ) from exc
             temp_handle, temp_name = tempfile.mkstemp(prefix=".wps_area_export_", suffix=".png", dir=str(output_dir))
             os.close(temp_handle)
             temp_path = Path(temp_name)
@@ -1624,19 +1906,49 @@ def _export_image_areas_from_workbook(workbook, image_outputs: list[dict[str, An
             chart_object = None
             try:
                 try:
-                    picture_range.CopyPicture(Appearance=1, Format=2)
-                except TypeError:
-                    picture_range.CopyPicture(1, 2)
-                chart_object = worksheet.ChartObjects().Add(0, 0, float(picture_range.Width), float(picture_range.Height))
+                    try:
+                        picture_range.CopyPicture(Appearance=1, Format=2)
+                    except TypeError:
+                        picture_range.CopyPicture(1, 2)
+                except Exception as exc:
+                    raise ProcessingError(
+                        f"WPS 的 CopyPicture 阶段无法复制图片区域 {sheet_name}!{area}（配置范围 {configured_area}）："
+                        f"{type(exc).__name__}: {exc}。程序未临时取消隐藏或更改行列隐藏状态；请在 WPS 中检查该范围的合并布局、"
+                        "工作表保护及当前可见区域，并确认 WPS 能复制该范围。"
+                    ) from exc
+                try:
+                    chart_object = worksheet.ChartObjects().Add(
+                        0, 0, float(picture_range.Width), float(picture_range.Height)
+                    )
+                except Exception as exc:
+                    raise ProcessingError(
+                        f"WPS 无法为图片区域 {sheet_name}!{area} 创建临时图表容器："
+                        f"{type(exc).__name__}: {exc}。请确认工作表允许创建图表对象。"
+                    ) from exc
                 chart = chart_object.Chart
-                chart.Paste()
-                export_result = chart.Export(str(temp_path), "PNG")
+                try:
+                    chart.Paste()
+                except Exception as exc:
+                    raise ProcessingError(
+                        f"WPS 无法将已复制的区域 {sheet_name}!{area} 粘贴到临时图表："
+                        f"{type(exc).__name__}: {exc}。请确认 WPS 剪贴板/图表对象可用后重试。"
+                    ) from exc
+                try:
+                    export_result = chart.Export(str(temp_path), "PNG")
+                except Exception as exc:
+                    raise ProcessingError(
+                        f"WPS 的 PNG 导出阶段失败，区域为 {sheet_name}!{area}（配置范围 {configured_area}）："
+                        f"{type(exc).__name__}: {exc}。请确认输出目录可写且 WPS 图表导出可用。"
+                    ) from exc
                 if export_result is False or not temp_path.is_file() or temp_path.stat().st_size == 0:
-                    raise ProcessingError(f"WPS 未能导出图片区域 {sheet_name}!{area}。")
+                    raise ProcessingError(
+                        f"WPS 的 PNG 导出阶段未生成有效文件：区域 {sheet_name}!{area}（配置范围 {configured_area}）。"
+                        "请确认输出目录可写，并在 WPS 中检查该区域是否可复制/粘贴到图表；程序不会为导出而取消隐藏行列。"
+                    )
 
                 collision = 1
                 while True:
-                    target = output_dir / _image_filename(output, index, collision)
+                    target = output_dir / _image_filename(output, index, collision, bounds)
                     try:
                         os.link(temp_path, target)
                         generated.append(target)
@@ -1880,7 +2192,7 @@ def _read_text_output_areas(workbook_path: Path, text_outputs: list[dict[str, An
 
 def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] = print,
                       on_text_previews: Callable[[list[dict[str, str]]], None] | None = None) -> Path:
-    """Run mappings, source merge, formulas, WPS save, terminal outputs, then publish the XLSX."""
+    """Process and save the XLSX, then publish it after outputs or on PNG failure."""
     settings = normalize_settings(raw_settings)
     template_path, final_path = _validate_inputs(settings)
     copy_start, copy_end = column_number(settings["copy_start_col"]), column_number(settings["copy_end_col"])
@@ -1905,6 +2217,7 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
     staging_path = Path(temp_name)
     generated_images: list[Path] = []
     published_final = False
+    preserve_final_after_image_failure = False
     try:
         log("校验模板公式和目标子表后，在输出目录创建临时副本。")
         formula_jobs = _create_staging_workbook(template_path, settings, all_records, staging_path, log)
@@ -1919,18 +2232,31 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
         text_previews = []
         for module_id in settings.get("workflow", DEFAULT_WORKFLOW):
             if module_id == "image_output":
-                generated_images = _export_image_areas_wps(staging_path, settings.get("image_outputs", []), final_path.parent, log)
+                try:
+                    generated_images = _export_image_areas_wps(
+                        staging_path, settings.get("image_outputs", []), final_path.parent, log
+                    )
+                except Exception as image_exc:
+                    try:
+                        _publish_staging_workbook(staging_path, final_path)
+                    except Exception as publish_exc:
+                        raise ProcessingError(
+                            f"图片 PNG 输出失败：{image_exc}\n"
+                            f"WPS 已完成计算并成功保存工作簿，但无法安全发布到目标路径：\n"
+                            f"{final_path}\n发布原因：{publish_exc}"
+                        ) from image_exc
+                    published_final = True
+                    preserve_final_after_image_failure = True
+                    raise ProcessingError(
+                        f"图片 PNG 输出失败：{image_exc}\n"
+                        f"WPS 已完成计算并成功保存 XLSX；该文件已保留：\n{final_path}"
+                    ) from image_exc
             elif module_id == "text_output":
                 text_previews = _read_text_output_areas(staging_path, settings.get("text_outputs", []))
         for preview in text_previews:
             log(f"已读取文本区域 {preview['sheet']}!{preview['range']}，内容将在处理完成后显示并可复制。")
 
-        try:
-            os.link(staging_path, final_path)
-        except FileExistsError as exc:
-            raise ProcessingError(f"输出文件在处理过程中被创建；为避免覆盖已停止：\n{final_path}") from exc
-        except OSError:
-            _copy_file_exclusive(staging_path, final_path)
+        _publish_staging_workbook(staging_path, final_path)
         published_final = True
         staging_path.unlink(missing_ok=True)
         log(f"处理成功，已另存为：{final_path}")
@@ -1942,7 +2268,7 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
             staging_path.unlink(missing_ok=True)
             for image_path in generated_images:
                 image_path.unlink(missing_ok=True)
-            if published_final:
+            if published_final and not preserve_final_after_image_failure:
                 final_path.unlink(missing_ok=True)
         except Exception as cleanup_exc:
             raise ProcessingError(f"处理失败：{exc}\n同时无法清理临时工作簿：{staging_path}\n清理错误：{cleanup_exc}") from exc
@@ -1956,10 +2282,20 @@ class App:
         self.tk, self.filedialog, self.messagebox, self.ttk = tk, filedialog, messagebox, ttk
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("1260x980")
-        self.root.minsize(1060, 860)
+        try:
+            screen_width = self.root.winfo_screenwidth()
+            screen_height = self.root.winfo_screenheight()
+        except Exception:
+            screen_width = screen_height = None
+        min_width, min_height, _max_width, _max_height = window_size_limits(screen_width, screen_height)
+        width, height = load_window_size(screen_width=screen_width, screen_height=screen_height)
+        self.root.resizable(True, True)
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(min_width, min_height)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.settings = load_settings()
+        startup_migration_notices = self.settings.pop("_migration_notices", [])
         self.vars: dict[str, Any] = {}
         self.job_vars: dict[str, Any] = {}
         self.operation_enabled: dict[str, Any] = {}
@@ -1970,7 +2306,33 @@ class App:
         self._render_area_configs()
         self._render_workflow()
         self._refresh_profile_choices()
+        if startup_migration_notices:
+            self.root.after(200, self._show_configuration_migration_notices, startup_migration_notices)
         self.root.after(150, self._drain_events)
+
+    def _on_close(self):
+        try:
+            save_window_size(
+                self.root.winfo_width(), self.root.winfo_height(),
+                screen_width=self.root.winfo_screenwidth(),
+                screen_height=self.root.winfo_screenheight(),
+            )
+        except Exception:
+            pass
+        self.root.destroy()
+
+    def _on_canvas_configure(self, event):
+        requested_width = self.content_frame.winfo_reqwidth()
+        requested_height = self.content_frame.winfo_reqheight()
+        width = max(event.width, requested_width)
+        height = max(event.height, requested_height)
+        self.main_canvas.itemconfigure(self.content_window, width=width, height=height)
+        self.main_canvas.configure(scrollregion=(0, 0, width, height))
+
+    def _on_content_configure(self, _event=None):
+        bounds = self.main_canvas.bbox("all")
+        if bounds:
+            self.main_canvas.configure(scrollregion=bounds)
 
     def _entry(self, parent, row, label, key, width=64, browse=None):
         self.ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(8, 8), pady=3)
@@ -1983,8 +2345,25 @@ class App:
 
     def _build(self):
         ttk = self.ttk
-        outer = ttk.Frame(self.root, padding=9)
-        outer.pack(fill="both", expand=True)
+        viewport = ttk.Frame(self.root)
+        viewport.grid(row=0, column=0, sticky="nsew")
+        viewport.rowconfigure(0, weight=1)
+        viewport.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        self.main_canvas = self.tk.Canvas(viewport, highlightthickness=0)
+        vertical_scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=self.main_canvas.yview)
+        horizontal_scrollbar = ttk.Scrollbar(viewport, orient="horizontal", command=self.main_canvas.xview)
+        self.main_canvas.configure(yscrollcommand=vertical_scrollbar.set,
+                                   xscrollcommand=horizontal_scrollbar.set)
+        self.main_canvas.grid(row=0, column=0, sticky="nsew")
+        vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+        outer = ttk.Frame(self.main_canvas, padding=9)
+        self.content_frame = outer
+        self.content_window = self.main_canvas.create_window((0, 0), window=outer, anchor="nw")
+        self.main_canvas.bind("<Configure>", self._on_canvas_configure)
+        outer.bind("<Configure>", self._on_content_configure)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(2, weight=3)
         outer.rowconfigure(6, weight=1)
@@ -2029,9 +2408,15 @@ class App:
         top = ttk.Frame(editor)
         top.grid(row=0, column=0, columnspan=2, sticky="ew")
         self.job_vars = {key: self.tk.StringVar() for key in ("template_sheet", "header_rows", "start_row", "formula_range")}
-        for i, (key, label, width) in enumerate((("template_sheet", "模板子表名", 25), ("header_rows", "保留标题行数", 10), ("start_row", "粘贴起始行/公式种子行", 13), ("formula_range", "公式列范围", 13))):
+        self.job_vars["formula_template_row"] = self.tk.StringVar()
+        self.job_vars["start_row"].trace_add("write", self._update_formula_template_row_display)
+        fields = (("template_sheet", "模板子表名", 25), ("header_rows", "保留标题行数", 10),
+                  ("start_row", "粘贴起始行", 13), ("formula_template_row", "公式模板行（自动）", 13),
+                  ("formula_range", "公式列范围", 13))
+        for i, (key, label, width) in enumerate(fields):
             ttk.Label(top, text=label).grid(row=0, column=i * 2, sticky="w", padx=4)
-            ttk.Entry(top, textvariable=self.job_vars[key], width=width).grid(row=0, column=i * 2 + 1, sticky="w", padx=4)
+            state = "readonly" if key == "formula_template_row" else "normal"
+            ttk.Entry(top, textvariable=self.job_vars[key], width=width, state=state).grid(row=0, column=i * 2 + 1, sticky="w", padx=4)
         self.source_tree = ttk.Treeview(editor, columns=("path", "sheet", "from", "to"), show="headings", height=7)
         for col, title, width in (("path", "源文件路径", 390), ("sheet", "源工作表（空=首表）", 165), ("from", "复制起始行", 90), ("to", "复制结束行（空=空行边界）", 170)):
             self.source_tree.heading(col, text=title)
@@ -2516,8 +2901,9 @@ class App:
             return
         self.active_job_index = index
         job = self.settings["jobs"][index]
-        for key in self.job_vars:
+        for key in ("template_sheet", "header_rows", "start_row", "formula_range"):
             self.job_vars[key].set(str(job.get(key, "")))
+        self._update_formula_template_row_display()
         for tree in (self.source_tree, self.mapping_tree):
             for item in tree.get_children():
                 tree.delete(item)
@@ -2540,6 +2926,19 @@ class App:
             self._show_job(index)
             self._refresh_job_row(index)
 
+    def _update_formula_template_row_display(self, *_args):
+        if not self.job_vars or "formula_template_row" not in self.job_vars:
+            return
+        try:
+            start_row = int(self.job_vars["start_row"].get())
+            value = str(start_row - 1) if start_row >= 2 else "需从第 2 行开始"
+        except (TypeError, ValueError):
+            value = "请输入有效行号"
+        self.job_vars["formula_template_row"].set(value)
+
+    def _show_configuration_migration_notices(self, notices):
+        self.messagebox.showinfo(APP_NAME, "\n\n".join(notices))
+
     def _refresh_job_row(self, index):
         if not (0 <= index < len(self.settings["jobs"])):
             return
@@ -2550,7 +2949,7 @@ class App:
     def _add_job(self):
         if not self._commit_job_editor():
             return
-        self.settings["jobs"].append({"template_sheet": "新目标表", "header_rows": 0, "start_row": 1, "formula_range": "A:A",
+        self.settings["jobs"].append({"template_sheet": "新目标表", "header_rows": 0, "start_row": 2, "formula_range": "A:A",
                                       "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None}],
                                       "mappings": [{"result_col": "A", "target_col": "B", "write_as": "value"}]})
         self._render_jobs(len(self.settings["jobs"]) - 1)
@@ -2802,6 +3201,7 @@ class App:
             self.messagebox.showerror(APP_NAME, str(exc))
 
     def _apply_settings_to_gui(self, settings, active_name=None):
+        migration_notices = settings.get("_migration_notices") or configuration_migration_notes(settings)
         normalized = normalize_settings(settings)
         self.settings = normalized
         self.active_profile_name = str(active_name if active_name is not None else normalized.get("config_name", ""))
@@ -2815,6 +3215,8 @@ class App:
         self._render_area_configs()
         self._render_workflow()
         self._refresh_profile_choices()
+        if migration_notices:
+            self._show_configuration_migration_notices(migration_notices)
 
     def _load_profile_named(self, name, selected_template_path=None):
         settings = load_profile(name, PROFILE_DIR)
@@ -2981,7 +3383,7 @@ class App:
                         self._log(f"完成：{payload}")
                         self.messagebox.showinfo(APP_NAME, f"处理成功，已保存新文件：\n{payload}")
                     else:
-                        self._log("处理失败；程序已清理临时工作簿，未发布半成品输出。")
+                        self._log("处理未全部完成；请查看详细诊断中的已保存文件路径及清理信息。")
                         self.messagebox.showerror(APP_NAME, str(payload))
         except queue.Empty:
             pass

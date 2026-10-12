@@ -54,9 +54,10 @@ def create_fake_data(base_dir: Path) -> Path:
             ws.cell(row=row, column=1).font = Font(bold=True)
             ws.cell(row=row, column=1).fill = header_fill
         first, last = col_range(formula_range)
+        formula_template_row = start_row - 1
         for col in range(first, last + 1):
-            cell = ws.cell(row=start_row, column=col)
-            cell.value = f'=IF($A{start_row}="", "", $A{start_row}&"-演示")'
+            cell = ws.cell(row=formula_template_row, column=col)
+            cell.value = f'=IF($A{formula_template_row}="", "", $A{formula_template_row}&"-演示")'
             cell.fill = PatternFill("solid", fgColor="E2F0D9")
             cell.border = border
         # Old values are deliberately present below headings; processing must clear contents, not styles.

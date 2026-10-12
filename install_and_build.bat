@@ -1,40 +1,67 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+set "VENV_PY=%~dp0.venv\Scripts\python.exe"
+set "LOG_FILE=%~dp0install_and_build.log"
+set "FAIL_STEP=initialization"
+>>"%LOG_FILE%" echo.
+>>"%LOG_FILE%" echo === Installer started %date% %time% ===
+echo Log file: "%LOG_FILE%"
 
-echo [1/5] Checking Python 3...
-where py >nul 2>nul
-if errorlevel 1 (
-  echo Python Launcher 'py' was not found. Install Python 3.10 or newer first.
-  exit /b 1
-)
-py -3 --version
-if errorlevel 1 exit /b 1
+echo [1/6] Checking Python 3 launcher...
+set "FAIL_STEP=Python launcher check"
+where py >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
+py -3 --version >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
 
-echo [2/5] Creating virtual environment...
-if not exist ".venv\Scripts\python.exe" py -3 -m venv .venv
-if errorlevel 1 exit /b 1
-call ".venv\Scripts\activate.bat"
-if errorlevel 1 exit /b 1
+echo [2/6] Creating or reusing the project virtual environment...
+set "FAIL_STEP=virtual environment creation"
+if not exist "%VENV_PY%" py -3 -m venv "%~dp0.venv" >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
+if not exist "%VENV_PY%" goto failed
 
-echo [3/5] Installing dependencies...
-python -m pip install --upgrade pip
-if errorlevel 1 exit /b 1
-python -m pip install -r requirements.txt
-if errorlevel 1 exit /b 1
+echo [3/6] Installing requirements into .venv...
+set "FAIL_STEP=virtual environment pip upgrade"
+"%VENV_PY%" -m pip install --upgrade pip >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
+set "FAIL_STEP=requirements installation"
+"%VENV_PY%" -m pip install -r "%~dp0requirements.txt" >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
 
-echo [4/5] Running static checks...
-python -m py_compile main.py workflow.py make_fake_data.py test_static.py
-if errorlevel 1 exit /b 1
-python main.py --self-check
-if errorlevel 1 exit /b 1
-python -m unittest -v test_static.py
-if errorlevel 1 exit /b 1
+echo [4/6] Verifying interpreter and PyWin32 COM imports...
+set "FAIL_STEP=PyWin32 COM import/version check"
+"%VENV_PY%" -c "import sys, importlib.metadata as metadata, pythoncom, win32com.client; print('Python executable:', sys.executable); print('pywin32 version:', metadata.version('pywin32')); print('pythoncom:', pythoncom.__file__); print('win32com.client:', win32com.client.__file__)" >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
 
-echo [5/5] Building Windows application folder...
-python -m PyInstaller --clean --noconfirm --windowed --onedir --name WpsSheetAutomation --hidden-import=pythoncom --hidden-import=pywintypes --hidden-import=win32timezone --hidden-import=win32com.client main.py
-if errorlevel 1 exit /b 1
+echo [5/6] Running syntax, self, and unit checks...
+set "FAIL_STEP=Python syntax check"
+"%VENV_PY%" -m py_compile main.py workflow.py make_fake_data.py test_static.py >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
+set "FAIL_STEP=application self-check"
+"%VENV_PY%" main.py --self-check >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
+set "FAIL_STEP=unit tests"
+"%VENV_PY%" -m unittest -v test_static.py >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
+
+echo [6/6] Building Windows application folder...
+set "FAIL_STEP=PyInstaller build"
+"%VENV_PY%" -m PyInstaller --clean --noconfirm --windowed --onedir --name WpsSheetAutomation --hidden-import=pythoncom --hidden-import=pywintypes --hidden-import=win32timezone --hidden-import=win32com --hidden-import=win32com.client --collect-all win32com main.py >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto failed
 
 echo Build complete: %~dp0dist\WpsSheetAutomation\WpsSheetAutomation.exe
-echo WPS Table must still be installed on the target Windows PC. COM operation has not been tested by this build script.
-endlocal
+echo Source launch entry: %~dp0run_app.bat
+echo WPS Table must be installed on the target Windows PC. Real WPS COM operation and the packaged EXE still require Windows acceptance testing.
+>>"%LOG_FILE%" echo Build completed %date% %time%
+pause
+endlocal & exit /b 0
+
+:failed
+echo.
+echo Installer/build failed at: %FAIL_STEP%
+echo Diagnostic log retained at: "%LOG_FILE%"
+>>"%LOG_FILE%" echo FAILED at: %FAIL_STEP% (%date% %time%)
+echo Do not launch main.py with system Python. Review the log, then retry this installer.
+pause
+endlocal & exit /b 1

@@ -1,3 +1,4 @@
 openpyxl>=3.1,<4
+# Required by pythoncom and win32com for WPS COM automation on Windows.
 pywin32>=306; platform_system == "Windows"
 pyinstaller>=6.10; platform_system == "Windows"
