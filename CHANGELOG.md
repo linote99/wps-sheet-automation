@@ -1,5 +1,10 @@
 # 变更记录
 
+## 2026-10-07：修复 PyInstaller workflow hook 同名冲突
+
+- 将项目本地工作流辅助模块从通用名称 `workflow.py` 改为 `wps_automation_workflow.py`，避免 PyInstaller hooks-contrib 将其误识别为第三方 `workflow` distribution 并调用 `copy_metadata('workflow')`。
+- 构建批处理与静态测试同步更新；main-only 回归 73 项通过。Linux 上 PyInstaller 6.22.3 / hooks-contrib 2026.8 onedir 冒烟打包通过，未触发 `hook-workflow.py`；这不替代 Windows 11 + WPS 实机验收。
+
 ## 2026-10-07：补充主程序 Windows 安装包构建
 - 新增 Inno Setup 安装定义；现有 Windows 构建批处理在找到 Inno Setup 6 编译器时，会在 PyInstaller 目录版构建通过后生成 `dist/WpsSheetAutomation_Setup_v12.exe`。
 - 安装器按当前用户安装，不需要管理员权限；安装目录之外的用户配置和授权状态不会随卸载删除。安装包仍只包含主程序，不包含密钥生成器或签发私钥。
@@ -142,3 +147,10 @@ ZIP/XML 检查拒绝路径穿越、重复/加密成员，并限制 ZIP 成员数
 新增 JSON 配置导入/导出及首版配置自动迁移。默认配置仍沿用三张示例表、既有公式范围和映射；中文 README、虚构数据生成器与单元测试已同步扩展，测试覆盖多源追加、行范围、公式填充、映射写入、配置往返和失败清理。
 
 首版主程序、README、配置、假数据生成器、测试、依赖说明及 Windows 打包脚本的原始副本保存在 `backup_v1/`。本次没有读取业务工作簿或访问外网，也没有在 Windows + WPS 上验证 COM 重算。
+
+## 2026-10-07：v13 区域筛选与源/目标双处理对象
+
+- 界面将文本分列、去重、格式转换改为中文，并新增指定范围区域筛选及条件比较。
+- 四类区域规则均可指定源文件或目标工作簿。源文件规则只改变本轮读取/复制数据，不写回源文件。
+- 移除独立区域 XLSX 和相关 PNG 输出；保留文本预览/复制。旧区域导出配置载入时忽略，配置版本升至 v9。
+- Linux 静态与合成工作簿回归：72 项通过；Windows/WPS COM 和 EXE 仍需目标环境验收。

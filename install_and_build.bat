@@ -26,11 +26,11 @@ if errorlevel 1 goto failed
 if errorlevel 1 goto failed
 
 set "FAIL_STEP=PyWin32 COM import check"
-"%VENV_PY%" -c "import pythoncom, win32com.client, win32crypt; print('PyWin32 COM imports OK')" >>"%LOG_FILE%" 2>&1
+"%VENV_PY%" -c "import sys, importlib.metadata as metadata, pythoncom, win32com.client; import win32crypt; print('Python executable:', sys.executable); print('pywin32 version:', metadata.version('pywin32')); print('PyWin32 COM imports OK')" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 
 set "FAIL_STEP=syntax check"
-"%VENV_PY%" -m py_compile main.py workflow.py licensing.py test_static.py >>"%LOG_FILE%" 2>&1
+"%VENV_PY%" -m py_compile main.py wps_automation_workflow.py licensing.py test_static.py >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 set "FAIL_STEP=application self-check"
 "%VENV_PY%" main.py --self-check >>"%LOG_FILE%" 2>&1
@@ -55,8 +55,8 @@ if defined ISCC_EXE (
   set "FAIL_STEP=Inno Setup installer compilation"
   "%ISCC_EXE%" /Qp "%~dp0WpsSheetAutomation.iss" >>"%LOG_FILE%" 2>&1
   if errorlevel 1 goto failed
-  echo Installer built: "%~dp0dist\WpsSheetAutomation_Setup_v12.exe"
-  >>"%LOG_FILE%" echo Installer built: "%~dp0dist\WpsSheetAutomation_Setup_v12.exe"
+  echo Installer built: "%~dp0dist\WpsSheetAutomation_Setup_v13.exe"
+  >>"%LOG_FILE%" echo Installer built: "%~dp0dist\WpsSheetAutomation_Setup_v13.exe"
 ) else (
   echo Inno Setup 6 was not found. The app folder is built, but no Setup EXE was created.
   echo Install Inno Setup 6 and rerun this script to create the installer.

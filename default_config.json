@@ -1,14 +1,30 @@
 {
-  "config_version": 8,
+  "config_version": 9,
+  "config_name": "",
+  "template_prefix_length": 5,
+  "workflow": [
+    "template_cleanup",
+    "pre_mapping",
+    "source_copy",
+    "formula_fill",
+    "formula_recalc",
+    "result_mapping",
+    "post_mapping",
+    "TextToColumns",
+    "RegionFilter",
+    "Deduplicate",
+    "FormatConvert",
+    "final_recalc_save",
+    "text_output"
+  ],
   "template_path": "",
   "output_dir": "",
   "output_filename": "处理结果.xlsx",
-  "export_region_pngs": false,
+  "output_filename_custom": null,
   "copy_start_col": "A",
   "copy_end_col": "",
   "pre_mappings": [],
   "post_mappings": [],
-  "image_outputs": [],
   "text_outputs": [],
   "TextToColumns": {
     "enabled": false,
@@ -22,6 +38,11 @@
     "enabled": false,
     "rules": []
   },
+  "RegionFilter": {
+    "enabled": false,
+    "rules": []
+  },
+  "source_start_row": 2,
   "jobs": [
     {
       "template_sheet": "1当天派单",
@@ -86,22 +107,5 @@
         }
       ]
     }
-  ],
-  "config_name": "",
-  "template_prefix_length": 5,
-  "workflow": [
-    "template_cleanup",
-    "pre_mapping",
-    "source_copy",
-    "formula_fill",
-    "formula_recalc",
-    "result_mapping",
-    "post_mapping",
-    "TextToColumns",
-    "Deduplicate",
-    "FormatConvert",
-    "final_recalc_save",
-    "image_output",
-    "text_output"
   ]
 }

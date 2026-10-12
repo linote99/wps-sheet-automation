@@ -1,3 +1,5 @@
-本次修正了两个构建测试问题：其一，区域导出单测不再启动真实 WPS COM；其二，主程序分包的安装脚本自检已与“仅构建主程序”的独立脚本对应。主程序包内 73 项静态回归测试通过。
+本次修复：Windows 版 openpyxl 会把自闭合 XML 标签输出为 `<autoFilter ... />`（`/>` 前有空格）；原静态测试只匹配无空格形式，导致测试错误失败。现测试兼容该空格形式，应用程序清理逻辑已用带空格样本验证。v13 包内 72 项静态回归测试通过。
 
-请关闭旧命令窗口，重新解压本包到全新文件夹并运行 install_and_build.bat。成功后从 dist\WpsSheetAutomation\WpsSheetAutomation.exe 启动。当前环境没有 Windows，未能实测 EXE。
+失败窗口提示“static regression tests”时，PyInstaller 尚未运行，因此 `dist\\WpsSheetAutomation` 目录不会存在。此时手动打开 WpsSheetAutomation.iss 会得到“没有匹配文件”；那是前置构建未完成的结果，不是 Inno Setup 安装器损坏。请按任意键关闭旧窗口，用本版在新目录运行 install_and_build.bat；它会先自测，再生成 PyInstaller 程序目录，最后编译安装包。当前环境未实测 Windows/WPS EXE。
+
+本次补充修复：项目内部模块 `workflow.py` 与 PyInstaller hooks-contrib 的 `hook-workflow.py` 同名。hook 会尝试 `copy_metadata('workflow')`，而项目并没有第三方 workflow distribution 元数据，因此构建抛出 PackageNotFoundError。现模块已改名为 `wps_automation_workflow.py`，主程序、构建脚本和静态测试同步更新。main-only 静态/合成工作簿回归 **73 项通过**；Linux 临时环境下 PyInstaller 6.22.3 / hooks-contrib 2026.8 onedir 冒烟打包通过，确认分析图包含新模块且不再运行 `hook-workflow.py`。该 Linux 冒烟包不是 Windows EXE；Windows 11 + WPS COM 仍需在目标机验收。

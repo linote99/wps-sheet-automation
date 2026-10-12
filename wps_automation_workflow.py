@@ -1,3 +1,9 @@
+"""Workflow helpers for WPS Sheet Automation.
+
+Keep this project module's name distinct from the unrelated third-party
+``workflow`` distribution handled by PyInstaller's contrib hook.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -17,10 +23,10 @@ MODULE_LABELS = {
     "result_mapping": "公式结果列映射",
     "post_mapping": "后映射",
     "TextToColumns": "文本分列",
+    "RegionFilter": "区域筛选",
     "Deduplicate": "去重",
     "FormatConvert": "格式转换",
     "final_recalc_save": "最终重算并保存",
-    "image_output": "自定义区域 XLSX / PNG 输出",
     "text_output": "文本区域剪贴板输出",
 }
 
@@ -38,7 +44,6 @@ DEPENDENCIES = (
     ("formula_fill", "formula_recalc", "公式填充必须先于首次完整重算"),
     ("formula_recalc", "result_mapping", "公式结果列映射必须读取首次完整重算后的结果"),
     ("result_mapping", "final_recalc_save", "结果映射必须在最终重算和保存之前完成"),
-    ("final_recalc_save", "image_output", "区域 XLSX 必须在工作簿最终重算并保存后导出"),
     ("final_recalc_save", "text_output", "文本必须在工作簿最终重算并保存后读取"),
 )
 
@@ -62,13 +67,12 @@ def validate_workflow(settings: dict[str, Any]) -> None:
         required.append(("pre_mapping", "配置了前映射规则"))
     if settings.get("post_mappings"):
         required.append(("post_mapping", "配置了后映射规则"))
-    operation_map = (("TextToColumns", "TextToColumns"), ("Deduplicate", "Deduplicate"), ("FormatConvert", "FormatConvert"))
+    operation_map = (("TextToColumns", "TextToColumns"), ("RegionFilter", "RegionFilter"),
+                     ("Deduplicate", "Deduplicate"), ("FormatConvert", "FormatConvert"))
     for key, module_id in operation_map:
         operation = settings.get(key, {})
         if isinstance(operation, dict) and operation.get("enabled", False):
             required.append((module_id, f"已启用 {MODULE_LABELS[module_id]}"))
-    if settings.get("image_outputs"):
-        required.append(("image_output", "配置了区域 XLSX/PNG 输出"))
     if settings.get("text_outputs"):
         required.append(("text_output", "配置了文本输出区域"))
     for module_id, reason in required:
@@ -83,7 +87,7 @@ def validate_workflow(settings: dict[str, Any]) -> None:
         ("result_mapping", "post_mapping", "后映射依赖公式结果列映射后的结果"),
         ("post_mapping", "final_recalc_save", "后映射必须在最终重算和保存前完成"),
     ))
-    region_modules = ("TextToColumns", "Deduplicate", "FormatConvert")
+    region_modules = ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert")
     for module_id in region_modules:
         edges.append(("result_mapping", module_id, f"{MODULE_LABELS[module_id]}必须在公式结果列映射后执行"))
         edges.append((module_id, "final_recalc_save", f"{MODULE_LABELS[module_id]}必须在最终重算和保存之前执行"))
