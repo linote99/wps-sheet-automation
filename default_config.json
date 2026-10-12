@@ -1,8 +1,9 @@
 {
-  "config_version": 13,
+  "config_version": 17,
   "config_name": "",
   "template_prefix_length": 5,
   "workflow": [
+    "source_merge",
     "source_preprocess",
     "template_cleanup",
     "pre_mapping",
@@ -17,20 +18,23 @@
     "Deduplicate",
     "FormatConvert",
     "final_recalc_save",
-    "image_output",
+    "region_xlsx_output",
     "text_output"
   ],
   "template_path": "",
   "output_dir": "",
   "output_filename": "处理结果.xlsx",
   "output_filename_custom": null,
-  "export_region_pngs": false,
+  "merge_only": false,
+  "merge_output_filename": "合并结果.xlsx",
+  "merge_sources": [],
+  "retain_merged_sources": false,
   "retain_edited_sources": false,
   "copy_start_col": "A",
   "copy_end_col": "",
   "pre_mappings": [],
   "post_mappings": [],
-  "image_outputs": [],
+  "region_xlsx_outputs": [],
   "text_outputs": [],
   "CustomFormula": {
     "enabled": false,
@@ -56,6 +60,7 @@
   "jobs": [
     {
       "template_sheet": "1当天派单",
+      "merged_source_filename": "",
       "header_rows": 2,
       "start_row": 3,
       "formula_range": "EB:EN",
@@ -64,6 +69,7 @@
     },
     {
       "template_sheet": "2当天归档",
+      "merged_source_filename": "",
       "header_rows": 2,
       "start_row": 3,
       "formula_range": "EB:EU",
@@ -72,6 +78,7 @@
     },
     {
       "template_sheet": "3装移全业务在途",
+      "merged_source_filename": "",
       "header_rows": 3,
       "start_row": 4,
       "formula_range": "EB:FV",

@@ -15,6 +15,7 @@ from typing import Any
 
 
 MODULE_LABELS = {
+    "source_merge": "源文件合并",
     "source_preprocess": "源文件规则处理",
     "template_cleanup": "模板清理",
     "pre_mapping": "前映射",
@@ -29,25 +30,26 @@ MODULE_LABELS = {
     "Deduplicate": "去重",
     "FormatConvert": "格式转换",
     "final_recalc_save": "最终重算并保存",
-    "image_output": "区域 XLSX 输出 / 可选 PNG 图片",
+    "region_xlsx_output": "区域 XLSX 输出",
     "text_output": "文本区域剪贴板输出",
 }
 
 DEFAULT_WORKFLOW = list(MODULE_LABELS)
 CORE_MODULES = {
-    "source_preprocess", "template_cleanup", "source_copy", "formula_fill", "formula_recalc",
+    "source_merge", "source_preprocess", "template_cleanup", "source_copy", "formula_fill", "formula_recalc",
     "final_recalc_save",
 }
 
 # The UI may reorder independent region processors and terminal readers. These
 # edges encode only correctness constraints shared by every valid workflow.
 DEPENDENCIES = (
+    ("source_merge", "source_preprocess", "源文件必须先按顺序合并，再执行其他源文件处理"),
     ("source_preprocess", "template_cleanup", "源文件规则必须先处理完成，再开始编辑模板"),
     ("template_cleanup", "source_copy", "模板清理必须先于源数据写入，否则可能清掉刚复制的数据"),
     ("source_copy", "formula_fill", "源数据复制必须先完成，才能按最终数据行数填充公式"),
     ("formula_fill", "formula_recalc", "公式填充必须先于首次完整重算"),
     ("formula_recalc", "final_recalc_save", "公式必须先完整重算，再最终重算并保存"),
-    ("final_recalc_save", "image_output", "区域 XLSX/PNG 必须在工作簿最终重算并保存后导出"),
+    ("final_recalc_save", "region_xlsx_output", "区域 XLSX 必须在工作簿最终重算并保存后导出"),
     ("final_recalc_save", "text_output", "文本必须在工作簿最终重算并保存后读取"),
 )
 
@@ -82,10 +84,8 @@ def validate_workflow(settings: dict[str, Any]) -> None:
             required.append((module_id, f"已启用 {MODULE_LABELS[module_id]}"))
     if settings.get("text_outputs"):
         required.append(("text_output", "配置了文本输出区域"))
-    if settings.get("image_outputs"):
-        required.append(("image_output", "配置了区域 XLSX 输出"))
-    if settings.get("export_region_pngs") and not settings.get("image_outputs"):
-        raise ValueError("已勾选图片输出，但没有配置区域 XLSX 输出范围；请添加区域或取消勾选。")
+    if settings.get("region_xlsx_outputs"):
+        required.append(("region_xlsx_output", "配置了区域 XLSX 输出"))
     for module_id, reason in required:
         if module_id not in workflow:
             raise ValueError(f"{reason}，但工作流中移除了“{MODULE_LABELS[module_id]}”模块；请重新添加该模块或清空/禁用对应配置。")

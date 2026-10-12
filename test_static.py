@@ -98,6 +98,10 @@ class FakeComWorksheet:
         self.events = events
 
     @property
+    def Name(self):
+        return self.worksheet.title
+
+    @property
     def UsedRange(self):
         rows = [cell.row for cell in self.worksheet._cells.values() if cell.value is not None]
         cols = [cell.column for cell in self.worksheet._cells.values() if cell.value is not None]
@@ -116,14 +120,35 @@ class FakeComWorksheet:
         return FakeMappedRange(self.worksheet, address, self.events)
 
 
+class FakeComWorksheetCollection:
+    def __init__(self, workbook, events):
+        self.workbook = workbook
+        self.events = events
+
+    @property
+    def Count(self):
+        return len(self.workbook.sheetnames)
+
+    def Item(self, name_or_index):
+        if isinstance(name_or_index, int):
+            title = self.workbook.sheetnames[name_or_index - 1]
+        else:
+            requested = str(name_or_index).casefold()
+            title = next((name for name in self.workbook.sheetnames if name.casefold() == requested), None)
+            if title is None:
+                raise KeyError(name_or_index)
+        return FakeComWorksheet(self.workbook[title], self.events)
+
+    def __call__(self, name_or_index):
+        return self.Item(name_or_index)
+
+
 class FakeComWorkbook:
     def __init__(self, path, events):
         self.path = Path(path)
         self.events = events
         self.workbook = load_workbook(self.path, data_only=False, keep_links=False)
-
-    def Worksheets(self, name):
-        return FakeComWorksheet(self.workbook[name], self.events)
+        self.Worksheets = FakeComWorksheetCollection(self.workbook, events)
 
     def Save(self):
         self.events.append("save")
@@ -421,6 +446,22 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual(main.DEFAULT_WORKFLOW, migrated_v5["workflow"])
         self.assertEqual(5, migrated_v5["template_prefix_length"])
 
+        legacy_v16 = deepcopy(main.DEFAULT_SETTINGS)
+        legacy_v16["config_version"] = 16
+        legacy_v16["RegionFilter"] = {"enabled": True, "rules": [{
+            "scope": "source", "sheet": "", "range": "", "has_header": True,
+            "filter_column": "A", "operator": "not_blank", "criteria": "",
+        }]}
+        migrated_v16 = main.normalize_settings(legacy_v16)
+        self.assertEqual(17, migrated_v16["config_version"])
+        self.assertEqual("sheet", main._parse_region_filter_area(
+            migrated_v16["RegionFilter"]["rules"][0]["range"]
+        )[1])
+        migration_message = " ".join(main.configuration_migration_notes(legacy_v16))
+        self.assertIn("第一张表", migration_message)
+        self.assertIn("不区分大小写", migration_message)
+        self.assertIn("筛选范围可留空", migration_message)
+
         legacy_v12 = deepcopy(main.DEFAULT_SETTINGS)
         legacy_v12["config_version"] = 12
         legacy_v12["workflow"].remove("result_mapping")
@@ -661,6 +702,20 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual(main.DEFAULT_WORKFLOW, sample["workflow"])
         self.assertEqual(main.CONFIG_VERSION, sample["config_version"])
 
+    def test_merged_source_filename_is_optional_but_validated(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["jobs"] = [deepcopy(settings["jobs"][0])]
+        settings["jobs"][0]["merged_source_filename"] = ""
+        main.validate_static_settings(settings)
+        settings["jobs"][0]["merged_source_filename"] = "custom-source.xlsx"
+        main.validate_static_settings(settings)
+        for filename, error in (("../escape.xlsx", "不能包含目录路径"),
+                                ("source.xlsm", "只能使用 .xlsx"),
+                                ("CON.xlsx", "保留设备名")):
+            settings["jobs"][0]["merged_source_filename"] = filename
+            with self.subTest(filename=filename), self.assertRaisesRegex(main.ProcessingError, error):
+                main.validate_static_settings(settings)
+
     def test_missing_source_path_is_located_and_reported_before_processing(self):
         settings = deepcopy(main.DEFAULT_SETTINGS)
         settings["jobs"][1]["sources"][0]["path"] = "C:/data/second.xlsx"
@@ -703,15 +758,16 @@ class StaticConfigurationTests(unittest.TestCase):
             path = Path(td) / "reusable.json"
             settings = deepcopy(main.DEFAULT_SETTINGS)
             settings["jobs"][0]["sources"] = [
-                {"path": "C:/data/one.xlsx", "source_sheet": "甲", "copy_start_row": 5, "copy_end_row": 8},
-                {"path": "C:/data/two.xlsx", "source_sheet": "乙", "copy_start_row": 2, "copy_end_row": None},
+                {"path": "C:/data/one.xlsx", "source_sheet": "甲", "copy_start_row": 5, "copy_end_row": 8, "keep_first_row": True},
+                {"path": "C:/data/two.xlsx", "source_sheet": "乙", "copy_start_row": 2, "copy_end_row": None, "keep_first_row": False},
             ]
             settings["pre_mappings"] = [{"source_sheet": "模板甲", "source_range": "A1:B2", "target_sheet": "模板乙", "target_range": "C3:D4"}]
             settings["post_mappings"] = [{"source_sheet": "模板乙", "source_range": "A1:B2", "target_sheet": "模板丙", "target_range": "C3:D4"}]
-            settings["image_outputs"] = [{"sheet": "模板丙", "range": "A1:B2"}]
+            settings["region_xlsx_outputs"] = [{"sheet": "模板丙", "range": "A1:B2"}]
             settings["text_outputs"] = [{"sheet": "模板丙", "range": "A1"}]
-            settings["export_region_pngs"] = True
+            settings["retain_merged_sources"] = True
             settings["retain_edited_sources"] = True
+            settings["jobs"][0]["merged_source_filename"] = "源数据副本.xlsx"
             settings["TextToColumns"] = {"enabled": True, "rules": [{"scope": "source", "sheet": "模板甲", "range": "A2:A8", "delimiter": "|", "output_start_col": "D", "column_formats": ["text", "number"]}]}
             settings["RegionFilter"] = {"enabled": True, "rules": [{"scope": "target", "sheet": "模板乙", "range": "A1:C8", "has_header": True, "filter_column": "A", "operator": "equals", "criteria": "OK"}]}
             settings["Deduplicate"] = {"enabled": True, "rules": [{"scope": "target", "sheet": "模板乙", "range": "A1:C8", "has_header": True, "key_mode": "columns", "key_columns": ["A", "C"]}]}
@@ -722,8 +778,9 @@ class StaticConfigurationTests(unittest.TestCase):
             loaded = main.load_settings(path)
             self.assertEqual(settings["jobs"][0], loaded["jobs"][0])
             self.assertEqual(main.CONFIG_VERSION, loaded["config_version"])
-            for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert", "workflow", "config_name", "template_prefix_length", "export_region_pngs", "retain_edited_sources"):
+            for key in ("pre_mappings", "post_mappings", "region_xlsx_outputs", "text_outputs", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert", "workflow", "config_name", "template_prefix_length", "retain_edited_sources"):
                 self.assertEqual(settings[key], loaded[key])
+            self.assertTrue(loaded["retain_merged_sources"])
         self.assertEqual([], loaded["jobs"][0]["mappings"])
 
     def test_named_profile_save_load_and_template_prefix_match_cardinality(self):
@@ -1035,160 +1092,48 @@ class StaticConfigurationTests(unittest.TestCase):
             finally:
                 exported.close()
 
-    def test_region_xlsx_is_always_exported_and_png_is_optional(self):
+    def test_region_xlsx_is_exported_without_image_generation(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             fake = create_fake_data(root / "fake")
             settings = deepcopy(main.DEFAULT_SETTINGS)
             settings.update({"copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
                              "output_dir": str(fake / "output"), "output_filename": "main-only.xlsx",
-                             "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}],
-                             "export_region_pngs": True})
+                             "region_xlsx_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}]})
             for idx, job in enumerate(settings["jobs"], 1):
                 job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
-                                   "copy_start_row": 2, "copy_end_row": 3}]
+                                   "copy_start_row": 2, "copy_end_row": 3, "keep_first_row": True}]
             def fake_calculate(path, _formula_jobs, _log, _post_mappings, _settings):
                 workbook = load_workbook(path, data_only=False)
                 workbook.save(path); workbook.close()
-            def fake_pngs(paths, _log):
-                generated = []
-                for path in paths:
-                    png_path = path.with_suffix(".png")
-                    png_path.write_bytes(b"test-png")
-                    generated.append(png_path)
-                return generated
             region_outputs = []
             with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
-                 mock.patch.object(main, "_read_wps_display_text", return_value={}), \
-                 mock.patch.object(main, "_export_region_xlsx_as_pngs", side_effect=fake_pngs):
+                 mock.patch.object(main, "_read_wps_display_text", return_value={}):
                 result = main.process_workbooks(settings, lambda _msg: None,
                                                 on_region_outputs=region_outputs.extend)
             self.assertTrue(result.is_file())
             self.assertTrue((Path(settings["output_dir"]) / "1当天派单.xlsx").is_file())
-            self.assertTrue((Path(settings["output_dir"]) / "1当天派单.png").is_file())
-            self.assertIn(Path(settings["output_dir"]) / "1当天派单.xlsx", region_outputs)
-            self.assertIn(Path(settings["output_dir"]) / "1当天派单.png", region_outputs)
-
-    def test_region_xlsx_is_exported_without_png_when_unchecked(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            fake = create_fake_data(root / "fake")
-            settings = deepcopy(main.DEFAULT_SETTINGS)
-            settings.update({"copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
-                             "output_dir": str(fake / "output"), "output_filename": "xlsx-only.xlsx",
-                             "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}],
-                             "export_region_pngs": False})
-            for idx, job in enumerate(settings["jobs"], 1):
-                job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
-                                   "copy_start_row": 2, "copy_end_row": 3}]
-            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _settings):
-                workbook = load_workbook(path, data_only=False)
-                workbook.save(path); workbook.close()
-            with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
-                 mock.patch.object(main, "_read_wps_display_text", return_value={}):
-                result = main.process_workbooks(settings, lambda _msg: None)
-            self.assertTrue(result.is_file())
-            self.assertTrue((Path(settings["output_dir"]) / "1当天派单.xlsx").is_file())
-            self.assertFalse((Path(settings["output_dir"]) / "1当天派单.png").exists())
+            self.assertEqual([Path(settings["output_dir"]) / "1当天派单.xlsx"], region_outputs)
+            self.assertEqual([".xlsx"], [path.suffix.lower() for path in region_outputs])
 
     def test_region_export_configuration_is_preserved_and_old_auto_open_removed(self):
         old = deepcopy(main.DEFAULT_SETTINGS)
         old["config_version"] = 8
         old["open_region_exports"] = True
         old["export_region_pngs"] = True
+        old.pop("region_xlsx_outputs")
         old["image_outputs"] = [{"sheet": "旧表", "range": "A1:B2"}]
+        old["workflow"].remove("region_xlsx_output")
         old["workflow"].append("image_output")
         normalized = main.normalize_settings(old)
         self.assertEqual(main.CONFIG_VERSION, normalized["config_version"])
         self.assertNotIn("open_region_exports", normalized)
-        self.assertTrue(normalized["export_region_pngs"])
-        self.assertEqual(old["image_outputs"], normalized["image_outputs"])
-        self.assertIn("image_output", normalized["workflow"])
+        self.assertNotIn("export_region_pngs", normalized)
+        self.assertNotIn("image_outputs", normalized)
+        self.assertEqual(old["image_outputs"], normalized["region_xlsx_outputs"])
+        self.assertIn("region_xlsx_output", normalized["workflow"])
         self.assertTrue(any("自动打开区域 XLSX" in note
                             for note in main.configuration_migration_notes(old)))
-
-    def test_region_xlsx_png_export_uses_wps_and_never_overwrites_existing_png(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            region_xlsx = root / "区域表.xlsx"
-            region_xlsx.write_bytes(b"fake-xlsx")
-            existing_png = root / "区域表.png"
-            existing_png.write_bytes(b"existing-user-image")
-            events = []
-
-            class FakeChart:
-                def Paste(self):
-                    events.append("paste")
-
-                def Export(self, path, file_type):
-                    self.assert_png = file_type
-                    Path(path).write_bytes(b"fake-png")
-                    events.append("chart-export")
-                    return True
-
-            class FakeChartObject:
-                def __init__(self):
-                    self.Chart = FakeChart()
-
-                def Activate(self):
-                    events.append("activate-chart")
-
-            class FakeChartObjects:
-                def Add(self, *_args):
-                    events.append("chart-add")
-                    return FakeChartObject()
-
-            class FakeArea:
-                Left, Top, Width, Height = 0, 0, 120, 60
-
-                def CopyPicture(self, **_kwargs):
-                    events.append("copy-picture")
-
-            class FakeWorksheet:
-                UsedRange = FakeArea()
-
-                def ChartObjects(self):
-                    return FakeChartObjects()
-
-                def Activate(self):
-                    events.append("activate-sheet")
-
-            class FakeSheets:
-                def __call__(self, _index):
-                    return FakeWorksheet()
-
-            class FakeWorkbook:
-                Worksheets = FakeSheets()
-
-                def Close(self, SaveChanges=False):
-                    events.append(("workbook-close", SaveChanges))
-
-            class FakeWorkbooks:
-                def Open(self, path, **_kwargs):
-                    events.append(("open", path))
-                    return FakeWorkbook()
-
-            class FakeApp:
-                Workbooks = FakeWorkbooks()
-
-                def Quit(self):
-                    events.append("quit")
-
-            class FakePythonCom:
-                def CoUninitialize(self):
-                    events.append("co-uninitialize")
-
-            logs = []
-            with mock.patch.object(main, "_connect_wps", return_value=(FakeApp(), FakePythonCom(), "fake.Application")):
-                outputs = main._export_region_xlsx_as_pngs([region_xlsx], logs.append)
-
-            self.assertEqual([root / "区域表_2.png"], outputs)
-            self.assertEqual(b"existing-user-image", existing_png.read_bytes())
-            self.assertEqual(b"fake-png", outputs[0].read_bytes())
-            self.assertTrue(region_xlsx.is_file(), "转换函数本身不能删除回退 XLSX")
-            self.assertIn("chart-export", events)
-            self.assertIn("quit", events)
-            self.assertIn("co-uninitialize", events)
 
     def test_region_xlsx_preserves_styles_merges_dimensions_and_hidden_axes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1809,6 +1754,80 @@ class StaticConfigurationTests(unittest.TestCase):
                 retained.close()
             self.assertIn("save", events)
 
+    def test_optional_merged_source_save_uses_target_default_or_custom_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "source.xlsx"
+            make_test_workbook(source_path, [("Data", {1: {1: "ID"}, 2: {1: "123"}})])
+            original_bytes = source_path.read_bytes()
+            template_path = root / "template.xlsx"
+            template = Workbook()
+            template.active.title = "Target Default"
+            template.active["B1"] = "=ROW()"
+            template_custom = template.create_sheet("TargetCustom")
+            template_custom["B1"] = "=ROW()"
+            template.save(template_path)
+            template.close()
+            output_dir = root / "output"
+            output_dir.mkdir()
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({"template_path": str(template_path), "output_dir": str(output_dir),
+                             "output_filename": "template-result.xlsx", "copy_start_col": "A",
+                             "copy_end_col": "A", "retain_merged_sources": True})
+            source = {"path": str(source_path), "source_sheet": "Data", "copy_start_row": 1,
+                      "copy_end_row": None, "keep_first_row": True}
+            settings["jobs"] = [
+                {"template_sheet": "Target Default", "merged_source_filename": "", "header_rows": 0,
+                 "start_row": 2, "formula_range": "B:B", "sources": [dict(source)], "mappings": []},
+                {"template_sheet": "TargetCustom", "merged_source_filename": "custom-source.xlsx",
+                 "header_rows": 0, "start_row": 2, "formula_range": "B:B",
+                 "sources": [dict(source)], "mappings": []},
+            ]
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "Data", "range": "A2", "mode": "number",
+            }]}
+            merged_paths = []
+            real_merge = main._merge_source_workbooks
+            events = []
+
+            def fake_connect(_log):
+                return FakeWpsApplication(events, {}), FakePythonCom(events), "fake.WPS"
+
+            def capture_merge(*args, **kwargs):
+                merged = real_merge(*args, **kwargs)
+                merged_paths.append(merged["path"])
+                return merged
+
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _region_processing):
+                self.assertEqual(2, len(merged_paths))
+                self.assertTrue(all(merged_path.is_file() for merged_path in merged_paths))
+                workbook = load_workbook(path, data_only=False)
+                try:
+                    self.assertEqual("ID", workbook["Target Default"]["A2"].value)
+                    self.assertEqual(123, workbook["Target Default"]["A3"].value)
+                    self.assertEqual("ID", workbook["TargetCustom"]["A2"].value)
+                    self.assertEqual(123, workbook["TargetCustom"]["A3"].value)
+                    workbook.save(path)
+                finally:
+                    workbook.close()
+
+            with mock.patch.object(main, "_merge_source_workbooks", side_effect=capture_merge), \
+                    mock.patch.object(main, "_connect_wps", side_effect=fake_connect), \
+                    mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate):
+                result = main.process_workbooks(settings, lambda _msg: None)
+
+            self.assertTrue(result.is_file())
+            self.assertEqual(["Target Default.xlsx", "custom-source.xlsx"],
+                             sorted(path.name for path in output_dir.glob("*.xlsx") if path != result))
+            self.assertTrue(all(not merged_path.exists() for merged_path in merged_paths))
+            self.assertEqual(original_bytes, source_path.read_bytes())
+            for filename in ("Target Default.xlsx", "custom-source.xlsx"):
+                saved = load_workbook(output_dir / filename, read_only=True, data_only=True)
+                try:
+                    self.assertEqual([("ID",), (123,)], list(saved["合并源数据"].values))
+                finally:
+                    saved.close()
+
     def test_processes_source_copy_before_editing_template(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1842,18 +1861,30 @@ class StaticConfigurationTests(unittest.TestCase):
             events = []
             fake_app = FakeWpsApplication(events, {})
             fake_pythoncom = FakePythonCom(events)
+            merged_paths = []
+            real_merge = main._merge_source_workbooks
+
+            def capture_merge(*args, **kwargs):
+                merged = real_merge(*args, **kwargs)
+                merged_paths.append(merged["path"])
+                return merged
 
             def fake_calculate(path, _formula_jobs, _log, _post_mappings, _settings):
+                self.assertEqual(1, len(merged_paths))
+                self.assertTrue(merged_paths[0].is_file())
                 events.append("template-processing")
                 workbook = load_workbook(path, data_only=False)
                 workbook.save(path)
                 workbook.close()
 
-            with mock.patch.object(main, "_connect_wps", return_value=(fake_app, fake_pythoncom, "fake.WPS")), \
+            with mock.patch.object(main, "_merge_source_workbooks", side_effect=capture_merge), \
+                    mock.patch.object(main, "_connect_wps", return_value=(fake_app, fake_pythoncom, "fake.WPS")), \
                     mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate):
                 final_path = main.process_workbooks(settings, lambda _msg: None)
 
             self.assertLess(events.index("save"), events.index("template-processing"))
+            self.assertTrue(merged_paths)
+            self.assertTrue(all(not merged_path.exists() for merged_path in merged_paths))
             self.assertEqual(original_bytes, source_path.read_bytes())
             result = load_workbook(final_path, data_only=False)
             try:
@@ -2732,18 +2763,53 @@ if __name__ == "__main__":
 
 class RegionFilterRangeShorthandTests(unittest.TestCase):
     def test_region_filter_range_shorthand_and_legacy_rectangle(self):
+        bounds, kind = main._parse_region_filter_area("")
+        self.assertEqual((1, 1, 16_384, 1_048_576), bounds)
+        self.assertEqual("sheet", kind)
         bounds, kind = main._parse_region_filter_area("A")
         self.assertEqual((1, 1, 1, 1_048_576), bounds)
         self.assertEqual("column", kind)
+        self.assertEqual(((1, 1, 1, 1_048_576), "column"), main._parse_region_filter_area("a"))
         bounds, kind = main._parse_region_filter_area("a1")
         self.assertEqual((1, 1, 1, 1), bounds)
         self.assertEqual("cell", kind)
+        self.assertEqual(((1, 1, 1, 1), "cell"), main._parse_region_filter_area("A1"))
         bounds, kind = main._parse_region_filter_area("A1:F100")
         self.assertEqual((1, 1, 6, 100), bounds)
         self.assertEqual("rectangle", kind)
         bounds, kind = main._parse_region_filter_area("A1")
-        self.assertEqual("sheet", kind)
-        self.assertEqual((1, 1, 16_384, 1_048_576), bounds)
+        self.assertEqual("cell", kind)
+        self.assertEqual((1, 1, 1, 1), bounds)
+
+    def test_blank_filter_sheet_and_range_use_first_sheet_and_used_range(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "default-sheet.xlsx"
+            make_test_workbook(path, [
+                ("Primary", {1: {1: "ID", 2: "Status"},
+                             2: {1: "KEEP-1", 2: "Keep"},
+                             3: {1: "DROP", 2: "Drop"}}),
+                ("Secondary", {1: {1: "OTHER", 2: "Keep"}}),
+            ])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["RegionFilter"] = {"enabled": True, "rules": [{
+                "scope": "target", "sheet": "", "range": "", "has_header": True,
+                "filter_column": "B", "operator": "equals", "criteria": "Keep",
+            }]}
+            main.validate_static_settings(settings)
+            messages = []
+            fake = FakeComWorkbook(path, [])
+            self.assertTrue(main._apply_region_processing(fake, settings, [], messages.append))
+            self.assertEqual("KEEP-1", fake.workbook["Primary"]["A2"].value)
+            self.assertIsNone(fake.workbook["Primary"]["A3"].value)
+            self.assertEqual("OTHER", fake.workbook["Secondary"]["A1"].value)
+            self.assertTrue(any("默认使用第一个工作表“Primary”" in message for message in messages))
+            fake.workbook.close()
+
+            settings["RegionFilter"]["rules"][0]["sheet"] = "pRiMaRy"
+            fake = FakeComWorkbook(path, [])
+            self.assertTrue(main._apply_region_processing(fake, settings, [], lambda _msg: None))
+            self.assertIsNone(fake.workbook["Primary"]["A3"].value)
+            fake.workbook.close()
 
     def test_region_filter_single_column_validates_without_full_column_cell_limit(self):
         settings = deepcopy(main.DEFAULT_SETTINGS)
@@ -2752,6 +2818,30 @@ class RegionFilterRangeShorthandTests(unittest.TestCase):
             "filter_column": "A", "operator": "equals", "criteria": "保留",
         }]}
         main.validate_static_settings(settings)
+
+    def test_upper_and_lowercase_single_cell_filter_ranges_are_equivalent(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "single-cell-filter.xlsx"
+            make_test_workbook(path, [("Primary", {
+                1: {1: "Drop", 2: "Keep-other-cell"},
+                2: {1: "Keep-row", 2: "Keep-other-row"},
+            })])
+            for area in ("A1", "a1"):
+                with self.subTest(area=area):
+                    settings = deepcopy(main.DEFAULT_SETTINGS)
+                    settings["RegionFilter"] = {"enabled": True, "rules": [{
+                        "scope": "target", "sheet": "primary", "range": area,
+                        "has_header": False, "filter_column": "A",
+                        "operator": "equals", "criteria": "Keep",
+                    }]}
+                    main.validate_static_settings(settings)
+                    fake = FakeComWorkbook(path, [])
+                    self.assertTrue(main._apply_region_processing(fake, settings, [], lambda _msg: None))
+                    sheet = fake.workbook["Primary"]
+                    self.assertIsNone(sheet["A1"].value)
+                    self.assertEqual("Keep-other-cell", sheet["B1"].value)
+                    self.assertEqual("Keep-row", sheet["A2"].value)
+                    fake.workbook.close()
 
     def test_sheet_row_and_column_selectors_resolve_to_used_range(self):
         workbook = Workbook()
@@ -2777,7 +2867,7 @@ class RegionFilterRangeShorthandTests(unittest.TestCase):
             })])
             settings = deepcopy(main.DEFAULT_SETTINGS)
             settings["RegionFilter"] = {"enabled": True, "rules": [{
-                "scope": "target", "sheet": "数据", "range": "A1", "has_header": True,
+                "scope": "target", "sheet": "数据", "range": "", "has_header": True,
                 "filter_column": "C", "operator": "equals", "criteria": "保留",
             }]}
             main.validate_static_settings(settings)
@@ -2853,3 +2943,279 @@ class RegionFilterRangeShorthandTests(unittest.TestCase):
                                                source_processing=settings)
             self.assertEqual([["状态", "记录"], ["保留", "first"], ["保留", "last"]], records)
             self.assertEqual(original, path.read_bytes())
+
+
+class SourceMergeTests(unittest.TestCase):
+    def _make_source(self, path, title, rows):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = title
+        for row in rows:
+            worksheet.append(row)
+        workbook.save(path)
+        workbook.close()
+
+    def test_merge_is_top_to_bottom_keeps_first_source_header_and_optionally_skips_later(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first = root / "first.xlsx"
+            second = root / "second.xlsx"
+            self._make_source(first, "Data", [["ID", "Value"], ["A", 1]])
+            self._make_source(second, "Other", [["ID", "Value"], ["B", 2]])
+            originals = {path: path.read_bytes() for path in (first, second)}
+            sources = [
+                {"path": str(first), "source_sheet": "Data", "copy_start_row": 1,
+                 "copy_end_row": None, "keep_first_row": False},
+                {"path": str(second), "source_sheet": "Other", "copy_start_row": 1,
+                 "copy_end_row": None, "keep_first_row": False},
+            ]
+            merged = main._merge_source_workbooks(
+                sources, deepcopy(main.DEFAULT_SETTINGS), 1, 2, lambda _msg: None
+            )
+            try:
+                records, retained = main._process_merged_source_workbook(
+                    merged, main.DEFAULT_SETTINGS, 1, 2, lambda _msg: None,
+                    False, root, root / "result.xlsx"
+                )
+                self.assertIsNone(retained)
+                self.assertEqual([["ID", "Value"], ["A", 1], ["B", 2]], records)
+                self.assertEqual(originals, {path: path.read_bytes() for path in originals})
+            finally:
+                merged["path"].unlink(missing_ok=True)
+
+    def test_later_source_header_can_be_retained_and_source_rules_map_to_merged_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first, second = root / "first.xlsx", root / "second.xlsx"
+            self._make_source(first, "Data", [["ID", "Value"], ["A", 1]])
+            self._make_source(second, "Data", [["ID", "Value"], ["B", 2]])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "Data", "range": "A1:B20", "mode": "text",
+            }]}
+            sources = [
+                {"path": str(first), "source_sheet": "Data", "copy_start_row": 1,
+                 "copy_end_row": None, "keep_first_row": True},
+                {"path": str(second), "source_sheet": "Data", "copy_start_row": 1,
+                 "copy_end_row": None, "keep_first_row": True},
+            ]
+            merged = main._merge_source_workbooks(sources, settings, 1, 2, lambda _msg: None)
+            try:
+                self.assertEqual(
+                    ["A1:B2", "A3:B4"],
+                    [rule["range"] for rule in merged["settings"]["FormatConvert"]["rules"]],
+                )
+                self.assertTrue(all(rule["sheet"] == "合并源数据" and rule["scope"] == "target"
+                                    for rule in merged["settings"]["FormatConvert"]["rules"]))
+                records, _retained = main._process_merged_source_workbook(
+                    {**merged, "has_rules": False}, settings, 1, 2, lambda _msg: None,
+                    False, root, root / "result.xlsx"
+                )
+                self.assertEqual([["ID", "Value"], ["A", 1], ["ID", "Value"], ["B", 2]], records)
+            finally:
+                merged["path"].unlink(missing_ok=True)
+
+    def test_blank_source_filter_uses_first_sheet_full_range_before_template_records_are_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.xlsx"
+            make_test_workbook(source, [
+                ("Primary", {1: {1: "ID", 2: "Status"},
+                             2: {1: "KEEP", 2: "Keep"},
+                             3: {1: "DROP", 2: "Drop"}}),
+                ("Secondary", {1: {1: "MUST-NOT-READ", 2: "Keep"}}),
+            ])
+            original = source.read_bytes()
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["RegionFilter"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "", "range": "", "has_header": True,
+                "filter_column": "B", "operator": "equals", "criteria": "Keep",
+            }]}
+            merged = main._merge_source_workbooks([{
+                "path": str(source), "source_sheet": "", "copy_start_row": 1,
+                "copy_end_row": None, "keep_first_row": True,
+            }], settings, 1, 2, lambda _msg: None)
+            try:
+                mapped = merged["settings"]["RegionFilter"]["rules"][0]
+                self.assertEqual("合并源数据", mapped["sheet"])
+                self.assertEqual("A1:B3", mapped["range"])
+                self.assertIn(("RegionFilter", 0), merged["used_rules"])
+
+                events = []
+                fake_app = FakeWpsApplication(events, {})
+                fake_pythoncom = FakePythonCom(events)
+                with mock.patch.object(main, "_connect_wps",
+                                        return_value=(fake_app, fake_pythoncom, "Fake WPS")):
+                    records, retained = main._process_merged_source_workbook(
+                        merged, settings, 1, 2, lambda _msg: None,
+                        False, root, root / "result.xlsx",
+                    )
+                self.assertIsNone(retained)
+                self.assertEqual([["ID", "Status"], ["KEEP", "Keep"]], records)
+                self.assertEqual(original, source.read_bytes())
+            finally:
+                merged["path"].unlink(missing_ok=True)
+
+    def test_all_five_source_rule_types_map_first_sheet_and_match_names_case_insensitively(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "mixed-case.xlsx"
+            make_test_workbook(source, [("Data", {
+                1: {1: "ID", 2: "Amount", 3: "Pair"},
+                2: {1: "A", 2: "10", 3: "X|1"},
+                3: {1: "A", 2: "10", 3: "X|1"},
+            }), ("Other", {1: {1: "NOT-FIRST-SHEET"}})])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["CustomFormula"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "dAtA", "range": "D2:D3",
+                "formula_mode": "custom", "formula": '=A2&"-F"',
+            }]}
+            settings["TextToColumns"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "", "range": "C2:C3", "delimiter": "|",
+                "output_start_col": "E", "column_formats": ["text", "text"],
+            }]}
+            settings["RegionFilter"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "", "range": "", "has_header": True,
+                "filter_column": "A", "operator": "not_blank", "criteria": "",
+            }]}
+            settings["Deduplicate"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "DATA", "range": "A1:C3",
+                "has_header": True, "key_mode": "columns", "key_columns": ["A"],
+            }]}
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "", "range": "B2:B3", "mode": "text",
+            }]}
+            merged = main._merge_source_workbooks([{
+                "path": str(source), "source_sheet": "dAtA", "copy_start_row": 1,
+                "copy_end_row": None, "keep_first_row": True,
+            }], settings, 1, 3, lambda _msg: None)
+            try:
+                expected = {"CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"}
+                self.assertEqual(expected, {key for key, _index in merged["used_rules"]})
+                for key in expected:
+                    rules = merged["settings"][key]["rules"]
+                    self.assertTrue(rules)
+                    self.assertTrue(all(rule["sheet"] == "合并源数据" and rule["scope"] == "target"
+                                        for rule in rules))
+                self.assertEqual("A1:C3", merged["settings"]["RegionFilter"]["rules"][0]["range"])
+            finally:
+                merged["path"].unlink(missing_ok=True)
+
+
+class StandaloneMergeTests(unittest.TestCase):
+    def _make_source(self, path, sheet_name, rows):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = sheet_name
+        for row in rows:
+            worksheet.append(row)
+        workbook.save(path)
+        workbook.close()
+
+    def _settings(self, root, sources, **updates):
+        settings = {
+            "config_version": main.CONFIG_VERSION,
+            "merge_only": True,
+            "template_path": "",
+            "output_dir": str(root / "out"),
+            "merge_output_filename": "custom-merge",
+            "merge_sources": sources,
+            "jobs": [],
+            "workflow": [],
+        }
+        settings.update(updates)
+        return settings
+
+    def test_csv_then_xlsx_merges_without_template_or_workflow_and_preserves_sources(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output_dir = root / "out"
+            output_dir.mkdir()
+            csv_path = root / "first.csv"
+            csv_path.write_bytes("\ufeff编号,名称\n001,CSV 记录\n003,\"=SUM(1,2)\"\n".encode("utf-8"))
+            xlsx_path = root / "later.xlsx"
+            self._make_source(xlsx_path, "首表", [["编号", "名称"], ["002", "XLSX 记录"]])
+            original_bytes = {path: path.read_bytes() for path in (csv_path, xlsx_path)}
+            settings = self._settings(root, [
+                {"path": str(csv_path), "source_sheet": "", "copy_start_row": 1,
+                 "copy_end_row": None, "keep_first_row": False},
+                {"path": str(xlsx_path), "source_sheet": "", "copy_start_row": 1,
+                 "copy_end_row": None, "keep_first_row": False},
+            ], FormatConvert={"enabled": True, "rules": [{
+                "scope": "target", "sheet": "does-not-exist", "range": "A1", "mode": "invalid",
+            }]})
+            result = main.process_workbooks(settings, lambda _message: None)
+            self.assertEqual("custom-merge.xlsx", result.name)
+            workbook = load_workbook(result, read_only=True, data_only=False)
+            try:
+                self.assertEqual([("编号", "名称"), ("001", "CSV 记录"), ("003", "=SUM(1,2)"),
+                                  ("002", "XLSX 记录")],
+                                 list(workbook["合并结果"].values))
+                self.assertEqual("s", workbook["合并结果"]["B3"].data_type)
+            finally:
+                workbook.close()
+            self.assertEqual(original_bytes, {path: path.read_bytes() for path in original_bytes})
+
+    def test_gb18030_csv_and_later_header_retention(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output_dir = root / "out"
+            output_dir.mkdir()
+            csv_path = root / "first.csv"
+            csv_path.write_bytes("列名;值\n甲;1\n".encode("gb18030"))
+            xlsx_path = root / "later.xlsx"
+            self._make_source(xlsx_path, "Data", [["列名", "值"], ["乙", 2]])
+            result = main.process_merge_only(self._settings(root, [
+                {"path": str(csv_path), "source_sheet": "", "copy_start_row": 1,
+                 "copy_end_row": None, "keep_first_row": False},
+                {"path": str(xlsx_path), "source_sheet": "Data", "copy_start_row": 1,
+                 "copy_end_row": None, "keep_first_row": True},
+            ], merge_output_filename="retained.xlsx"), lambda _message: None)
+            workbook = load_workbook(result, read_only=True, data_only=True)
+            try:
+                self.assertEqual([("列名", "值"), ("甲", "1"), ("列名", "值"), ("乙", 2)],
+                                 list(workbook.active.values))
+            finally:
+                workbook.close()
+
+    def test_merge_only_requires_csv_only_in_first_position_and_prevents_overwrite(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output_dir = root / "out"
+            output_dir.mkdir()
+            csv_path = root / "first.csv"
+            csv_path.write_text("a\n1\n", encoding="utf-8")
+            another_csv = root / "later.csv"
+            another_csv.write_text("b\n2\n", encoding="utf-8")
+            with self.assertRaisesRegex(main.ProcessingError, "后续文件必须是 .xlsx"):
+                main.validate_static_settings(self._settings(root, [
+                    {"path": str(csv_path)}, {"path": str(another_csv)},
+                ]))
+            xlsx_path = root / "source.xlsx"
+            self._make_source(xlsx_path, "Data", [["x"]])
+            source_before = xlsx_path.read_bytes()
+            existing_result = output_dir / "custom-merge.xlsx"
+            existing_result.write_bytes(b"existing")
+            with self.assertRaisesRegex(main.ProcessingError, "已存在"):
+                main.process_merge_only(self._settings(root, [
+                    {"path": str(xlsx_path), "source_sheet": "", "copy_start_row": 1,
+                     "copy_end_row": None, "keep_first_row": True},
+                ]), lambda _message: None)
+            self.assertEqual(b"existing", existing_result.read_bytes())
+            self.assertEqual(source_before, xlsx_path.read_bytes())
+
+    def test_v14_configuration_migrates_without_enabling_standalone_mode(self):
+        legacy = deepcopy(main.DEFAULT_SETTINGS)
+        legacy["config_version"] = 14
+        for key in ("merge_only", "merge_sources", "merge_output_filename", "retain_merged_sources"):
+            legacy.pop(key, None)
+        legacy["retain_edited_sources"] = True
+        for job in legacy["jobs"]:
+            job.pop("merged_source_filename", None)
+        migrated = main.normalize_settings(legacy)
+        self.assertEqual(main.CONFIG_VERSION, migrated["config_version"])
+        self.assertFalse(migrated["merge_only"])
+        self.assertEqual([], migrated["merge_sources"])
+        self.assertEqual("合并结果.xlsx", migrated["merge_output_filename"])
+        self.assertTrue(migrated["retain_merged_sources"])
+        self.assertTrue(all(job["merged_source_filename"] == "" for job in migrated["jobs"]))
+        self.assertIn("独立源文件合并", " ".join(main.configuration_migration_notes(legacy)))
