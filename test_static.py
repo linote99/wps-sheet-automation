@@ -343,7 +343,7 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual({"result_col": "EQ", "target_col": "DG", "write_as": "value"}, migrated["jobs"][1]["mappings"][0])
         main.validate_static_settings(migrated)
         migrated_v5 = main.normalize_settings({"config_version": 5, "jobs": deepcopy(main.DEFAULT_SETTINGS["jobs"])})
-        self.assertEqual(7, migrated_v5["config_version"])
+        self.assertEqual(main.CONFIG_VERSION, migrated_v5["config_version"])
         self.assertEqual(main.DEFAULT_WORKFLOW, migrated_v5["workflow"])
         self.assertEqual(5, migrated_v5["template_prefix_length"])
 
@@ -355,7 +355,7 @@ class StaticConfigurationTests(unittest.TestCase):
                 legacy["jobs"] = [deepcopy(legacy["jobs"][0])]
                 legacy["jobs"][0].update({"start_row": 4, "formula_seed_row": 4})
                 migrated = main.normalize_settings(legacy)
-                self.assertEqual(7, migrated["config_version"])
+                self.assertEqual(main.CONFIG_VERSION, migrated["config_version"])
                 self.assertEqual(4, migrated["jobs"][0]["start_row"])
                 self.assertNotIn("formula_seed_row", migrated["jobs"][0])
                 self.assertEqual(3, main._formula_template_row(migrated["jobs"][0]))
@@ -460,7 +460,7 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual([3, 3, 4], [job["start_row"] for job in sample["jobs"]])
         self.assertEqual(["EB:EN", "EB:EU", "EB:FV"], [job["formula_range"] for job in sample["jobs"]])
         self.assertEqual(main.DEFAULT_WORKFLOW, sample["workflow"])
-        self.assertEqual(7, sample["config_version"])
+        self.assertEqual(main.CONFIG_VERSION, sample["config_version"])
 
     def test_missing_source_path_is_located_and_reported_before_processing(self):
         settings = deepcopy(main.DEFAULT_SETTINGS)
@@ -838,24 +838,104 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertEqual(saved_bytes[0], final_path.read_bytes())
             self.assertEqual([final_path], list(Path(settings["output_dir"]).iterdir()))
 
-    def test_open_region_exports_setting_defaults_off_and_round_trips(self):
-        legacy = deepcopy(main.DEFAULT_SETTINGS)
-        legacy.pop("open_region_exports", None)
-        self.assertFalse(main.normalize_settings(legacy)["open_region_exports"])
-        enabled = deepcopy(main.DEFAULT_SETTINGS)
-        enabled["open_region_exports"] = True
-        self.assertTrue(main.normalize_settings(enabled)["open_region_exports"])
+    def test_region_png_setting_defaults_off_and_migrates_legacy_auto_open_flag(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        self.assertFalse(settings["export_region_pngs"])
+        old = deepcopy(settings)
+        old.pop("export_region_pngs")
+        old["open_region_exports"] = True
+        normalized = main.normalize_settings(old)
+        self.assertTrue(normalized["export_region_pngs"])
+        self.assertNotIn("open_region_exports", normalized)
+        self.assertEqual(main.CONFIG_VERSION, normalized["config_version"])
+        self.assertTrue(any("PNG 导出" in note for note in main.configuration_migration_notes(old)))
+        explicit_new = dict(old, export_region_pngs=False)
+        self.assertFalse(main.normalize_settings(explicit_new)["export_region_pngs"])
 
-    def test_open_region_xlsx_files_uses_windows_default_file_association(self):
-        opened = []
-        logs = []
-        paths = [Path("/tmp/区域一.xlsx"), Path("/tmp/区域二.xlsx")]
-        with mock.patch.object(main.os, "startfile", side_effect=opened.append, create=True):
-            main._open_region_xlsx_files(paths, logs.append)
-        self.assertEqual([str(path) for path in paths], opened)
-        self.assertEqual(2, len(logs))
+    def test_region_xlsx_png_export_uses_wps_and_never_overwrites_existing_png(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            region_xlsx = root / "区域表.xlsx"
+            region_xlsx.write_bytes(b"fake-xlsx")
+            existing_png = root / "区域表.png"
+            existing_png.write_bytes(b"existing-user-image")
+            events = []
 
-    def test_region_xlsx_preserves_styles_merges_dimensions_and_removes_hidden_axes(self):
+            class FakeChart:
+                def Paste(self):
+                    events.append("paste")
+
+                def Export(self, path, file_type):
+                    self.assert_png = file_type
+                    Path(path).write_bytes(b"fake-png")
+                    events.append("chart-export")
+                    return True
+
+            class FakeChartObject:
+                def __init__(self):
+                    self.Chart = FakeChart()
+
+                def Activate(self):
+                    events.append("activate-chart")
+
+            class FakeChartObjects:
+                def Add(self, *_args):
+                    events.append("chart-add")
+                    return FakeChartObject()
+
+            class FakeArea:
+                Left, Top, Width, Height = 0, 0, 120, 60
+
+                def CopyPicture(self, **_kwargs):
+                    events.append("copy-picture")
+
+            class FakeWorksheet:
+                UsedRange = FakeArea()
+
+                def ChartObjects(self):
+                    return FakeChartObjects()
+
+                def Activate(self):
+                    events.append("activate-sheet")
+
+            class FakeSheets:
+                def __call__(self, _index):
+                    return FakeWorksheet()
+
+            class FakeWorkbook:
+                Worksheets = FakeSheets()
+
+                def Close(self, SaveChanges=False):
+                    events.append(("workbook-close", SaveChanges))
+
+            class FakeWorkbooks:
+                def Open(self, path, **_kwargs):
+                    events.append(("open", path))
+                    return FakeWorkbook()
+
+            class FakeApp:
+                Workbooks = FakeWorkbooks()
+
+                def Quit(self):
+                    events.append("quit")
+
+            class FakePythonCom:
+                def CoUninitialize(self):
+                    events.append("co-uninitialize")
+
+            logs = []
+            with mock.patch.object(main, "_connect_wps", return_value=(FakeApp(), FakePythonCom(), "fake.Application")):
+                outputs = main._export_region_xlsx_as_pngs([region_xlsx], logs.append)
+
+            self.assertEqual([root / "区域表_2.png"], outputs)
+            self.assertEqual(b"existing-user-image", existing_png.read_bytes())
+            self.assertEqual(b"fake-png", outputs[0].read_bytes())
+            self.assertTrue(region_xlsx.is_file(), "转换函数本身不能删除回退 XLSX")
+            self.assertIn("chart-export", events)
+            self.assertIn("quit", events)
+            self.assertIn("co-uninitialize", events)
+
+    def test_region_xlsx_preserves_styles_merges_dimensions_and_hidden_axes(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             source_path = root / "source.xlsx"
@@ -894,12 +974,13 @@ class StaticConfigurationTests(unittest.TestCase):
             original = load_workbook(source_path, data_only=False)
             try:
                 result = exported["工单表"]
-                self.assertEqual({"A1:B1"}, {str(area) for area in result.merged_cells.ranges})
-                self.assertEqual((3, 2), (result.max_row, result.max_column))
-                self.assertEqual(("标题", "001", "尾行"),
-                                 (result["A1"].value, result["A2"].value, result["A3"].value))
-                self.assertEqual(("1234", "42"), (result["B2"].value, result["B3"].value))
-                self.assertEqual(("s", "s"), (result["B2"].data_type, result["B3"].data_type))
+                self.assertEqual({"A1:C1"}, {str(area) for area in result.merged_cells.ranges})
+                self.assertEqual((4, 3), (result.max_row, result.max_column))
+                self.assertEqual(("标题", "001", "HIDDEN-ROW", "尾行"),
+                                 (result["A1"].value, result["A2"].value, result["A3"].value, result["A4"].value))
+                self.assertEqual(("1234", "99", "42"), (result["B2"].value, result["B3"].value, result["B4"].value))
+                self.assertEqual("HIDDEN-COL", result["C2"].value)
+                self.assertEqual("s", result["B2"].data_type)
                 self.assertEqual("0000", result["B2"].number_format)
                 self.assertTrue(result["B2"].font.italic)
                 self.assertEqual("112233", result["B2"].font.color.rgb[-6:])
@@ -907,16 +988,89 @@ class StaticConfigurationTests(unittest.TestCase):
                 self.assertEqual("224466", result["A1"].fill.fgColor.rgb[-6:])
                 self.assertEqual("center", result["A1"].alignment.horizontal)
                 self.assertEqual(26, result.row_dimensions[2].height)
-                self.assertEqual(31, result.row_dimensions[3].height)
+                self.assertEqual(31, result.row_dimensions[4].height)
                 self.assertEqual(20, result.column_dimensions["A"].width)
                 self.assertEqual(17, result.column_dimensions["B"].width)
-                self.assertFalse(any(dim.hidden for dim in result.row_dimensions.values()))
-                self.assertFalse(any(dim.hidden for dim in result.column_dimensions.values()))
+                self.assertTrue(result.row_dimensions[3].hidden)
+                self.assertTrue(result.column_dimensions["C"].hidden)
+                self.assertEqual("112233", result["B2"].font.color.rgb[-6:])
                 self.assertTrue(original["工单表"].row_dimensions[3].hidden)
                 self.assertTrue(original["工单表"].column_dimensions["C"].hidden)
             finally:
                 exported.close()
                 original.close()
+
+    def test_region_xlsx_text_values_keep_number_format_display_precision(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "formats.xlsx"
+            output_dir = root / "exports"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "显示格式"
+            worksheet["A1"] = 1234
+            worksheet["A1"].number_format = "#,##0"
+            worksheet["A1"].font = Font(color="123456")
+            worksheet["A2"] = 0.125
+            worksheet["A2"].number_format = "0.00%"
+            worksheet["A2"].font = Font(color="AA2244")
+            worksheet["A3"] = 12.34567
+            worksheet["A3"].number_format = "0.000"
+            worksheet["A4"] = 42
+            worksheet["A4"].number_format = "000000"
+            worksheet["A5"] = __import__("datetime").datetime(2025, 4, 3)
+            worksheet["A5"].number_format = "yyyy/mm/dd"
+            worksheet["A6"] = True
+            worksheet["A7"] = 0
+            worksheet["A7"].number_format = "#,##0.00;(#,##0.00);-"
+            worksheet.column_dimensions["A"].width = 1
+            workbook.save(source_path)
+            workbook.close()
+
+            paths = main._export_table_areas(
+                source_path, [{"sheet": "显示格式", "range": "A1:A7"}], output_dir, lambda _msg: None
+            )
+            exported = load_workbook(paths[0], data_only=False)
+            try:
+                result = exported.active
+                self.assertEqual(
+                    ["1,234", "12.50%", "12.346", "000042", "2025/04/03", "TRUE", "-"],
+                    [result.cell(row=row, column=1).value for row in range(1, 8)],
+                )
+                self.assertTrue(all(result.cell(row=row, column=1).data_type == "s" for row in range(1, 8)))
+                self.assertTrue(all("#" not in result.cell(row=row, column=1).value for row in range(1, 8)))
+                self.assertEqual("123456", result["A1"].font.color.rgb[-6:])
+                self.assertEqual("AA2244", result["A2"].font.color.rgb[-6:])
+                self.assertEqual("0.00%", result["A2"].number_format)
+                self.assertEqual("000000", result["A4"].number_format)
+                self.assertEqual(1, result.column_dimensions["A"].width)
+            finally:
+                exported.close()
+
+    def test_wps_display_text_uses_text_and_ignores_hash_overflow(self):
+        class FakeSheet:
+            def Cells(self, row, col):
+                text = "1.234,50" if (row, col) == (1, 1) else "####"
+                return type("FakeCell", (), {"Text": text})()
+
+        fake_app = mock.Mock()
+        fake_workbook = mock.Mock()
+        fake_workbook.Worksheets.return_value = FakeSheet()
+        fake_app.Workbooks.Open.return_value = fake_workbook
+        fake_pythoncom = mock.Mock()
+        safe_copy_path = Path("/tmp/sanitized-read-copy.xlsx")
+        with mock.patch.object(main.sys, "platform", "win32"), \
+                mock.patch.object(main, "_connect_wps", return_value=(fake_app, fake_pythoncom, "fake.WPS")):
+            display = main._read_wps_display_text(
+                safe_copy_path, [("S", 1, 1), ("S", 1, 2)], lambda _message: None
+            )
+        self.assertEqual({("S", 1, 1): "1.234,50"}, display)
+        fake_app.Workbooks.Open.assert_called_once_with(
+            str(safe_copy_path), UpdateLinks=0, ReadOnly=True, AddToMru=False
+        )
+        fake_workbook.Close.assert_called_once_with(SaveChanges=False)
+        fake_app.Quit.assert_called_once_with()
+        fake_pythoncom.CoUninitialize.assert_called_once_with()
 
     def test_region_xlsx_merge_closure_includes_the_complete_merged_title(self):
         with tempfile.TemporaryDirectory() as td:
@@ -982,7 +1136,7 @@ class StaticConfigurationTests(unittest.TestCase):
                 )
             self.assertEqual([], list(output_dir.iterdir()))
 
-    def test_region_xlsx_rejects_all_hidden_axes_and_large_rectangles(self):
+    def test_region_xlsx_keeps_fully_hidden_selection_and_rejects_large_rectangles(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             source_path = root / "source.xlsx"
@@ -994,11 +1148,17 @@ class StaticConfigurationTests(unittest.TestCase):
             worksheet.row_dimensions[1].hidden = True
             workbook.save(source_path)
             workbook.close()
-            with self.assertRaisesRegex(main.ProcessingError, "行列均为隐藏状态"):
-                main._export_table_areas(
-                    source_path, [{"sheet": "空白", "range": "A1"}], output_dir, lambda _msg: None
-                )
-            self.assertEqual([], list(output_dir.iterdir()))
+            paths = main._export_table_areas(
+                source_path, [{"sheet": "空白", "range": "A1"}], output_dir, lambda _msg: None
+            )
+            exported = load_workbook(paths[0], data_only=False)
+            try:
+                self.assertEqual("hidden", exported.active["A1"].value)
+                self.assertTrue(exported.active.row_dimensions[1].hidden)
+            finally:
+                exported.close()
+            for path in paths:
+                path.unlink()
 
         settings = deepcopy(main.DEFAULT_SETTINGS)
         settings["image_outputs"] = [{"sheet": "工作表", "range": "A1:DV1000"}]
@@ -1255,6 +1415,100 @@ class StaticConfigurationTests(unittest.TestCase):
                 self.assertEqual("TEXT", region_workbook.active["A1"].value)
             finally:
                 region_workbook.close()
+
+    def test_png_mode_exports_from_region_xlsx_then_deletes_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({"copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
+                             "output_dir": str(fake / "output"), "output_filename": "png-mode.xlsx",
+                             "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}],
+                             "export_region_pngs": True})
+            for idx, job in enumerate(settings["jobs"], 1):
+                job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
+                                   "copy_start_row": 2, "copy_end_row": 3}]
+            events = []
+            region_xlsx = Path(settings["output_dir"]) / "simulated.xlsx"
+            png_path = Path(settings["output_dir"]) / "simulated.png"
+
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _region_processing):
+                events.append("workbook-save")
+                workbook = load_workbook(path)
+                workbook.save(path)
+                workbook.close()
+
+            def fake_export(path, _outputs, output_dir, _log, **_kwargs):
+                self.assertTrue(path.is_file())
+                events.append("region-xlsx-export")
+                workbook = Workbook()
+                workbook.active["A1"] = "TEXT"
+                workbook.save(region_xlsx)
+                workbook.close()
+                return [region_xlsx]
+
+            def fake_pngs(paths, _log):
+                self.assertEqual([region_xlsx], paths)
+                self.assertTrue(region_xlsx.is_file())
+                events.append("png-from-xlsx")
+                png_path.write_bytes(b"fake-png")
+                return [png_path]
+
+            def fake_text(_path, _outputs, _log=None):
+                events.append("text-read")
+                return []
+
+            outputs = []
+            with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
+                 mock.patch.object(main, "_export_table_areas", side_effect=fake_export), \
+                 mock.patch.object(main, "_export_region_xlsx_as_pngs", side_effect=fake_pngs), \
+                 mock.patch.object(main, "_read_text_output_areas", side_effect=fake_text):
+                result = main.process_workbooks(settings, lambda _msg: None, on_region_outputs=outputs.extend)
+
+            self.assertTrue(result.is_file())
+            self.assertEqual(["workbook-save", "region-xlsx-export", "png-from-xlsx", "text-read"], events)
+            self.assertFalse(region_xlsx.exists())
+            self.assertEqual(b"fake-png", png_path.read_bytes())
+            self.assertEqual([png_path], outputs)
+
+    def test_png_export_failure_preserves_region_xlsx_and_saved_main_workbook(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({"copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
+                             "output_dir": str(fake / "output"), "output_filename": "png-failure.xlsx",
+                             "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}],
+                             "export_region_pngs": True})
+            for idx, job in enumerate(settings["jobs"], 1):
+                job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
+                                   "copy_start_row": 2, "copy_end_row": 3}]
+            region_xlsx = Path(settings["output_dir"]) / "fallback.xlsx"
+            final_path = Path(settings["output_dir"]) / settings["output_filename"]
+
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _region_processing):
+                workbook = load_workbook(path)
+                workbook.save(path)
+                workbook.close()
+
+            def fake_export(_path, _outputs, _output_dir, _log, **_kwargs):
+                workbook = Workbook()
+                workbook.save(region_xlsx)
+                workbook.close()
+                return [region_xlsx]
+
+            with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
+                 mock.patch.object(main, "_export_table_areas", side_effect=fake_export), \
+                 mock.patch.object(main, "_export_region_xlsx_as_pngs",
+                                   side_effect=main.ProcessingError("模拟 PNG 转换失败")):
+                with self.assertRaises(main.ProcessingError) as caught:
+                    main.process_workbooks(settings, lambda _msg: None)
+
+            message = str(caught.exception)
+            self.assertIn("区域 PNG 图片导出失败", message)
+            self.assertIn(str(region_xlsx), message)
+            self.assertTrue(final_path.is_file())
+            self.assertTrue(region_xlsx.is_file())
 
     def test_region_xlsx_failure_preserves_valid_wps_saved_xlsx_and_reports_exact_path(self):
         with tempfile.TemporaryDirectory() as td:

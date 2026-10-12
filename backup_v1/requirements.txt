@@ -1,3 +1,0 @@
-openpyxl>=3.1,<4
-pywin32>=306; platform_system == "Windows"
-pyinstaller>=6.10; platform_system == "Windows"

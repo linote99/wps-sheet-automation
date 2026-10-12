@@ -20,7 +20,7 @@ MODULE_LABELS = {
     "Deduplicate": "去重",
     "FormatConvert": "格式转换",
     "final_recalc_save": "最终重算并保存",
-    "image_output": "自定义区域 XLSX 文本输出",
+    "image_output": "自定义区域 XLSX / PNG 输出",
     "text_output": "文本区域剪贴板输出",
 }
 
@@ -68,7 +68,7 @@ def validate_workflow(settings: dict[str, Any]) -> None:
         if isinstance(operation, dict) and operation.get("enabled", False):
             required.append((module_id, f"已启用 {MODULE_LABELS[module_id]}"))
     if settings.get("image_outputs"):
-        required.append(("image_output", "配置了区域 XLSX 输出"))
+        required.append(("image_output", "配置了区域 XLSX/PNG 输出"))
     if settings.get("text_outputs"):
         required.append(("text_output", "配置了文本输出区域"))
     for module_id, reason in required:

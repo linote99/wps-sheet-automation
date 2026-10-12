@@ -13,8 +13,8 @@ import traceback
 import zipfile
 from contextlib import contextmanager
 from copy import copy, deepcopy
-from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from datetime import date, datetime, time as datetime_time, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
@@ -24,6 +24,7 @@ from xml.parsers import expat
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.formula.translate import Translator
+from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils.cell import column_index_from_string, get_column_letter, range_boundaries
 from openpyxl.utils.datetime import from_excel, WINDOWS_EPOCH
 from workflow import (DEFAULT_WORKFLOW, MODULE_LABELS, add_workflow_module, list_profiles,
@@ -49,7 +50,7 @@ def _window_size_path() -> Path:
 
 
 WINDOW_SIZE_PATH = _window_size_path()
-CONFIG_VERSION = 7
+CONFIG_VERSION = 8
 LEGACY_FORMULA_ROW_KEYS = ("formula_seed_row", "formula_template_row", "formula_row", "seed_row")
 MAX_PROCESSING_CELLS = 500_000
 MAX_REGION_XLSX_CELLS = 100_000
@@ -70,7 +71,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "output_dir": "",
     "output_filename": "处理结果.xlsx",
     "output_filename_custom": None,
-    "open_region_exports": False,
+    "export_region_pngs": False,
     "copy_start_col": "A",
     "copy_end_col": "",
     "pre_mappings": [],
@@ -230,10 +231,15 @@ def configuration_migration_notes(raw: Any) -> list[str]:
     if not isinstance(jobs, list):
         jobs = []
     notes: list[str] = []
-    if version < CONFIG_VERSION:
+    if version < 7:
         notes.append(
-            f"旧配置版本 v{version} 已按 v{CONFIG_VERSION} 规则迁移：每个目标表的 start_row 保持为粘贴起始行，"
+            f"旧配置版本 v{version} 已按 v7 规则迁移：每个目标表的 start_row 保持为粘贴起始行，"
             "公式模板行自动取 start_row - 1；旧版本中将起始行当作公式种子行的含义不再沿用。"
+        )
+    if "open_region_exports" in raw and "export_region_pngs" not in raw:
+        notes.append(
+            "旧的“自动打开区域 XLSX”选项已迁移为 PNG 导出开关：启用后会导出 PNG，"
+            "并在图片成功生成后删除本轮对应的独立区域 XLSX。"
         )
     for index, job in enumerate(jobs, 1):
         if not isinstance(job, dict):
@@ -460,7 +466,11 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
             job["sources"] = converted
         normalized_jobs.append(job)
     settings["jobs"] = normalized_jobs
-    settings["open_region_exports"] = bool(settings.get("open_region_exports", False))
+    legacy_open_exports = settings.pop("open_region_exports", None)
+    if "export_region_pngs" in raw:
+        settings["export_region_pngs"] = bool(settings.get("export_region_pngs", False))
+    else:
+        settings["export_region_pngs"] = bool(legacy_open_exports) if legacy_open_exports is not None else False
     for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs"):
         if settings.get(key) is None:
             settings[key] = []
@@ -1794,7 +1804,7 @@ def _calculate_in_wps(staging_path: Path, formula_jobs: list[tuple[str, int, int
         recalc_phase = "后映射及区域处理后" if applied_steps else "后映射写入后"
         _recalculate_and_wait(app, log, recalc_phase)
         workbook.Save()
-        log("WPS 已完成后映射、第二次完整重算并保存工作簿；接下来只导出区域 XLSX 和读取文本预览，不再改动工作簿。")
+        log("WPS 已完成后映射、第二次完整重算并保存工作簿；接下来只导出区域 XLSX、按需转换 PNG 并读取文本预览，不再改动工作簿。")
     except ProcessingError:
         raise
     except Exception as exc:
@@ -1919,16 +1929,422 @@ def _column_is_hidden(worksheet, column: int) -> bool:
     return bool(dimension.hidden) if dimension is not None else False
 
 
-def _value_as_export_text(value: Any) -> str | None:
+def _split_excel_format_sections(format_code: str) -> list[str]:
+    sections: list[str] = []
+    current: list[str] = []
+    quoted = False
+    escaped = False
+    bracket_depth = 0
+    for char in str(format_code or "General"):
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            current.append(char)
+            escaped = True
+        elif char == '"' and bracket_depth == 0:
+            current.append(char)
+            quoted = not quoted
+        elif not quoted and char == "[":
+            bracket_depth += 1
+            current.append(char)
+        elif not quoted and char == "]" and bracket_depth:
+            bracket_depth -= 1
+            current.append(char)
+        elif char == ";" and not quoted and bracket_depth == 0:
+            sections.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    sections.append("".join(current))
+    return sections
+
+
+def _excel_format_condition(section: str) -> tuple[str, Decimal] | None:
+    match = re.search(r"\[(<=|>=|<>|=|<|>)\s*(-?\d+(?:\.\d+)?)\]", section)
+    if not match:
+        return None
+    try:
+        return match.group(1), Decimal(match.group(2))
+    except InvalidOperation:
+        return None
+
+
+def _format_condition_matches(value: Decimal, condition: tuple[str, Decimal]) -> bool:
+    operator, threshold = condition
+    return {
+        "<": value < threshold,
+        "<=": value <= threshold,
+        ">": value > threshold,
+        ">=": value >= threshold,
+        "=": value == threshold,
+        "<>": value != threshold,
+    }[operator]
+
+
+def _select_excel_format_section(value: Any, format_code: str) -> tuple[str, int, bool]:
+    sections = _split_excel_format_sections(format_code)
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return sections[-1] if len(sections) >= 4 else sections[0], 0, False
+    conditional = [_excel_format_condition(section) for section in sections]
+    if any(condition is not None for condition in conditional):
+        for index, condition in enumerate(conditional):
+            if condition is not None and _format_condition_matches(number, condition):
+                return sections[index], index, True
+        for index, condition in enumerate(conditional):
+            if condition is None:
+                return sections[index], index, True
+        return sections[0], 0, True
+    if number < 0 and len(sections) >= 2:
+        return sections[1], 1, False
+    if number == 0 and len(sections) >= 3:
+        return sections[2], 2, False
+    return sections[0], 0, False
+
+
+def _format_literal_affix(text: str) -> str:
+    result: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            end = text.find('"', index + 1)
+            if end < 0:
+                result.append(text[index + 1:])
+                break
+            result.append(text[index + 1:end])
+            index = end + 1
+        elif char == "\\" and index + 1 < len(text):
+            result.append(text[index + 1])
+            index += 2
+        elif char == "_" and index + 1 < len(text):
+            result.append(" ")
+            index += 2
+        elif char == "*" and index + 1 < len(text):
+            index += 2
+        elif char == "[":
+            end = text.find("]", index + 1)
+            if end < 0:
+                index += 1
+                continue
+            directive = text[index + 1:end]
+            currency = re.match(r"\$([^\]-]+)(?:-[^]]*)?$", directive)
+            if currency and currency.group(1):
+                result.append(currency.group(1))
+            index = end + 1
+        else:
+            result.append(char)
+            index += 1
+    return "".join(result)
+
+
+def _numeric_pattern_span(section: str) -> tuple[int, int, str] | None:
+    visible: list[tuple[str, int, int]] = []
+    index = 0
+    while index < len(section):
+        char = section[index]
+        if char == '"':
+            end = section.find('"', index + 1)
+            index = len(section) if end < 0 else end + 1
+        elif char in ("\\", "_", "*") and index + 1 < len(section):
+            index += 2
+        elif char == "[":
+            end = section.find("]", index + 1)
+            index = len(section) if end < 0 else end + 1
+        else:
+            visible.append((char, index, index + 1))
+            index += 1
+    for offset, (char, start, end) in enumerate(visible):
+        if char not in "0#?":
+            continue
+        stop = offset + 1
+        while stop < len(visible):
+            next_char = visible[stop][0]
+            if next_char in "0#?,.":
+                stop += 1
+                continue
+            if next_char in "Ee" and stop + 1 < len(visible) and visible[stop + 1][0] in "+-":
+                stop += 2
+                while stop < len(visible) and visible[stop][0] in "0#?":
+                    stop += 1
+                continue
+            break
+        start_pos = start
+        end_pos = visible[stop - 1][2]
+        return start_pos, end_pos, section[start_pos:end_pos]
+    return None
+
+
+def _format_number_with_excel_mask(value: Any, section: str, section_index: int,
+                                   conditional_format: bool) -> str:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return str(value)
+    if not number.is_finite():
+        return str(value)
+    selected_negative_section = number < 0 and section_index == 1 and not conditional_format
+    number_for_display = abs(number) if selected_negative_section else number
+    pattern_info = _numeric_pattern_span(section)
+    if pattern_info is None:
+        literal = _format_literal_affix(section)
+        return literal if literal else str(value) if section.strip().lower() == "general" else ""
+    start, end, pattern = pattern_info
+    if re.search(r"\d\s*/\s*[0#?]", pattern):
+        return str(value)
+    exponent_match = re.search(r"[Ee]([+-]?)([0#?]+)$", pattern)
+    percent_count = section.count("%")
+    scaled = number_for_display * (Decimal(100) ** percent_count)
+    mantissa_pattern = pattern
+    exponent_pattern = None
+    if exponent_match:
+        exponent_pattern = exponent_match.group(0)
+        mantissa_pattern = pattern[:exponent_match.start()]
+    integer_pattern, dot, decimal_pattern = mantissa_pattern.partition(".")
+    trailing_scale_commas = len(integer_pattern) - len(integer_pattern.rstrip(","))
+    integer_pattern = integer_pattern.rstrip(",")
+    scaled /= Decimal(1000) ** trailing_scale_commas
+
+    if exponent_pattern:
+        decimals = len(decimal_pattern)
+        try:
+            rendered = f"{scaled:.{decimals}E}"
+            mantissa, exponent_value = rendered.split("E")
+            exponent_value_int = int(exponent_value)
+            sign_char, exponent_digits = exponent_pattern[1], exponent_pattern[2:]
+            exponent_sign = "+" if exponent_value_int >= 0 else "-"
+            if sign_char == "-" and exponent_value_int >= 0:
+                exponent_sign = ""
+            formatted = (f"{mantissa}E{exponent_sign}"
+                         f"{abs(exponent_value_int):0{max(1, len(exponent_digits))}d}")
+        except (ValueError, InvalidOperation):
+            return str(value)
+    else:
+        min_decimals = decimal_pattern.count("0")
+        max_decimals = len(decimal_pattern)
+        quantizer = Decimal(1).scaleb(-max_decimals)
+        try:
+            rounded = scaled.quantize(quantizer, rounding=ROUND_HALF_UP) if max_decimals else scaled.quantize(Decimal(1), rounding=ROUND_HALF_UP)
+        except InvalidOperation:
+            return str(value)
+        fixed = f"{abs(rounded):.{max_decimals}f}" if rounded < 0 else f"{rounded:.{max_decimals}f}"
+        integer_text, _, decimal_text = fixed.partition(".")
+        required_integer_zeros = integer_pattern.count("0")
+        if not integer_text and required_integer_zeros:
+            integer_text = "0"
+        integer_text = integer_text.zfill(required_integer_zeros)
+        if "," in integer_pattern:
+            integer_text = f"{int(integer_text or '0'):,}"
+        if max_decimals > min_decimals:
+            while len(decimal_text) > min_decimals and decimal_text.endswith("0"):
+                decimal_text = decimal_text[:-1]
+        decimal_text = decimal_text.ljust(min_decimals, "0")
+        if decimal_text:
+            formatted = f"{integer_text or '0'}.{decimal_text}"
+        else:
+            formatted = integer_text
+        if not formatted and scaled == 0 and not required_integer_zeros and not decimal_text:
+            formatted = ""
+
+    prefix = _format_literal_affix(section[:start])
+    suffix = _format_literal_affix(section[end:])
+    if number < 0 and not selected_negative_section and not conditional_format:
+        prefix = "-" + prefix
+    return prefix + formatted + suffix
+
+
+def _format_temporal_value(value: Any, format_code: str) -> str:
+    if isinstance(value, timedelta):
+        seconds = int(value.total_seconds())
+        hours, remainder = divmod(abs(seconds), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    if isinstance(value, date) and not isinstance(value, datetime):
+        value = datetime(value.year, value.month, value.day)
+    if isinstance(value, datetime_time):
+        value = datetime.combine(date(1899, 12, 30), value)
+    if not isinstance(value, datetime):
+        return str(value)
+    section = _split_excel_format_sections(format_code)[0]
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    token_re = re.compile(r"AM/PM|A/P|yyyy|yy|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|ss|s", re.IGNORECASE)
+    while index < len(section):
+        char = section[index]
+        if char == '"':
+            end = section.find('"', index + 1)
+            if end < 0:
+                tokens.append(("literal", section[index + 1:]))
+                break
+            tokens.append(("literal", section[index + 1:end]))
+            index = end + 1
+        elif char == "\\" and index + 1 < len(section):
+            tokens.append(("literal", section[index + 1]))
+            index += 2
+        elif char in "_*" and index + 1 < len(section):
+            if char == "_":
+                tokens.append(("literal", " "))
+            index += 2
+        elif char == "[":
+            end = section.find("]", index + 1)
+            if end < 0:
+                index += 1
+                continue
+            directive = section[index + 1:end]
+            if directive.lower() in ("h", "hh", "m", "mm", "s", "ss"):
+                tokens.append(("elapsed", directive))
+            else:
+                currency = re.match(r"\$([^\]-]+)(?:-[^]]*)?$", directive)
+                if currency and currency.group(1):
+                    tokens.append(("literal", currency.group(1)))
+            index = end + 1
+        else:
+            match = token_re.match(section, index)
+            if match:
+                tokens.append(("date", match.group(0)))
+                index = match.end()
+            else:
+                tokens.append(("literal", char))
+                index += 1
+
+    date_tokens = [text.lower() for kind, text in tokens if kind == "date"]
+    has_ampm = any(token in ("am/pm", "a/p") for token in date_tokens)
+    rendered: list[str] = []
+    prior_date_token = ""
+    for token_index, (kind, token) in enumerate(tokens):
+        if kind == "literal":
+            rendered.append(token)
+            continue
+        if kind == "elapsed":
+            rendered.append(token)
+            continue
+        lower = token.lower()
+        if lower == "am/pm":
+            rendered.append("AM" if value.hour < 12 else "PM")
+        elif lower == "a/p":
+            rendered.append("A" if value.hour < 12 else "P")
+        elif lower.startswith("y"):
+            rendered.append(f"{value.year % 100:02d}" if len(lower) <= 2 else f"{value.year:04d}")
+        elif lower.startswith("d"):
+            if len(lower) >= 4:
+                rendered.append(("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")[value.weekday()])
+            elif len(lower) == 3:
+                rendered.append(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[value.weekday()])
+            elif len(lower) == 2:
+                rendered.append(f"{value.day:02d}")
+            else:
+                rendered.append(str(value.day))
+        elif lower.startswith("h"):
+            hour = value.hour % 12 or 12 if has_ampm else value.hour
+            rendered.append(f"{hour:02d}" if len(lower) == 2 else str(hour))
+        elif lower.startswith("s"):
+            rendered.append(f"{value.second:02d}" if len(lower) == 2 else str(value.second))
+        elif lower.startswith("m"):
+            next_date_token = ""
+            for later_kind, later_text in tokens[token_index + 1:]:
+                if later_kind == "date":
+                    next_date_token = later_text.lower()
+                    break
+                if later_kind == "literal" and later_text not in (":", ".", " "):
+                    break
+            minute = prior_date_token.startswith("h") or next_date_token.startswith("s")
+            if minute:
+                rendered.append(f"{value.minute:02d}" if len(lower) >= 2 else str(value.minute))
+            elif len(lower) >= 4:
+                rendered.append(("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")[value.month - 1])
+            elif len(lower) == 3:
+                rendered.append(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")[value.month - 1])
+            elif len(lower) == 2:
+                rendered.append(f"{value.month:02d}")
+            else:
+                rendered.append(str(value.month))
+        prior_date_token = lower
+    return "".join(rendered)
+
+
+def _value_as_export_text(value: Any, number_format: str = "General") -> str | None:
+    """Return a non-formula text value approximating Excel's displayed cell text."""
     if value is None:
         return None
-    if isinstance(value, datetime):
-        return value.isoformat(sep=" ")
-    if isinstance(value, date):
-        return value.isoformat()
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
+    if isinstance(value, (datetime, date, datetime_time, timedelta)):
+        if number_format and number_format.lower() not in ("general", "@") and is_date_format(number_format):
+            return _format_temporal_value(value, number_format)
+        if isinstance(value, datetime):
+            return value.isoformat(sep=" ")
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, datetime_time):
+            return value.isoformat()
+        return str(value)
+    if isinstance(value, (int, float, Decimal)):
+        if not number_format or number_format.lower() in ("general", "@"):
+            if isinstance(value, float) and value.is_integer():
+                return str(int(value))
+            return str(value)
+        section, section_index, conditional = _select_excel_format_section(value, number_format)
+        return _format_number_with_excel_mask(value, section, section_index, conditional)
     return str(value)
+
+
+def _read_wps_display_text(safe_copy_path: Path, requested_cells: list[tuple[str, int, int]],
+                           log: Callable[[str], None]) -> dict[tuple[str, int, int], str]:
+    """Read numeric/date Range.Text from a sanitized temporary copy when WPS COM is available."""
+    if sys.platform != "win32" or not requested_cells:
+        return {}
+    app = workbook = pythoncom = None
+    com_initialized = False
+    result: dict[tuple[str, int, int], str] = {}
+    try:
+        app, pythoncom, progid = _connect_wps(log)
+        com_initialized = True
+        for prop, value in (("Visible", False), ("DisplayAlerts", False), ("AskToUpdateLinks", False),
+                            ("EnableEvents", False), ("AutomationSecurity", 3)):
+            try:
+                setattr(app, prop, value)
+            except Exception:
+                pass
+        workbook = app.Workbooks.Open(str(safe_copy_path), UpdateLinks=0, ReadOnly=True, AddToMru=False)
+        sheets: dict[str, Any] = {}
+        for sheet_name, row, col in requested_cells:
+            try:
+                if sheet_name not in sheets:
+                    sheets[sheet_name] = workbook.Worksheets(sheet_name)
+                worksheet = sheets[sheet_name]
+                text = worksheet.Cells(row, col).Text
+                if text is None:
+                    continue
+                text = str(text)
+                # Range.Text may return hashes solely because the source column is too narrow.
+                if text and re.fullmatch(r"#+", text.strip()):
+                    continue
+                result[(sheet_name, row, col)] = text
+            except Exception:
+                continue
+        if result:
+            log(f"区域 XLSX 导出已通过 WPS {progid} 的单元格 Text 读取 {len(result):,} 个数值/日期显示文本。")
+    except Exception as exc:
+        log(f"提示：无法从 WPS COM 读取单元格显示文本，将按 number_format 转换；导出继续且原工作簿不变。原因：{type(exc).__name__}: {exc}")
+    finally:
+        if workbook is not None:
+            try:
+                workbook.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if app is not None:
+            try:
+                app.Quit()
+            except Exception:
+                pass
+        if com_initialized and pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+    return result
 
 
 def _copy_dimension_properties(source_dimension, target_dimension, names: tuple[str, ...]) -> None:
@@ -1958,6 +2374,7 @@ def _export_table_areas(workbook_path: Path, area_outputs: list[dict[str, Any]],
             return _export_table_areas_loaded(
                 source_workbook, area_outputs, output_dir, log,
                 multiple_exports=len(area_outputs) > 1, reserved_paths=reserved,
+                source_copy_path=safe_copy.path,
             )
     except ProcessingError:
         raise
@@ -1967,10 +2384,12 @@ def _export_table_areas(workbook_path: Path, area_outputs: list[dict[str, Any]],
 
 def _export_table_areas_loaded(source_workbook, area_outputs: list[dict[str, Any]], output_dir: Path,
                                log: Callable[[str], None], multiple_exports: bool,
-                               reserved_paths: set[Path]) -> list[Path]:
+                               reserved_paths: set[Path], source_copy_path: Path | None = None) -> list[Path]:
     """Create one styled, text-valued XLSX workbook for each configured source area."""
     generated: list[Path] = []
     try:
+        export_specs = []
+        requested_display_cells = set()
         for index, output in enumerate(area_outputs, 1):
             sheet_name = str(output["sheet"]).strip()
             if sheet_name not in source_workbook.sheetnames:
@@ -1986,20 +2405,37 @@ def _export_table_areas_loaded(source_workbook, area_outputs: list[dict[str, Any
             )
             _check_region_xlsx_area_size(bounds, f"第 {index} 项区域 XLSX 输出（合并区域闭包）")
             min_col, min_row, max_col, max_row = bounds
-            visible_rows = [row for row in range(min_row, max_row + 1)
-                            if not worksheet.sheet_format.zeroHeight
-                            and not worksheet.row_dimensions[row].hidden]
-            visible_cols = [col for col in range(min_col, max_col + 1)
-                            if not _column_is_hidden(worksheet, col)]
-            if not visible_rows or not visible_cols:
-                raise ProcessingError(
-                    f"第 {index} 项区域 XLSX 输出 {sheet_name}!{_area_address(bounds)} 的行列均为隐藏状态，"
-                    "剔除隐藏行列后没有可导出的单元格。"
-                )
-            row_map = {source_row: target_row for target_row, source_row in enumerate(visible_rows, 1)}
-            col_map = {source_col: target_col for target_col, source_col in enumerate(visible_cols, 1)}
-            rows_removed = max_row - min_row + 1 - len(visible_rows)
-            cols_removed = max_col - min_col + 1 - len(visible_cols)
+            source_rows = list(range(min_row, max_row + 1))
+            source_cols = list(range(min_col, max_col + 1))
+            export_specs.append({
+                "index": index, "output": output, "sheet_name": sheet_name, "worksheet": worksheet,
+                "bounds": bounds, "configured_bounds": configured_bounds,
+                "min_col": min_col, "min_row": min_row,
+                "source_rows": source_rows, "source_cols": source_cols,
+            })
+            for source_row in source_rows:
+                for source_col in source_cols:
+                    value = worksheet.cell(source_row, source_col).value
+                    if value is not None and not isinstance(value, bool) and isinstance(
+                            value, (int, float, Decimal, datetime, date, datetime_time, timedelta)):
+                        requested_display_cells.add((sheet_name, source_row, source_col))
+
+        display_texts = _read_wps_display_text(
+            source_copy_path, sorted(requested_display_cells), log
+        ) if source_copy_path is not None else {}
+
+        for spec in export_specs:
+            index = spec["index"]
+            output = spec["output"]
+            sheet_name = spec["sheet_name"]
+            worksheet = spec["worksheet"]
+            bounds = spec["bounds"]
+            configured_bounds = spec["configured_bounds"]
+            min_col, min_row, max_col, max_row = bounds
+            source_rows = spec["source_rows"]
+            source_cols = spec["source_cols"]
+            row_map = {source_row: source_row - min_row + 1 for source_row in source_rows}
+            col_map = {source_col: source_col - min_col + 1 for source_col in source_cols}
 
             export_workbook = Workbook()
             export_sheet = export_workbook.active
@@ -2011,26 +2447,28 @@ def _export_table_areas_loaded(source_workbook, area_outputs: list[dict[str, Any
                     setattr(export_sheet.sheet_format, name, getattr(worksheet.sheet_format, name))
                 except (AttributeError, TypeError, ValueError):
                     pass
-            export_sheet.sheet_format.zeroHeight = False
+            export_sheet.sheet_format.zeroHeight = worksheet.sheet_format.zeroHeight
 
             total_chars = 0
             try:
-                for target_row, source_row in enumerate(visible_rows, 1):
+                for target_row, source_row in enumerate(source_rows, 1):
                     source_dimension = worksheet.row_dimensions.get(source_row)
                     if source_dimension is not None:
                         _copy_dimension_properties(
                             source_dimension, export_sheet.row_dimensions[target_row],
-                            ("height", "outlineLevel", "collapsed")
+                            ("height", "outlineLevel", "collapsed", "hidden", "thickTop", "thickBot")
                         )
-                    export_sheet.row_dimensions[target_row].hidden = False
-                    for target_col, source_col in enumerate(visible_cols, 1):
+                    for target_col, source_col in enumerate(source_cols, 1):
                         source_cell = worksheet.cell(source_row, source_col)
                         target_cell = export_sheet.cell(target_row, target_col)
                         if source_cell.has_style:
                             for style_name in ("font", "fill", "border", "alignment", "protection"):
                                 setattr(target_cell, style_name, copy(getattr(source_cell, style_name)))
                             target_cell.number_format = source_cell.number_format
-                        text = _value_as_export_text(source_cell.value)
+                        display_key = (sheet_name, source_row, source_col)
+                        text = display_texts.get(display_key)
+                        if text is None:
+                            text = _value_as_export_text(source_cell.value, source_cell.number_format)
                         if text is not None:
                             total_chars += len(text)
                             if total_chars > MAX_REGION_XLSX_CHARS:
@@ -2039,27 +2477,23 @@ def _export_table_areas_loaded(source_workbook, area_outputs: list[dict[str, Any
                                 )
                             target_cell.value = text
                             target_cell.data_type = "s"
-                for target_col, source_col in enumerate(visible_cols, 1):
+                for target_col, source_col in enumerate(source_cols, 1):
                     source_dimension = _column_dimension_for_index(worksheet, source_col)
                     target_dimension = export_sheet.column_dimensions[get_column_letter(target_col)]
                     if source_dimension is not None:
                         _copy_dimension_properties(
                             source_dimension, target_dimension,
-                            ("width", "bestFit", "outlineLevel", "collapsed")
+                            ("width", "bestFit", "outlineLevel", "collapsed", "hidden")
                         )
-                    target_dimension.hidden = False
 
                 for merged in worksheet.merged_cells.ranges:
                     if not _areas_overlap(bounds, (merged.min_col, merged.min_row, merged.max_col, merged.max_row)):
                         continue
-                    merged_rows = [row_map[row] for row in range(merged.min_row, merged.max_row + 1)
-                                   if row in row_map]
-                    merged_cols = [col_map[col] for col in range(merged.min_col, merged.max_col + 1)
-                                   if col in col_map]
-                    if merged_rows and merged_cols and (len(merged_rows) > 1 or len(merged_cols) > 1):
+                    if (merged.min_row in row_map and merged.max_row in row_map
+                            and merged.min_col in col_map and merged.max_col in col_map):
                         export_sheet.merge_cells(
-                            start_row=min(merged_rows), start_column=min(merged_cols),
-                            end_row=max(merged_rows), end_column=max(merged_cols)
+                            start_row=row_map[merged.min_row], start_column=col_map[merged.min_col],
+                            end_row=row_map[merged.max_row], end_column=col_map[merged.max_col]
                         )
 
                 temp_handle, temp_name = tempfile.mkstemp(
@@ -2101,7 +2535,7 @@ def _export_table_areas_loaded(source_workbook, area_outputs: list[dict[str, Any
                 log(f"区域 {sheet_name}!{_area_address(configured_bounds)} 与合并单元格相交，导出范围扩展为 {_area_address(bounds)}。")
             log(
                 f"已导出区域 XLSX {sheet_name}!{_area_address(bounds)}：{target.name}；"
-                f"隐藏行剔除 {rows_removed} 行、隐藏列剔除 {cols_removed} 列，单元格值均为文本。"
+                f"选区内隐藏行列及其原始位置均保留；单元格值均为文本。"
             )
         return generated
     except Exception as exc:
@@ -2317,6 +2751,7 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
     generated_region_files: list[Path] = []
     published_final = False
     preserve_final_after_region_failure = False
+    preserve_region_files_after_image_failure = False
     try:
         log("校验模板公式和目标子表后，在输出目录创建临时副本。")
         formula_jobs = _create_staging_workbook(template_path, settings, all_records, staging_path, log)
@@ -2331,24 +2766,47 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
         text_previews = []
         for module_id in settings.get("workflow", DEFAULT_WORKFLOW):
             if module_id == "image_output":
+                region_xlsx_files: list[Path] = []
                 try:
-                    generated_region_files = _export_table_areas(
+                    region_xlsx_files = _export_table_areas(
                         staging_path, settings.get("image_outputs", []), final_path.parent, log,
                         reserved_paths={final_path},
                     )
+                    if settings.get("export_region_pngs"):
+                        try:
+                            generated_region_files = _export_region_xlsx_as_pngs(region_xlsx_files, log)
+                        except Exception:
+                            preserve_region_files_after_image_failure = True
+                            raise
+                        for region_path in region_xlsx_files:
+                            try:
+                                region_path.unlink(missing_ok=True)
+                                if region_path.exists():
+                                    log(f"PNG 已导出，但未能删除独立区域 XLSX（文件仍保留）：{region_path}")
+                                else:
+                                    log(f"PNG 已成功导出，临时独立区域 XLSX 已删除：{region_path}")
+                            except OSError as delete_exc:
+                                log(f"PNG 已导出，但删除独立区域 XLSX 失败；该表已保留：{region_path}；{delete_exc}")
+                    else:
+                        generated_region_files = region_xlsx_files
                 except Exception as image_exc:
                     try:
                         _publish_staging_workbook(staging_path, final_path)
                     except Exception as publish_exc:
                         raise ProcessingError(
-                            f"区域 XLSX 输出失败：{image_exc}\n"
+                            f"区域输出失败：{image_exc}\n"
                             f"WPS 已完成计算并成功保存工作簿，但无法安全发布到目标路径：\n"
                             f"{final_path}\n发布原因：{publish_exc}"
                         ) from image_exc
                     published_final = True
                     preserve_final_after_region_failure = True
+                    output_kind = "区域 PNG 图片导出" if settings.get("export_region_pngs") else "区域 XLSX 输出"
+                    fallback_note = ""
+                    if preserve_region_files_after_image_failure and region_xlsx_files:
+                        fallback_paths = "\n".join(str(path) for path in region_xlsx_files)
+                        fallback_note = f"\n图片导出未完成；独立区域 XLSX 已保留：\n{fallback_paths}"
                     raise ProcessingError(
-                        f"区域 XLSX 输出失败：{image_exc}\n"
+                        f"{output_kind}失败：{image_exc}{fallback_note}\n"
                         f"WPS 已完成计算并成功保存 XLSX；该文件已保留：\n{final_path}"
                     ) from image_exc
             elif module_id == "text_output":
@@ -2368,8 +2826,9 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
     except Exception as exc:
         try:
             staging_path.unlink(missing_ok=True)
-            for region_path in generated_region_files:
-                region_path.unlink(missing_ok=True)
+            if not preserve_region_files_after_image_failure:
+                for region_path in generated_region_files:
+                    region_path.unlink(missing_ok=True)
             if published_final and not preserve_final_after_region_failure:
                 final_path.unlink(missing_ok=True)
         except Exception as cleanup_exc:
@@ -2377,20 +2836,92 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
         raise
 
 
-def _open_region_xlsx_files(paths: list[Path], log: Callable[[str], None]) -> None:
-    """Open generated region workbooks using Windows' registered file association."""
-    if not paths:
-        return
-    opener = getattr(os, "startfile", None)
-    if opener is None:
-        log("自动打开区域 XLSX 仅支持 Windows 文件关联；导出文件已保存。")
-        return
-    for path in paths:
+def _copy_region_png_exclusive(source: Path, region_xlsx: Path) -> Path:
+    """Publish one generated PNG beside its XLSX without replacing existing files."""
+    collision = 1
+    while True:
+        suffix = "" if collision == 1 else f"_{collision}"
+        destination = region_xlsx.parent / f"{region_xlsx.stem}{suffix}.png"
         try:
-            opener(str(path))
-            log(f"已请求系统自动打开区域文件：{path}")
-        except Exception as exc:
-            log(f"自动打开区域文件失败（文件已保存）：{path}；{exc}")
+            _copy_file_exclusive(source, destination)
+            return destination
+        except FileExistsError:
+            collision += 1
+        except OSError:
+            if destination.exists():
+                collision += 1
+                continue
+            raise
+
+
+def _export_region_xlsx_as_pngs(paths: list[Path], log: Callable[[str], None]) -> list[Path]:
+    """Render each already-exported region workbook through WPS and publish PNGs safely."""
+    if not paths:
+        return []
+    app = workbook = pythoncom = None
+    com_initialized = False
+    generated: list[Path] = []
+    try:
+        app, pythoncom, progid = _connect_wps(log)
+        com_initialized = True
+        for prop, value in (("Visible", False), ("DisplayAlerts", False),
+                            ("AskToUpdateLinks", False), ("EnableEvents", False),
+                            ("AutomationSecurity", 3)):
+            try:
+                setattr(app, prop, value)
+            except Exception:
+                pass
+        for region_path in paths:
+            if not region_path.is_file():
+                raise ProcessingError(f"待转 PNG 的独立区域 XLSX 不存在：{region_path}")
+            log(f"正在从独立区域 XLSX 导出 PNG：{region_path.name}")
+            with tempfile.TemporaryDirectory(prefix=".wps_region_png_", dir=str(region_path.parent)) as temp_dir:
+                temp_png = Path(temp_dir) / "render.png"
+                workbook = app.Workbooks.Open(
+                    str(region_path), UpdateLinks=0, ReadOnly=False, AddToMru=False
+                )
+                worksheet = workbook.Worksheets(1)
+                area = worksheet.UsedRange
+                width = max(48.0, min(2000.0, float(area.Width)))
+                height = max(24.0, min(12000.0, float(area.Height)))
+                worksheet.Activate()
+                chart_object = worksheet.ChartObjects().Add(
+                    float(area.Left), float(area.Top), width, height
+                )
+                area.CopyPicture(Appearance=1, Format=-4147)
+                chart_object.Activate()
+                chart_object.Chart.Paste()
+                exported = chart_object.Chart.Export(str(temp_png), "PNG")
+                if not exported or not temp_png.is_file() or temp_png.stat().st_size == 0:
+                    raise ProcessingError(f"WPS 未能从区域 XLSX 导出有效 PNG：{region_path}")
+                workbook.Close(SaveChanges=False)
+                workbook = None
+                png_path = _copy_region_png_exclusive(temp_png, region_path)
+                generated.append(png_path)
+                log(f"已导出区域 PNG：{png_path}")
+        return generated
+    except Exception as exc:
+        for path in generated:
+            path.unlink(missing_ok=True)
+        if isinstance(exc, ProcessingError):
+            raise
+        raise ProcessingError(f"WPS 将独立区域 XLSX 导出为 PNG 失败：{type(exc).__name__}: {exc}") from exc
+    finally:
+        if workbook is not None:
+            try:
+                workbook.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if app is not None:
+            try:
+                app.Quit()
+            except Exception:
+                pass
+        if com_initialized and pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
 
 class App:
@@ -2414,8 +2945,8 @@ class App:
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.settings = load_settings()
         self.output_filename_custom = bool(self.settings.get("output_filename_custom", False))
-        self.region_auto_open_var = tk.BooleanVar(value=bool(self.settings.get("open_region_exports", False)))
-        self._auto_open_for_run = False
+        self.export_region_pngs_var = tk.BooleanVar(value=bool(self.settings.get("export_region_pngs", False)))
+        self._export_pngs_for_run = False
         self._region_output_files: list[Path] = []
         self._suppress_output_filename_trace = False
         startup_migration_notices = self.settings.pop("_migration_notices", [])
@@ -2580,7 +3111,7 @@ class App:
         for label, command in (("添加映射", self._add_mapping), ("编辑映射", self._edit_mapping), ("删除映射", self._delete_mapping)):
             ttk.Button(map_buttons, text=label, command=command).pack(side="left", padx=2)
         editor.rowconfigure(1, weight=1)
-        note = "执行顺序：模板清理/前映射 → 多源追加 → 填公式与完整重算 → 后映射 → TextToColumns → Deduplicate → FormatConvert → 再完整重算并保存 → 最后导出区域 XLSX 与文本预览/复制（此后不改工作簿）。区域 XLSX 保留格式、剔除隐藏行列并将数据写为文本；三个区域处理功能各有独立开关和规则列表。"
+        note = "执行顺序：模板清理/前映射 → 多源追加 → 填公式与完整重算 → 后映射 → TextToColumns → Deduplicate → FormatConvert → 再完整重算并保存 → 最后导出区域 XLSX 与文本预览/复制（此后不改工作簿）。区域 XLSX 保留样式和隐藏行列，尽量按表格显示文本写入文本值；三个区域处理功能各有独立开关和规则列表。"
         ttk.Label(editor, text=note, foreground="#4b5563", wraplength=1180, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 0))
 
         area_box = ttk.LabelFrame(outer, text="模板内部前/后映射及终端输出区域（与每份源文件无关）", padding=5)
@@ -2606,13 +3137,14 @@ class App:
         self.workflow_tree = self._create_workflow_tab(area_tabs)
         selector_help = ("范围选择（映射区保持普通矩形语法）：单格 A1=整表，A5=整行5，D1=整列D；"
                          "B3,B3=单格；两个不同端点如 D8,B3=自动规范化的矩形。Excel 上限 XFD / 1048576 行。"
-                         f"区域 XLSX 整行/整列/整表按已用范围解析，最多 {MAX_REGION_XLSX_CELLS:,} 格、{MAX_REGION_XLSX_CHARS:,} 字符；隐藏行列会从导出副本中剔除。文本整行/整列/整表按工作表已用范围解析，"
+                         f"区域 XLSX 整行/整列/整表按已用范围解析，最多 {MAX_REGION_XLSX_CELLS:,} 格、{MAX_REGION_XLSX_CHARS:,} 字符；隐藏行列保留原位置并继续隐藏。文本整行/整列/整表按工作表已用范围解析，"
                          f"最多 {MAX_TEXT_CELLS:,} 格、{MAX_TEXT_CHARS:,} 字符，并按 {TEXT_COPY_CHUNK_ROWS} 行分块预览/复制；"
                          f"区域处理单条规则最多 {MAX_PROCESSING_CELLS:,} 格。")
         ttk.Label(area_box, text=selector_help, foreground="#4b5563", wraplength=1180,
                   justify="left").grid(row=1, column=0, sticky="w", padx=4, pady=(4, 1))
-        ttk.Checkbutton(area_box, text="处理成功后自动打开单独导出的区域 XLSX 文件",
-                        variable=self.region_auto_open_var).grid(row=2, column=0, sticky="w", padx=4, pady=(3, 1))
+        ttk.Checkbutton(area_box,
+                        text="处理成功后从单独导出的区域 XLSX 生成 PNG，并删除成功转换的 XLSX（默认关闭；图片失败时保留 XLSX）",
+                        variable=self.export_region_pngs_var).grid(row=2, column=0, sticky="w", padx=4, pady=(3, 1))
 
         controls = ttk.Frame(outer)
         controls.grid(row=4, column=0, sticky="ew", pady=7)
@@ -3297,7 +3829,7 @@ class App:
             raise ProcessingError("当前目标表的保留标题行数和粘贴起始行必须是整数。")
         settings = {key: var.get().strip() for key, var in self.vars.items()}
         settings["output_filename_custom"] = bool(self.output_filename_custom)
-        settings["open_region_exports"] = bool(self.region_auto_open_var.get())
+        settings["export_region_pngs"] = bool(self.export_region_pngs_var.get())
         settings["config_version"] = CONFIG_VERSION
         settings["config_name"] = self.active_profile_name
         settings["jobs"] = deepcopy(self.settings["jobs"])
@@ -3363,7 +3895,7 @@ class App:
             self._suppress_output_filename_trace = False
         for key, var in self.operation_enabled.items():
             var.set(bool(normalized.get(key, {}).get("enabled", False)))
-        self.region_auto_open_var.set(bool(normalized.get("open_region_exports", False)))
+        self.export_region_pngs_var.set(bool(normalized.get("export_region_pngs", False)))
         self.profile_choice.set(self.active_profile_name)
         self._render_jobs()
         self._render_area_configs()
@@ -3513,7 +4045,7 @@ class App:
         self.run_button.configure(state="disabled")
         self.progress.start(10)
         self._render_text_previews([])
-        self._auto_open_for_run = bool(settings.get("open_region_exports", False))
+        self._export_pngs_for_run = bool(settings.get("export_region_pngs", False))
         self._region_output_files = []
         self._log("开始处理……")
         def work():
@@ -3541,9 +4073,10 @@ class App:
                     self.run_button.configure(state="normal")
                     if event == "success":
                         self._log(f"完成：{payload}")
-                        if self._auto_open_for_run:
-                            _open_region_xlsx_files(self._region_output_files, self._log)
-                        self.messagebox.showinfo(APP_NAME, f"处理成功，已保存新文件：\n{payload}")
+                        output_note = ""
+                        if self._export_pngs_for_run:
+                            output_note = f"\n已导出区域 PNG：{len(self._region_output_files)} 张；图片成功后会删除对应区域 XLSX。"
+                        self.messagebox.showinfo(APP_NAME, f"处理成功，已保存新文件：\n{payload}{output_note}")
                     else:
                         self._log("处理未全部完成；请查看详细诊断中的已保存文件路径及清理信息。")
                         self.messagebox.showerror(APP_NAME, str(payload))

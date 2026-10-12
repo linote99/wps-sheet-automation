@@ -1,9 +1,9 @@
 {
-  "config_version": 7,
+  "config_version": 8,
   "template_path": "",
   "output_dir": "",
   "output_filename": "处理结果.xlsx",
-  "open_region_exports": false,
+  "export_region_pngs": false,
   "copy_start_col": "A",
   "copy_end_col": "",
   "pre_mappings": [],
