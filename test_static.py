@@ -1,0 +1,1130 @@
+from __future__ import annotations
+
+import json
+import re
+import tempfile
+import unittest
+import zipfile
+from copy import copy, deepcopy
+from pathlib import Path
+from unittest import mock
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.utils.cell import column_index_from_string, get_column_letter, range_boundaries
+from openpyxl.worksheet.table import Table
+
+import main
+from make_fake_data import create_fake_data
+
+
+class FakeComRange:
+    def __init__(self):
+        self.NumberFormat = "General"
+        self.Value2 = None
+
+
+class FakeMappedRange:
+    def __init__(self, worksheet, address, events):
+        self.worksheet = worksheet
+        self.address = address
+        self.events = events
+        self.min_col, self.min_row, self.max_col, self.max_row = range_boundaries(address)
+
+    @property
+    def Formula(self):
+        values = tuple(
+            tuple(self.worksheet.cell(row=row, column=col).value
+                  for col in range(self.min_col, self.max_col + 1))
+            for row in range(self.min_row, self.max_row + 1)
+        )
+        return values[0][0] if len(values) == 1 and len(values[0]) == 1 else values
+
+    @property
+    def NumberFormat(self):
+        return self.worksheet.cell(row=self.min_row, column=self.min_col).number_format
+
+    @NumberFormat.setter
+    def NumberFormat(self, value):
+        for row in range(self.min_row, self.max_row + 1):
+            for col in range(self.min_col, self.max_col + 1):
+                self.worksheet.cell(row=row, column=col).number_format = value
+
+    @property
+    def Value2(self):
+        self.events.append(("read", self.address))
+        values = tuple(
+            tuple(self.worksheet.cell(row=row, column=col).value
+                  for col in range(self.min_col, self.max_col + 1))
+            for row in range(self.min_row, self.max_row + 1)
+        )
+        return values[0][0] if len(values) == 1 and len(values[0]) == 1 else values
+
+    @Value2.setter
+    def Value2(self, values):
+        self.events.append(("write", self.address))
+        if not isinstance(values, (tuple, list)):
+            values = ((values,),)
+        elif values and not isinstance(values[0], (tuple, list)):
+            values = tuple((value,) for value in values)
+        for row_offset, row_values in enumerate(values):
+            for col_offset, value in enumerate(row_values):
+                self.worksheet.cell(row=self.min_row + row_offset, column=self.min_col + col_offset).value = value
+
+
+class FakeComWorksheet:
+    def __init__(self, worksheet, events):
+        self.worksheet = worksheet
+        self.events = events
+
+    def Range(self, address):
+        return FakeMappedRange(self.worksheet, address, self.events)
+
+
+class FakeComWorkbook:
+    def __init__(self, path, events):
+        self.path = Path(path)
+        self.events = events
+        self.workbook = load_workbook(self.path, data_only=False, keep_links=False)
+
+    def Worksheets(self, name):
+        return FakeComWorksheet(self.workbook[name], self.events)
+
+    def Save(self):
+        self.events.append("save")
+        self.workbook.save(self.path)
+
+    def Close(self, SaveChanges=False):
+        self.events.append("close")
+        self.workbook.close()
+
+
+class FakeWpsApplication:
+    def __init__(self, events, calculated_values):
+        self.events = events
+        self.calculated_values = calculated_values
+        self.Workbooks = self
+        self.workbook = None
+        self.CalculationState = 0
+
+    def Open(self, path, **_kwargs):
+        self.events.append("open")
+        self.workbook = FakeComWorkbook(path, self.events)
+        return self.workbook
+
+    def CalculateFullRebuild(self):
+        self.events.append("calculate")
+        worksheet = self.workbook.workbook["1当天派单"]
+        for row, value in self.calculated_values.items():
+            worksheet[f"EJ{row}"] = value
+
+    def Quit(self):
+        self.events.append("quit")
+
+
+class FakePythonCom:
+    def __init__(self, events):
+        self.events = events
+
+    def CoUninitialize(self):
+        self.events.append("co-uninitialize")
+
+
+class FakePictureChart:
+    def __init__(self, events, should_fail=False):
+        self.events = events
+        self.should_fail = should_fail
+
+    def Paste(self):
+        self.events.append("picture-paste")
+
+    def Export(self, path, file_format):
+        self.events.append(("picture-export", Path(path).name, file_format))
+        if self.should_fail:
+            raise RuntimeError("fake picture export failure")
+        Path(path).write_bytes(b"FAKE-PNG")
+        return True
+
+
+class FakePictureChartObject:
+    def __init__(self, events, should_fail=False):
+        self.events = events
+        self.Chart = FakePictureChart(events, should_fail)
+
+    def Delete(self):
+        self.events.append("chart-delete")
+
+
+class FakePictureChartObjects:
+    def __init__(self, events, should_fail=False):
+        self.events = events
+        self.should_fail = should_fail
+
+    def Add(self, *_args):
+        self.events.append("chart-add")
+        return FakePictureChartObject(self.events, self.should_fail)
+
+
+class FakePictureRange:
+    Width = 120
+    Height = 60
+
+    def __init__(self, address, events):
+        self.address = address
+        self.events = events
+
+    def CopyPicture(self, **_kwargs):
+        self.events.append(("copy-picture", self.address))
+
+
+class FakePictureWorksheet:
+    def __init__(self, title, events, should_fail=False):
+        self.title = title
+        self.events = events
+        self.should_fail = should_fail
+
+    def Range(self, address):
+        return FakePictureRange(address, self.events)
+
+    def ChartObjects(self):
+        return FakePictureChartObjects(self.events, self.should_fail)
+
+
+class FakePictureWorkbook:
+    def __init__(self, events, should_fail=False):
+        self.events = events
+        self.should_fail = should_fail
+
+    def Worksheets(self, name):
+        return FakePictureWorksheet(name, self.events, self.should_fail)
+
+
+def make_test_workbook(path: Path, sheets: list[tuple[str, dict[int, dict[int, object]]]]) -> None:
+    workbook = Workbook()
+    for index, (title, rows) in enumerate(sheets):
+        worksheet = workbook.active if index == 0 else workbook.create_sheet()
+        worksheet.title = title
+        for row_number, columns in rows.items():
+            for column_number, value in columns.items():
+                worksheet.cell(row=row_number, column=column_number, value=value)
+    workbook.save(path)
+    workbook.close()
+
+
+def rewrite_xlsx_member(path: Path, member_name: str, transform) -> None:
+    """Modify one XML member of a synthetic XLSX fixture, never a supplied workbook."""
+    temporary = path.with_name(f"{path.stem}.rewritten{path.suffix}")
+    with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(temporary, "w") as destination:
+        destination.comment = source.comment
+        for info in source.infolist():
+            data = source.read(info.filename)
+            if info.filename == member_name:
+                data = transform(data)
+            destination.writestr(copy(info), data)
+    temporary.replace(path)
+
+
+def corrupt_autofilter_ref(path: Path, member_name: str, old_ref: str, new_ref: str) -> None:
+    import re
+
+    old = old_ref.encode("ascii")
+    new = new_ref.encode("ascii")
+
+    def replace(data: bytes) -> bytes:
+        pattern = rb'(<autoFilter\b[^>]*\bref=")[^\"]*(")'
+        matched, count = re.subn(pattern, lambda m: m.group(1) + new + m.group(2), data, count=1)
+        if count != 1 or old not in data:
+            raise AssertionError(f"未能在 {member_name} 中定位筛选区域 {old_ref!r}")
+        return matched
+
+    rewrite_xlsx_member(path, member_name, replace)
+
+
+def corrupt_sortstate_ref(path: Path, member_name: str, old_ref: str, new_ref: str) -> None:
+    old = f'ref="{old_ref}"'.encode("ascii")
+    new = f'ref="{new_ref}"'.encode("ascii")
+
+    def replace(data: bytes) -> bytes:
+        pattern = rb"(<sortState\b[^>]*\b)ref=" + re.escape(old[4:])
+        matched, count = re.subn(pattern, lambda match: match.group(1) + new, data, count=1)
+        if count != 1 or old not in data:
+            raise AssertionError(f"未能在 {member_name} 中定位排序区域 {old_ref!r}")
+        return matched
+
+    rewrite_xlsx_member(path, member_name, replace)
+
+
+def make_sortstate_workbook(path: Path) -> None:
+    workbook = Workbook()
+    first = workbook.active
+    first.title = "整行排序"
+    first.append(["标题", "值"])
+    first.append(["FAKE-1", 1])
+    first.append(["FAKE-2", 2])
+    first.auto_filter.ref = "A1:B3"
+    first.auto_filter.add_sort_condition("A2:A3")
+    second = workbook.create_sheet("A1排序")
+    second.append(["标题", "值"])
+    second.append(["FAKE-A", 1])
+    second.auto_filter.ref = "A1:B2"
+    second.auto_filter.add_sort_condition("A2:A2")
+    workbook.save(path)
+    workbook.close()
+    corrupt_sortstate_ref(path, "xl/worksheets/sheet1.xml", "A1:B3", "3:393")
+
+
+class StaticConfigurationTests(unittest.TestCase):
+    def test_default_and_legacy_configuration(self):
+        main.validate_static_settings(main.DEFAULT_SETTINGS)
+        expected = [("EJ", "DG", 2, 3), ("EQ", "DG", 2, 3), ("FQ", "DG", 3, 4)]
+        actual = [(j["mappings"][0]["result_col"], j["mappings"][0]["target_col"], j["header_rows"], j["start_row"])
+                  for j in main.DEFAULT_SETTINGS["jobs"]]
+        self.assertEqual(expected, actual)
+        self.assertEqual([(132, 144), (132, 151), (132, 178)], [main.parse_column_range(j["formula_range"]) for j in main.DEFAULT_SETTINGS["jobs"]])
+        legacy = {
+            "sources": ["1.xlsx", "2.xlsx", "3.xlsx"], "source_start_row": 4,
+            "jobs": [
+                {"template_sheet": "一", "source_sheet": "源", "header_rows": 2, "start_row": 3, "formula_range": "EB:EN", "result_col": "EJ", "target_col": "DG"},
+                {"template_sheet": "二", "source_sheet": "源", "header_rows": 2, "start_row": 3, "formula_range": "EB:EU", "result_col": "EQ", "target_col": "DG"},
+                {"template_sheet": "三", "source_sheet": "源", "header_rows": 3, "start_row": 4, "formula_range": "EB:FV", "result_col": "FQ", "target_col": "DG"},
+            ],
+        }
+        migrated = main.normalize_settings(legacy)
+        self.assertEqual("1.xlsx", migrated["jobs"][0]["sources"][0]["path"])
+        self.assertEqual(4, migrated["jobs"][0]["sources"][0]["copy_start_row"])
+        self.assertEqual({"result_col": "EQ", "target_col": "DG", "write_as": "value"}, migrated["jobs"][1]["mappings"][0])
+        main.validate_static_settings(migrated)
+
+    def test_ranges_and_mapping_validation(self):
+        self.assertEqual(111, main.column_number("DG"))
+        self.assertTrue(main.ranges_overlap((132, 144), (140, 150)))
+        self.assertFalse(main.ranges_overlap((1, 10), (11, 20)))
+        with self.assertRaises(main.ProcessingError):
+            main.parse_column_range("EN:EB")
+        with self.assertRaises(main.ProcessingError):
+            main.column_number("XFE")
+        invalid = deepcopy(main.DEFAULT_SETTINGS)
+        invalid["jobs"][0]["mappings"][0]["target_col"] = "EB"
+        with self.assertRaisesRegex(main.ProcessingError, "位于公式范围 EB:EN 内"):
+            main.validate_static_settings(invalid)
+        overlapping_copy_and_mapping = deepcopy(main.DEFAULT_SETTINGS)
+        overlapping_copy_and_mapping["copy_start_col"] = "DG"
+        overlapping_copy_and_mapping["copy_end_col"] = "DG"
+        main.validate_static_settings(overlapping_copy_and_mapping)
+        duplicate_mapping = deepcopy(main.DEFAULT_SETTINGS)
+        duplicate_mapping["jobs"][0]["mappings"].append(deepcopy(duplicate_mapping["jobs"][0]["mappings"][0]))
+        with self.assertRaisesRegex(main.ProcessingError, "第 1 条和第 2 条映射都写入目标列 DG"):
+            main.validate_static_settings(duplicate_mapping)
+        invalid = deepcopy(main.DEFAULT_SETTINGS)
+        invalid["jobs"][0]["sources"][0]["copy_end_row"] = 1
+        with self.assertRaises(main.ProcessingError):
+            main.validate_static_settings(invalid)
+
+    def test_shared_area_selector_semantics_and_excel_limits(self):
+        self.assertEqual(((1, 1, 16_384, 1_048_576), "sheet"), main._parse_selection_details("A1"))
+        self.assertEqual(((1, 5, 16_384, 5), "row"), main._parse_selection_details("A5"))
+        self.assertEqual(((4, 1, 4, 1_048_576), "column"), main._parse_selection_details("D1"))
+        self.assertEqual(((2, 3, 2, 3), "cell"), main._parse_selection_details("B3,B3"))
+        self.assertEqual(((2, 3, 4, 8), "rectangle"), main._parse_selection_details("D8,B3"))
+        self.assertEqual(((2, 3, 4, 8), "rectangle"), main._parse_selection_details("D8:B3"))
+        self.assertEqual(((16_384, 1_048_576, 16_384, 1_048_576), "cell"),
+                         main._parse_selection_details("XFD1048576"))
+        for invalid in ("", "A0", "XFE1", "A1048577", "A1,B3,C5", "not-a-cell"):
+            with self.subTest(invalid=invalid), self.assertRaises(main.ProcessingError):
+                main._parse_selection_details(invalid)
+        with self.assertRaisesRegex(main.ProcessingError, "WPS 图片安全上限"):
+            main._check_image_area_size(main._parse_selected_area("A5"), "测试图片")
+        with self.assertRaisesRegex(main.ProcessingError, "处理上限"):
+            main._check_processing_area_size(main._parse_selected_area("A1"), "测试去重")
+
+    def test_sample_json_validates(self):
+        sample = json.loads((Path(__file__).parent / "default_config.json").read_text(encoding="utf-8"))
+        main.validate_static_settings(sample)
+        self.assertEqual([3, 3, 4], [job["start_row"] for job in sample["jobs"]])
+        self.assertEqual(["EB:EN", "EB:EU", "EB:FV"], [job["formula_range"] for job in sample["jobs"]])
+
+    def test_missing_source_path_is_located_and_reported_before_processing(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["jobs"][1]["sources"][0]["path"] = "C:/data/second.xlsx"
+        self.assertEqual((0, 0), main._first_missing_source_location(settings))
+        settings["jobs"][0]["sources"][0]["path"] = "  "
+        self.assertEqual((0, 0), main._first_missing_source_location(settings))
+        settings["jobs"][0]["sources"][0]["path"] = "C:/data/first.xlsx"
+        self.assertEqual((2, 0), main._first_missing_source_location(settings))
+        settings["jobs"][2]["sources"][0]["path"] = "C:/data/third.xlsx"
+        self.assertIsNone(main._first_missing_source_location(settings))
+
+        with tempfile.TemporaryDirectory() as td:
+            fake = create_fake_data(Path(td) / "fake")
+            invalid = deepcopy(main.DEFAULT_SETTINGS)
+            invalid["template_path"] = str(fake / "template.xlsx")
+            with self.assertRaisesRegex(main.ProcessingError, '目标表“1当天派单”的第 1 份源工作簿尚未配置文件路径'):
+                main._validate_inputs(invalid)
+
+    def test_save_load_reusable_configuration_round_trip(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "reusable.json"
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"][0]["sources"] = [
+                {"path": "C:/data/one.xlsx", "source_sheet": "甲", "copy_start_row": 5, "copy_end_row": 8},
+                {"path": "C:/data/two.xlsx", "source_sheet": "乙", "copy_start_row": 2, "copy_end_row": None},
+            ]
+            settings["jobs"][0]["mappings"].append({"result_col": "EK", "target_col": "DH", "write_as": "text"})
+            settings["pre_mappings"] = [{"source_sheet": "模板甲", "source_range": "A1:B2", "target_sheet": "模板乙", "target_range": "C3:D4"}]
+            settings["post_mappings"] = [{"source_sheet": "模板乙", "source_range": "A1:B2", "target_sheet": "模板丙", "target_range": "C3:D4"}]
+            settings["image_outputs"] = [{"sheet": "模板甲", "range": "B3,B3"}, {"sheet": "模板乙", "range": "D2:D8"}]
+            settings["text_outputs"] = [{"sheet": "模板丙", "range": "A1"}]
+            settings["TextToColumns"] = {"enabled": True, "rules": [{"sheet": "模板甲", "range": "A2:A8", "delimiter": "|", "output_start_col": "D", "column_formats": ["text", "number"]}]}
+            settings["Deduplicate"] = {"enabled": True, "rules": [{"sheet": "模板乙", "range": "A1:C8", "has_header": True, "key_mode": "columns", "key_columns": ["A", "C"]}]}
+            settings["FormatConvert"] = {"enabled": True, "rules": [{"sheet": "模板丙", "range": "D2:D8", "mode": "date"}]}
+            main.save_settings(settings, path)
+            loaded = main.load_settings(path)
+            self.assertEqual(settings["jobs"][0], loaded["jobs"][0])
+            self.assertEqual(main.CONFIG_VERSION, loaded["config_version"])
+            for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs", "TextToColumns", "Deduplicate", "FormatConvert"):
+                self.assertEqual(settings[key], loaded[key])
+
+    def test_pure_region_processing_and_text_area_format(self):
+        split, columns = main.split_text_column(["001|2024-02-01", "002|2024-02-02"], "|", ["number", "date"])
+        self.assertEqual(2, columns)
+        self.assertEqual([[1, __import__("datetime").datetime(2024, 2, 1)],
+                          [2, __import__("datetime").datetime(2024, 2, 2)]], split)
+        deduplicated, removed = main.deduplicate_matrix(
+            [["ID", "Name"], ["1", "first"], ["1", "duplicate"], ["2", "next"]],
+            has_header=True, key_mode="columns", key_indexes=[0],
+        )
+        self.assertEqual(1, removed)
+        self.assertEqual([["ID", "Name"], ["1", "first"], ["2", "next"], [None, None]], deduplicated)
+        self.assertEqual(1234.5, main.convert_cell_value("1,234.5", "number"))
+        self.assertEqual("42", main.convert_cell_value(42, "text"))
+        self.assertEqual(__import__("datetime").datetime(2024, 3, 5), main.convert_cell_value("20240305", "date"))
+        self.assertEqual("x\t1\ny\t", main._format_text_matrix([["x", 1], ["y", None]]))
+
+    def test_invalid_processing_step_rules_are_rejected(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["TextToColumns"] = {"enabled": True, "rules": [{"sheet": "T", "range": "A1:B2", "delimiter": ",", "output_start_col": "C", "column_formats": ["text"]}]}
+        with self.assertRaisesRegex(main.ProcessingError, "源范围必须是单列"):
+            main.validate_static_settings(settings)
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["Deduplicate"] = {"enabled": True, "rules": [{"sheet": "T", "range": "A1:C4", "has_header": False, "key_mode": "columns", "key_columns": ["D"]}]}
+        with self.assertRaisesRegex(main.ProcessingError, "不在所选区域内"):
+            main.validate_static_settings(settings)
+
+    def test_pre_mapping_reads_original_template_before_cleanup_and_uses_independent_sheets(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            template_path = fake / "template.xlsx"
+            workbook = load_workbook(template_path)
+            workbook["1当天派单"]["A20"] = "PRE-SOURCE-ONE"
+            workbook["2当天归档"]["B20"] = "PRE-SOURCE-TWO"
+            workbook.save(template_path)
+            workbook.close()
+            original_bytes = template_path.read_bytes()
+
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["template_path"] = str(template_path)
+            settings["pre_mappings"] = [
+                {"source_sheet": "1当天派单", "source_range": "A20", "target_sheet": "2当天归档", "target_range": "Z1"},
+                {"source_sheet": "2当天归档", "source_range": "B20", "target_sheet": "3装移全业务在途", "target_range": "Y1"},
+            ]
+            staging = root / "pre-mapped.xlsx"
+            records = [[ ["D1", "x", 1] ], [["D2", "y", 2]], [["D3", "z", 3]]]
+            main._create_staging_workbook(template_path, settings, records, staging, lambda _msg: None)
+            result = load_workbook(staging, data_only=False)
+            try:
+                self.assertIsNone(result["1当天派单"]["A20"].value)
+                self.assertEqual("PRE-SOURCE-ONE", result["2当天归档"]["Z1"].value)
+                self.assertEqual("PRE-SOURCE-TWO", result["3装移全业务在途"]["Y1"].value)
+            finally:
+                result.close()
+            self.assertEqual(original_bytes, template_path.read_bytes())
+
+    def test_pre_mapping_conflict_with_main_write_area_is_rejected_before_staging(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["copy_end_col"] = "C"
+        settings["pre_mappings"] = [{"source_sheet": "S", "source_range": "A1", "target_sheet": "1当天派单", "target_range": "B3"}]
+        records = [[["ROW", "x", 1]], [["ROW2", "y", 2]], [["ROW3", "z", 3]]]
+        with self.assertRaisesRegex(main.ProcessingError, "前映射目标.*与主数据复制区域.*冲突"):
+            main._validate_pre_mapping_conflicts(settings, records)
+
+    def test_text_and_value_mapping_writer(self):
+        text_range = FakeComRange()
+        main._write_mapped_values(text_range, [12, None, "001"], "text")
+        self.assertEqual("@", text_range.NumberFormat)
+        self.assertEqual((("12",), (None,), ("001",)), text_range.Value2)
+        value_range = FakeComRange()
+        main._write_mapped_values(value_range, [12, None], "value")
+        self.assertEqual("General", value_range.NumberFormat)
+        self.assertEqual(((12,), (None,)), value_range.Value2)
+        single_range = FakeComRange()
+        main._write_mapped_values(single_range, ["one"], "text")
+        self.assertEqual((("one",),), single_range.Value2)
+
+    def test_multiple_image_areas_export_names_and_temporary_resources(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            events = []
+            outputs = [{"sheet": "工单表", "range": "A1:B2"}, {"sheet": "工单表", "range": "D3:E8"}]
+            paths = main._export_image_areas_from_workbook(FakePictureWorkbook(events), outputs, output_dir, lambda _msg: None)
+            self.assertEqual(["工单表_A1-B2_001.png", "工单表_D3-E8_002.png"], [path.name for path in paths])
+            self.assertTrue(all(path.read_bytes() == b"FAKE-PNG" for path in paths))
+            self.assertEqual({path.name for path in paths}, {path.name for path in output_dir.iterdir()})
+            self.assertEqual(2, events.count("chart-delete"))
+
+    def test_image_export_avoids_overwrite_and_cleans_temp_files_on_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            existing = output_dir / "工单表_A1-B2_001.png"
+            existing.write_bytes(b"USER-FILE")
+            paths = main._export_image_areas_from_workbook(
+                FakePictureWorkbook([]), [{"sheet": "工单表", "range": "A1:B2"}], output_dir, lambda _msg: None
+            )
+            self.assertEqual("工单表_A1-B2_001_2.png", paths[0].name)
+            self.assertEqual(b"USER-FILE", existing.read_bytes())
+
+        with tempfile.TemporaryDirectory() as td:
+            output_dir = Path(td)
+            events = []
+            with self.assertRaisesRegex(RuntimeError, "fake picture export failure"):
+                main._export_image_areas_from_workbook(
+                    FakePictureWorkbook(events, should_fail=True), [{"sheet": "S", "range": "A1,A1"}], output_dir, lambda _msg: None
+                )
+            self.assertEqual([], list(output_dir.iterdir()))
+            self.assertIn("chart-delete", events)
+
+    def test_text_area_reader_emits_tab_columns_newline_rows_and_blanks(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "text-area.xlsx"
+            make_test_workbook(path, [("文本", {1: {1: "name", 2: "count"}, 2: {1: "row-1", 2: 5}, 3: {1: "row-2"}})])
+            previews = main._read_text_output_areas(path, [{"sheet": "文本", "range": "A1:B3"}])
+            self.assertEqual("name\tcount\nrow-1\t5\nrow-2\t", previews[0]["text"])
+
+    def test_whole_sheet_text_is_resolved_to_used_range_and_chunked(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "used-range.xlsx"
+            sheet_data = {1: {1: "header", 2: "value"}}
+            sheet_data.update({row: {1: f"r{row}", 2: row} for row in range(2, 506)})
+            make_test_workbook(path, [("整表", sheet_data)])
+            preview = main._read_text_output_areas(path, [{"sheet": "整表", "range": "A1"}])[0]
+            self.assertEqual("A1:B505", preview["resolved_range"])
+            self.assertEqual(2, len(preview["chunks"]))
+            self.assertEqual((1, 500), (preview["chunks"][0]["start_row"], preview["chunks"][0]["end_row"]))
+            self.assertEqual((501, 505), (preview["chunks"][1]["start_row"], preview["chunks"][1]["end_row"]))
+            self.assertTrue(preview["chunks"][1]["text"].startswith("r501\t501"))
+
+    def test_large_image_and_text_areas_are_rejected_by_config_validation(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["image_outputs"] = [{"sheet": "工作表", "range": "A1"}]
+        with self.assertRaisesRegex(main.ProcessingError, "WPS 图片安全上限"):
+            main.validate_static_settings(settings)
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["text_outputs"] = [{"sheet": "工作表", "range": "A1:DV1000"}]
+        with self.assertRaisesRegex(main.ProcessingError, "文本预览/复制上限"):
+            main.validate_static_settings(settings)
+
+    def test_text_split_refuses_to_overwrite_nonempty_destination(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "split-conflict.xlsx"
+            make_test_workbook(path, [("数据", {1: {1: "x|y", 2: "KEEP-ME"}})])
+            events = []
+            fake_workbook = FakeComWorkbook(path, events)
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = []
+            settings["TextToColumns"] = {"enabled": True, "rules": [{
+                "sheet": "数据", "range": "A1:A1", "delimiter": "|", "output_start_col": "B", "column_formats": ["text", "text"]}]}
+            with self.assertRaisesRegex(main.ProcessingError, "不会静默覆盖"):
+                main._apply_region_processing(fake_workbook, settings, [], lambda _msg: None)
+            self.assertEqual("KEEP-ME", fake_workbook.workbook["数据"]["B1"].value)
+            fake_workbook.workbook.close()
+
+    def test_preview_copy_writes_exact_tabs_and_newlines_to_clipboard(self):
+        text = "a\t1\nb\t2"
+        clipboard = {"text": None}
+        root = mock.Mock()
+        root.clipboard_clear.side_effect = lambda: clipboard.update(text="")
+        root.clipboard_append.side_effect = lambda value: clipboard.update(text=value)
+        stub_app = type("ClipboardApp", (), {})()
+        stub_app.root = root
+        stub_app._log = lambda _message: None
+        stub_app.messagebox = mock.Mock()
+        main.App._copy_preview_to_clipboard(stub_app, text)
+        self.assertEqual(text, clipboard["text"])
+        root.clipboard_clear.assert_called_once()
+        root.clipboard_append.assert_called_once_with(text)
+
+    def test_mapping_can_overwrite_copied_column_after_formula_calculation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            source_path = root / "source_dg.xlsx"
+            make_test_workbook(source_path, [("数据", {
+                2: {111: "COPIED-1"},
+                3: {111: "COPIED-2"},
+            })])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [deepcopy(settings["jobs"][0])]
+            settings["copy_start_col"] = "DG"
+            settings["copy_end_col"] = "DG"
+            settings["template_path"] = str(fake / "template.xlsx")
+            settings["jobs"][0]["sources"] = [
+                {"path": str(source_path), "source_sheet": "数据", "copy_start_row": 2, "copy_end_row": 3}
+            ]
+            main.validate_static_settings(settings)
+            records = main._read_source_records(source_path, "数据", 2, 111, 111, lambda _msg: None, end_row=3)
+            staging = root / "mapping-overwrite.xlsx"
+            formula_jobs = main._create_staging_workbook(
+                Path(settings["template_path"]), settings, [records], staging, lambda _msg: None
+            )
+
+            staged = load_workbook(staging, data_only=False)
+            try:
+                self.assertEqual("COPIED-1", staged["1当天派单"]["DG3"].value)
+                self.assertEqual("COPIED-2", staged["1当天派单"]["DG4"].value)
+            finally:
+                staged.close()
+
+            events = []
+            fake_app = FakeWpsApplication(events, {3: "CALCULATED-1", 4: "CALCULATED-2"})
+            fake_pythoncom = FakePythonCom(events)
+            with mock.patch.object(main, "_connect_wps", return_value=(fake_app, fake_pythoncom, "fake.WPS")):
+                main._calculate_in_wps(staging, formula_jobs, lambda _msg: None)
+
+            final = load_workbook(staging, data_only=False)
+            try:
+                self.assertEqual("CALCULATED-1", final["1当天派单"]["DG3"].value)
+                self.assertEqual("CALCULATED-2", final["1当天派单"]["DG4"].value)
+            finally:
+                final.close()
+            calculate_index = events.index("calculate")
+            result_read_index = events.index(("read", "EJ3:EJ4"))
+            target_write_index = events.index(("write", "DG3:DG4"))
+            self.assertLess(calculate_index, result_read_index)
+            self.assertLess(result_read_index, target_write_index)
+
+    def test_wps_order_is_recalc_post_mapping_three_independent_functions_recalc_save(self):
+        with tempfile.TemporaryDirectory() as td:
+            staging = Path(td) / "ordered.xlsx"
+            make_test_workbook(staging, [
+                ("1当天派单", {3: {1: "11|x"}, 4: {1: "11|x"}, 5: {1: "12|y"}}),
+                ("2当天归档", {1: {1: "POST-A", 2: "POST-B"}}),
+                ("3装移全业务在途", {1: {4: None, 5: None}}),
+            ])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [deepcopy(settings["jobs"][0])]
+            settings["jobs"][0].update({"template_sheet": "1当天派单", "start_row": 3, "formula_range": "EB:EN"})
+            settings["TextToColumns"] = {"enabled": True, "rules": [{
+                "sheet": "1当天派单", "range": "A3:A5", "delimiter": "|", "output_start_col": "H", "column_formats": ["number", "text"]}]}
+            settings["Deduplicate"] = {"enabled": True, "rules": [{
+                "sheet": "1当天派单", "range": "H3:I5", "has_header": False, "key_mode": "row", "key_columns": []}]}
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "sheet": "1当天派单", "range": "H3:H5", "mode": "text"}]}
+            post_mappings = [{"source_sheet": "2当天归档", "source_range": "A1:B1",
+                              "target_sheet": "3装移全业务在途", "target_range": "D1:E1"}]
+            formula_jobs = [("1当天派单", 3, 5, [{"result_col": "EJ", "target_col": "DG", "write_as": "value"}])]
+            events = []
+            fake_app = FakeWpsApplication(events, {3: "CALC-3", 4: "CALC-4", 5: "CALC-5"})
+            fake_pythoncom = FakePythonCom(events)
+            with mock.patch.object(main, "_connect_wps", return_value=(fake_app, fake_pythoncom, "fake.WPS")):
+                main._calculate_in_wps(staging, formula_jobs, lambda _msg: None, post_mappings, settings)
+
+            output = load_workbook(staging, data_only=False)
+            try:
+                self.assertEqual(("POST-A", "POST-B"), (output["3装移全业务在途"]["D1"].value, output["3装移全业务在途"]["E1"].value))
+                self.assertEqual("11", output["1当天派单"]["H3"].value)
+                self.assertEqual("12", output["1当天派单"]["H4"].value)
+                self.assertIsNone(output["1当天派单"]["H5"].value)
+                self.assertEqual("@", output["1当天派单"]["H3"].number_format)
+            finally:
+                output.close()
+
+            first_recalc = events.index("calculate")
+            result_read = events.index(("read", "EJ3:EJ5"))
+            post_write = events.index(("write", "D1:E1"))
+            split_write = events.index(("write", "H3:I5"))
+            convert_write = events.index(("write", "H3:H5"))
+            second_recalc = events.index("calculate", first_recalc + 1)
+            save = events.index("save")
+            self.assertLess(first_recalc, result_read)
+            self.assertLess(result_read, post_write)
+            self.assertLess(post_write, split_write)
+            self.assertLess(split_write, convert_write)
+            self.assertLess(convert_write, second_recalc)
+            self.assertLess(second_recalc, save)
+
+    def test_terminal_image_and_text_outputs_run_only_after_saved_workbook(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({"copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
+                             "output_dir": str(fake / "output"), "output_filename": "terminal-outputs.xlsx",
+                             "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}],
+                             "text_outputs": [{"sheet": "2当天归档", "range": "A1:B2"}]})
+            for idx, job in enumerate(settings["jobs"], 1):
+                job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
+                                   "copy_start_row": 2, "copy_end_row": 3}]
+            events = []
+
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _region_processing):
+                events.append("workbook-save")
+                workbook = load_workbook(path, data_only=False)
+                workbook.save(path)
+                workbook.close()
+
+            def fake_export(path, _outputs, output_dir, _log):
+                self.assertTrue(path.is_file())
+                events.append("image-export")
+                image_path = output_dir / "simulated.png"
+                image_path.write_bytes(b"FAKE-PNG")
+                return [image_path]
+
+            def fake_text(path, _outputs):
+                self.assertTrue(path.is_file())
+                events.append("text-read")
+                return [{"sheet": "2当天归档", "range": "A1:B2", "text": "preview"}]
+
+            previews = []
+            with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
+                 mock.patch.object(main, "_export_image_areas_wps", side_effect=fake_export), \
+                 mock.patch.object(main, "_read_text_output_areas", side_effect=fake_text):
+                result = main.process_workbooks(settings, lambda _msg: None, previews.extend)
+            self.assertTrue(result.is_file())
+            self.assertEqual(["workbook-save", "image-export", "text-read"], events)
+            self.assertEqual("preview", previews[0]["text"])
+            self.assertEqual(b"FAKE-PNG", (fake / "output" / "simulated.png").read_bytes())
+
+    def test_source_bounds_multi_source_order_and_formula_seed_fill(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            template_path = fake / "template.xlsx"
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["copy_end_col"] = "C"
+            settings["template_path"] = str(template_path)
+            settings["output_dir"] = str(fake / "output")
+            settings["output_filename"] = "not-published.xlsx"
+            settings["jobs"][0].update({"header_rows": 2, "start_row": 5})
+            settings["jobs"][1].update({"header_rows": 2, "start_row": 6})
+            settings["jobs"][2].update({"header_rows": 3, "start_row": 7})
+            settings["jobs"][0]["sources"] = [
+                {"path": str(fake / "1.xlsx"), "source_sheet": "示例源表", "copy_start_row": 2, "copy_end_row": 3},
+                {"path": str(fake / "1_extra.xlsx"), "source_sheet": "示例源表", "copy_start_row": 4, "copy_end_row": 5},
+            ]
+            settings["jobs"][1]["sources"] = [
+                {"path": str(fake / "2.xlsx"), "source_sheet": "示例源表", "copy_start_row": 3, "copy_end_row": 4},
+            ]
+            settings["jobs"][2]["sources"] = [
+                {"path": str(fake / "3.xlsx"), "source_sheet": "示例源表", "copy_start_row": 5, "copy_end_row": None},
+            ]
+            # Move formula seeds in a template copy to distinct configured destination rows.
+            wb = load_workbook(template_path)
+            for job in settings["jobs"]:
+                ws = wb[job["template_sheet"]]
+                first, last = main.parse_column_range(job["formula_range"])
+                row = job["start_row"]
+                for col in range(first, last + 1):
+                    ws.cell(row=row, column=col).value = f'=IF($A{row}="", "", $A{row}&"-演示")'
+            wb.save(template_path)
+            wb.close()
+
+            all_records = []
+            for job in settings["jobs"]:
+                records = []
+                for source in job["sources"]:
+                    start, end = source["copy_start_row"], source["copy_end_row"]
+                    records.extend(main._read_source_records(Path(source["path"]), source["source_sheet"], start, 1, 3,
+                                                             lambda _msg: None, end))
+                all_records.append(records)
+            ids = [record[0] for record in all_records[0]]
+            self.assertEqual(["FAKE-1-01", "FAKE-1-02", "FAKE-1X-03", "FAKE-1X-04"], ids)
+            self.assertEqual(["FAKE-2-02", "FAKE-2-03"], [r[0] for r in all_records[1]])
+            self.assertEqual(["FAKE-3-04"], [r[0] for r in all_records[2]])
+
+            staging = root / "prepared.xlsx"
+            main._create_staging_workbook(template_path, settings, all_records, staging, lambda _msg: None)
+            out = load_workbook(staging, data_only=False)
+            try:
+                for job, records in zip(settings["jobs"], all_records):
+                    ws = out[job["template_sheet"]]
+                    start = job["start_row"]
+                    last = start + len(records) - 1
+                    self.assertIn("演示标题", ws["A1"].value)
+                    self.assertEqual(records[0][0], ws.cell(start, 1).value)
+                    self.assertEqual(records[-1][0], ws.cell(last, 1).value)
+                    first_formula_col, _ = main.parse_column_range(job["formula_range"])
+                    self.assertTrue(ws.cell(start, first_formula_col).value.startswith("=IF("))
+                    self.assertTrue(ws.cell(last, first_formula_col).value.startswith("=IF("))
+                    self.assertIn(f"${get_column_letter(1)}{last}", ws.cell(last, first_formula_col).value)
+                    self.assertIsNone(ws["A20"].value)
+                    self.assertIsNone(ws["DG25"].value)
+                    self.assertIsNotNone(ws["A20"].fill.fgColor.rgb)
+            finally:
+                out.close()
+
+    def test_blank_source_sheet_name_selects_first_worksheet(self):
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "two_sheets.xlsx"
+            make_test_workbook(source_path, [
+                ("首个工作表", {2: {1: "FIRST-SHEET"}}),
+                ("第二个工作表", {2: {1: "SECOND-SHEET"}}),
+            ])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"][0]["sources"][0].update({"path": str(source_path), "source_sheet": "   "})
+            main.validate_static_settings(settings)
+            messages = []
+            records = main._read_source_records(source_path, "", 2, 1, 3, messages.append)
+            self.assertEqual("FIRST-SHEET", records[0][0])
+            self.assertTrue(any("默认使用第一个工作表“首个工作表”" in message for message in messages))
+
+    def test_blank_row_boundary_checks_all_used_columns_and_next_source_appends(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            first_source = root / "first.xlsx"
+            second_source = root / "second.xlsx"
+            make_test_workbook(first_source, [("数据", {
+                2: {1: "SRC1-1", 2: "A"},
+                3: {4: "copy-range-empty-but-row-not-empty"},
+                4: {1: "SRC1-2", 2: "B"},
+                6: {1: "AFTER-ALL-COLUMN-BLANK-BOUNDARY"},
+            })])
+            make_test_workbook(second_source, [("数据", {
+                2: {1: "SRC2-1"},
+                3: {1: "SRC2-2"},
+            })])
+
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [deepcopy(settings["jobs"][0])]
+            settings["template_path"] = str(fake / "template.xlsx")
+            settings["output_dir"] = str(fake / "output")
+            settings["output_filename"] = "append-boundary-result.xlsx"
+            job = settings["jobs"][0]
+            job.update({"header_rows": 2, "start_row": 5})
+            job["sources"] = [
+                {"path": str(first_source), "source_sheet": "数据", "copy_start_row": 2, "copy_end_row": None},
+                {"path": str(second_source), "source_sheet": "数据", "copy_start_row": 2, "copy_end_row": None},
+            ]
+
+            template = load_workbook(settings["template_path"])
+            ws = template[job["template_sheet"]]
+            formula_start, formula_end = main.parse_column_range(job["formula_range"])
+            for col in range(formula_start, formula_end + 1):
+                ws.cell(row=5, column=col).value = '=IF($A5="", "", $A5&"-演示")'
+            template.save(settings["template_path"])
+            template.close()
+            main.validate_static_settings(settings)
+
+            records = []
+            messages = []
+            for source in job["sources"]:
+                records.extend(main._read_source_records(Path(source["path"]), source["source_sheet"],
+                                                         source["copy_start_row"], 1, 3, messages.append))
+            self.assertEqual(["SRC1-1", "SRC1-2", "SRC2-1", "SRC2-2"], [row[0] for row in records])
+            self.assertTrue(any("第 5 行遇到整行空白边界" in message for message in messages))
+
+            staging = root / "prepared.xlsx"
+            main._create_staging_workbook(Path(settings["template_path"]), settings, [records], staging, lambda _msg: None)
+            output = load_workbook(staging, data_only=False)
+            try:
+                out_ws = output[job["template_sheet"]]
+                self.assertEqual(["SRC1-1", "SRC1-2", "SRC2-1", "SRC2-2"],
+                                 [out_ws.cell(row=row, column=1).value for row in range(5, 9)])
+                self.assertIsNone(out_ws.cell(row=9, column=1).value)
+            finally:
+                output.close()
+
+    def test_empty_end_row_without_blank_boundary_uses_last_nonempty_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "no_boundary.xlsx"
+            make_test_workbook(source_path, [("数据", {
+                2: {1: "FIRST"},
+                3: {4: "outside-copy-columns"},
+                4: {1: "LAST"},
+            })])
+            messages = []
+            records = main._read_source_records(source_path, "数据", 2, 1, 3, messages.append)
+            self.assertEqual(["FIRST", "LAST"], [row[0] for row in records])
+            self.assertTrue(any("最后非空行 4 未遇到整行空白边界" in message for message in messages))
+
+    def test_explicit_end_row_includes_data_across_blank_rows_but_not_beyond_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "explicit_end.xlsx"
+            make_test_workbook(source_path, [("数据", {
+                2: {1: "IN-1"},
+                4: {1: "IN-2"},
+                6: {1: "AFTER-EXPLICIT-END"},
+            })])
+            records = main._read_source_records(source_path, "数据", 2, 1, 3, lambda _msg: None, end_row=4)
+            self.assertEqual(["IN-1", "IN-2"], [row[0] for row in records])
+
+    def test_all_blank_source_fails_without_creating_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            blank_source = root / "blank.xlsx"
+            make_test_workbook(blank_source, [("空表", {})])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [deepcopy(settings["jobs"][0])]
+            settings["copy_end_col"] = "C"
+            settings["template_path"] = str(fake / "template.xlsx")
+            settings["output_dir"] = str(fake / "output")
+            settings["output_filename"] = "must-not-exist.xlsx"
+            settings["jobs"][0]["sources"] = [
+                {"path": str(blank_source), "source_sheet": "", "copy_start_row": 2, "copy_end_row": None}
+            ]
+            with self.assertRaisesRegex(main.ProcessingError, "没有可复制数据"):
+                main.process_workbooks(settings, lambda _msg: None)
+            self.assertEqual([], list((fake / "output").iterdir()))
+
+    def test_processing_failure_leaves_no_final_or_staging_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["copy_end_col"] = "C"
+            settings["template_path"] = str(fake / "template.xlsx")
+            settings["output_dir"] = str(fake / "output")
+            settings["output_filename"] = "failure.xlsx"
+            for idx, job in enumerate(settings["jobs"], 1):
+                job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表", "copy_start_row": 2, "copy_end_row": 3}]
+            with mock.patch.object(main, "_calculate_in_wps", side_effect=main.ProcessingError("模拟 COM 故障")):
+                with self.assertRaisesRegex(main.ProcessingError, "模拟 COM 故障"):
+                    main.process_workbooks(settings, lambda _msg: None)
+            output_files = list((fake / "output").iterdir())
+            self.assertEqual([], output_files)
+
+    def test_invalid_autofilter_is_removed_only_in_template_read_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            template_path = fake / "template.xlsx"
+            template = load_workbook(template_path)
+            template["1当天派单"].auto_filter.ref = "A1:C20"
+            template.save(template_path)
+            template.close()
+            corrupt_autofilter_ref(template_path, "xl/worksheets/sheet1.xml", "A1:C20", "A1-BROKEN")
+            original_bytes = template_path.read_bytes()
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [deepcopy(settings["jobs"][0])]
+            settings["template_path"] = str(template_path)
+            staging = root / "staging.xlsx"
+            messages = []
+
+            main._create_staging_workbook(
+                template_path, settings, [[["TEMPLATE-FAKE", "value", 1]]], staging, messages.append
+            )
+            self.assertEqual(original_bytes, template_path.read_bytes())
+            self.assertTrue(any(
+                '模板工作簿“template.xlsx”工作表“1当天派单”的自动筛选区域 \'A1-BROKEN\'' in message
+                and "临时读取副本" in message for message in messages
+            ))
+            result = load_workbook(staging, data_only=False)
+            try:
+                self.assertEqual("TEMPLATE-FAKE", result["1当天派单"]["A3"].value)
+            finally:
+                result.close()
+
+    def test_invalid_autofilter_is_removed_only_in_source_read_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.xlsx"
+            make_test_workbook(source_path, [("源数据", {1: {1: "标题"}, 2: {1: "ROW-1", 2: "x"}, 3: {1: "ROW-2", 2: "y"}})])
+            source = load_workbook(source_path)
+            source.active.auto_filter.ref = "A1:B3"
+            source.save(source_path)
+            source.close()
+            corrupt_autofilter_ref(source_path, "xl/worksheets/sheet1.xml", "A1:B3", "not-an-area")
+            original_bytes = source_path.read_bytes()
+            messages = []
+
+            records = main._read_source_records(source_path, "源数据", 2, 1, 2, messages.append, end_row=3)
+            self.assertEqual([["ROW-1", "x"], ["ROW-2", "y"]], records)
+            self.assertEqual(original_bytes, source_path.read_bytes())
+            self.assertTrue(any(
+                '源工作簿“source.xlsx”工作表“源数据”的自动筛选区域 \'not-an-area\'' in message
+                and "临时读取副本" in message for message in messages
+            ))
+
+    def test_valid_filters_table_filter_and_unfiltered_workbook_are_preserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workbook_path = root / "mixed.xlsx"
+            workbook = Workbook()
+            invalid_sheet = workbook.active
+            invalid_sheet.title = "需要临时修复"
+            invalid_sheet.append(["A", "B"])
+            invalid_sheet.append([1, 2])
+            invalid_sheet.auto_filter.ref = "A1:B2"
+            valid_sheet = workbook.create_sheet("有效筛选")
+            valid_sheet.append(["A", "B"])
+            valid_sheet.append([1, 2])
+            valid_sheet.auto_filter.ref = "A1:B2"
+            table = Table(displayName="FakeTable", ref="A1:B2")
+            valid_sheet.add_table(table)
+            workbook.save(workbook_path)
+            workbook.close()
+            corrupt_autofilter_ref(workbook_path, "xl/worksheets/sheet1.xml", "A1:B2", "A1:BAD")
+            original_bytes = workbook_path.read_bytes()
+            with zipfile.ZipFile(workbook_path) as archive:
+                original_invalid_sheet = archive.read("xl/worksheets/sheet1.xml")
+                original_valid_sheet = archive.read("xl/worksheets/sheet2.xml")
+                original_table = archive.read("xl/tables/table1.xml")
+            expected_invalid_sheet = original_invalid_sheet.replace(b'<autoFilter ref="A1:BAD"/>', b"")
+            self.assertNotEqual(expected_invalid_sheet, original_invalid_sheet)
+
+            messages = []
+            with main._temporary_workbook_copy(workbook_path, "测试工作簿", messages.append) as clean_copy:
+                with zipfile.ZipFile(clean_copy) as archive:
+                    self.assertEqual(expected_invalid_sheet, archive.read("xl/worksheets/sheet1.xml"))
+                    self.assertEqual(original_valid_sheet, archive.read("xl/worksheets/sheet2.xml"))
+                    self.assertEqual(original_table, archive.read("xl/tables/table1.xml"))
+                    self.assertIn(b'<autoFilter ref="A1:B2"/>', archive.read("xl/worksheets/sheet2.xml"))
+                    self.assertIn(b'<autoFilter ref="A1:B2"/>', archive.read("xl/tables/table1.xml"))
+                loaded = load_workbook(clean_copy, data_only=False)
+                try:
+                    self.assertEqual("A1:B2", loaded["有效筛选"].auto_filter.ref)
+                finally:
+                    loaded.close()
+            self.assertEqual(original_bytes, workbook_path.read_bytes())
+            self.assertEqual(1, len(messages))
+            self.assertIn("需要临时修复", messages[0])
+
+            no_filter_path = root / "no-filter.xlsx"
+            make_test_workbook(no_filter_path, [("普通表", {1: {1: "HEADER"}, 2: {1: "FAKE"}})])
+            no_filter_bytes = no_filter_path.read_bytes()
+            messages = []
+            with main._temporary_workbook_copy(no_filter_path, "测试工作簿", messages.append) as clean_copy:
+                with zipfile.ZipFile(no_filter_path) as source_zip, zipfile.ZipFile(clean_copy) as copy_zip:
+                    self.assertEqual(source_zip.read("xl/worksheets/sheet1.xml"), copy_zip.read("xl/worksheets/sheet1.xml"))
+            self.assertEqual(no_filter_bytes, no_filter_path.read_bytes())
+            self.assertEqual([], messages)
+
+    def test_row_sortstate_ref_normalizes_and_valid_a1_sortstate_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workbook_path = root / "sortstate.xlsx"
+            make_sortstate_workbook(workbook_path)
+            original_bytes = workbook_path.read_bytes()
+            messages = []
+
+            with main._temporary_workbook_copy(workbook_path, "测试工作簿", messages.append) as clean_copy:
+                with zipfile.ZipFile(clean_copy) as archive:
+                    row_sorted_xml = archive.read("xl/worksheets/sheet1.xml")
+                    a1_sorted_xml = archive.read("xl/worksheets/sheet2.xml")
+                self.assertIn(b'<sortState ref="A3:XFD393"', row_sorted_xml)
+                self.assertIn(b'<sortState ref="A1:B2"', a1_sorted_xml)
+                loaded = load_workbook(clean_copy, data_only=False, keep_links=False)
+                try:
+                    self.assertEqual("A3:XFD393", loaded["整行排序"].auto_filter.sortState.ref)
+                    self.assertEqual("A1:B2", loaded["A1排序"].auto_filter.sortState.ref)
+                finally:
+                    loaded.close()
+
+            self.assertEqual(original_bytes, workbook_path.read_bytes())
+            self.assertEqual(1, len(messages))
+            self.assertIn(str(workbook_path), messages[0])
+            self.assertIn("整行排序", messages[0])
+            self.assertIn("'3:393'", messages[0])
+            self.assertIn("'A3:XFD393'", messages[0])
+
+    def test_sortstate_preprocessing_is_used_for_template_and_source_entries(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "source.xlsx"
+            make_sortstate_workbook(source_path)
+            source_bytes = source_path.read_bytes()
+            source_messages = []
+            records = main._read_source_records(
+                source_path, "整行排序", 2, 1, 2, source_messages.append, end_row=3
+            )
+            self.assertEqual([["FAKE-1", 1], ["FAKE-2", 2]], records)
+            self.assertEqual(source_bytes, source_path.read_bytes())
+            self.assertTrue(any(
+                str(source_path) in message and "整行排序" in message
+                and "'3:393'" in message and "'A3:XFD393'" in message
+                for message in source_messages
+            ))
+
+            fake = create_fake_data(root / "fake")
+            template_path = fake / "template.xlsx"
+            template = load_workbook(template_path)
+            first = template["1当天派单"]
+            first.auto_filter.ref = "A1:C10"
+            first.auto_filter.add_sort_condition("A3:A10")
+            second = template["2当天归档"]
+            second.auto_filter.ref = "A1:C10"
+            second.auto_filter.add_sort_condition("A3:A10")
+            template.save(template_path)
+            template.close()
+            corrupt_sortstate_ref(template_path, "xl/worksheets/sheet1.xml", "A1:C10", "3:393")
+            template_bytes = template_path.read_bytes()
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [deepcopy(settings["jobs"][0])]
+            settings["template_path"] = str(template_path)
+            staging = root / "staging.xlsx"
+            template_messages = []
+
+            main._create_staging_workbook(
+                template_path, settings, [[ ["FAKE-TEMPLATE", "value", 1] ]],
+                staging, template_messages.append,
+            )
+            self.assertEqual(template_bytes, template_path.read_bytes())
+            self.assertTrue(any(
+                str(template_path) in message and "1当天派单" in message
+                and "'3:393'" in message and "'A3:XFD393'" in message
+                for message in template_messages
+            ))
+            prepared = load_workbook(staging, data_only=False, keep_links=False)
+            try:
+                self.assertEqual("A3:XFD393", prepared["1当天派单"].auto_filter.sortState.ref)
+                self.assertEqual("A1:C10", prepared["2当天归档"].auto_filter.sortState.ref)
+            finally:
+                prepared.close()
+
+    def test_invalid_sortstate_ref_fails_explicitly_without_deleting_sort_info(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for invalid_ref in ("0:393", "1048577:1048578", "393:3", "3:393x"):
+                with self.subTest(ref=invalid_ref):
+                    workbook_path = root / f"invalid-{len(list(root.iterdir()))}.xlsx"
+                    make_sortstate_workbook(workbook_path)
+                    corrupt_sortstate_ref(workbook_path, "xl/worksheets/sheet1.xml", "3:393", invalid_ref)
+                    original_bytes = workbook_path.read_bytes()
+                    with self.assertRaises(main.ProcessingError) as caught:
+                        with main._temporary_workbook_copy(workbook_path, "测试工作簿", lambda _msg: None):
+                            self.fail("不安全的 sortState 引用不应被静默删除或接受")
+                    self.assertIn("sortState ref", str(caught.exception))
+                    self.assertIn(invalid_ref, str(caught.exception))
+                    self.assertIn("未删除该排序定义", str(caught.exception))
+                    self.assertEqual(original_bytes, workbook_path.read_bytes())
+
+    def test_safe_copy_rejects_zip_traversal_member_count_and_uncompressed_size(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "fixture.xlsx"
+            make_test_workbook(path, [("数据", {1: {1: "FAKE"}})])
+            original = path.read_bytes()
+            traversal_path = root / "traversal.xlsx"
+            with zipfile.ZipFile(path) as source, zipfile.ZipFile(traversal_path, "w") as destination:
+                for info in source.infolist():
+                    destination.writestr(copy(info), source.read(info.filename))
+                destination.writestr("../outside.xml", b"test")
+            temp_copies_before = set(Path(tempfile.gettempdir()).glob("wps_sheet_autofilter_*.xlsx"))
+            with self.assertRaisesRegex(main.ProcessingError, "路径不安全") as caught:
+                with main._temporary_workbook_copy(traversal_path, "测试工作簿", lambda _msg: None):
+                    self.fail("不安全 ZIP 路径不应被接受")
+            self.assertIn("在 WPS 中打开该文件的副本", str(caught.exception))
+            self.assertEqual(temp_copies_before, set(Path(tempfile.gettempdir()).glob("wps_sheet_autofilter_*.xlsx")))
+
+            with mock.patch.object(main, "MAX_XLSX_MEMBERS", 1):
+                with self.assertRaisesRegex(main.ProcessingError, "成员数"):
+                    with main._temporary_workbook_copy(path, "测试工作簿", lambda _msg: None):
+                        self.fail("超限 ZIP 成员数不应被接受")
+            with mock.patch.object(main, "MAX_XLSX_UNCOMPRESSED_BYTES", 1):
+                with self.assertRaisesRegex(main.ProcessingError, "解压总大小"):
+                    with main._temporary_workbook_copy(path, "测试工作簿", lambda _msg: None):
+                        self.fail("超限 ZIP 解压大小不应被接受")
+            self.assertEqual(original, path.read_bytes())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
