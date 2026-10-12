@@ -1,5 +1,11 @@
 # 变更记录
 
+## 2026-10-07：v14 修复 Windows 启动时授权弹窗不可见
+
+- 授权阶段主窗口保持隐藏时，不再把授权对话框设为隐藏主窗口的从属窗口；窗口显示后再启用模态输入，避免程序等待不可见弹窗。
+- 窗口化 EXE 的启动异常现在会弹出可见错误信息，并写入 `%LOCALAPPDATA%\\WpsSheetAutomation\\logs\\startup.log`；日志记录启动阶段及完整异常堆栈。
+- main-only 静态/合成工作簿回归 **75 项通过**。本环境不是 Windows，仍需目标机确认授权窗口和 EXE 行为。
+
 ## 2026-10-07：修复 PyInstaller workflow hook 同名冲突
 
 - 将项目本地工作流辅助模块从通用名称 `workflow.py` 改为 `wps_automation_workflow.py`，避免 PyInstaller hooks-contrib 将其误识别为第三方 `workflow` distribution 并调用 `copy_metadata('workflow')`。

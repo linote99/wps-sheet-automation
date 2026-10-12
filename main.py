@@ -4298,6 +4298,27 @@ def self_check() -> int:
         return 1
 
 
+def _startup_log_path() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return base / "WpsSheetAutomation" / "logs" / "startup.log"
+
+
+def _write_startup_log(stage: str, detail: str = "") -> Path | None:
+    path = _startup_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(f"\n[{datetime.now().astimezone().isoformat(timespec='seconds')}] {stage}\n")
+            if detail:
+                stream.write(detail.rstrip() + "\n")
+        return path
+    except OSError:
+        return None
+
+
 def main() -> int:
     if "--self-check" in sys.argv:
         return self_check()
@@ -4305,20 +4326,44 @@ def main() -> int:
         print("此程序的公式重算与最终保存要求 Windows 版 WPS 表格 COM。请在 Windows 11 + WPS 表格环境运行。")
         print("当前执行环境不是 Windows；没有生成或验证 EXE。可运行 python main.py --self-check 和假数据单元测试。")
         return 2
+    root = None
+    stage = "导入 Tk 图形界面组件"
+    _write_startup_log("启动开始")
     try:
         import tkinter as tk
+        stage = "创建 Tk 主窗口"
         root = tk.Tk()
         root.withdraw()
+        _write_startup_log("主窗口已创建，开始授权检查")
+        stage = "显示授权窗口"
         from licensing import authorize_startup
         if not authorize_startup(root):
             root.destroy()
+            _write_startup_log("用户关闭授权窗口，程序退出")
             return 0
+        _write_startup_log("授权通过，开始构建主界面")
+        stage = "构建主界面"
         App(root)
         root.deiconify()
+        _write_startup_log("主界面已显示")
+        stage = "运行主界面消息循环"
         root.mainloop()
         return 0
     except Exception as exc:
-        print(f"启动失败：{exc}", file=sys.stderr)
+        detail = traceback.format_exc()
+        log_path = _write_startup_log(f"{stage}失败：{exc}", detail)
+        message = f"程序启动失败（{stage}）：\n{exc}"
+        if log_path is not None:
+            message += f"\n\n诊断日志：\n{log_path}"
+        try:
+            if root is not None:
+                root.deiconify()
+                root.lift()
+            from tkinter import messagebox
+            messagebox.showerror(APP_NAME, message, parent=root)
+        except Exception:
+            pass
+        print(message + "\n\n" + detail, file=sys.stderr)
         return 1
 
 

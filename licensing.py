@@ -298,8 +298,14 @@ def authorize_startup(root: Any) -> bool:
     dialog = tk.Toplevel(root)
     dialog.title("软件授权")
     dialog.resizable(False, False)
-    dialog.transient(root)
-    dialog.grab_set()
+    # The main root is intentionally withdrawn during startup. On Windows, a
+    # transient dialog owned by a hidden root can itself remain invisible.
+    # Only attach to the root when it is actually visible.
+    try:
+        if root.state() != "withdrawn":
+            dialog.transient(root)
+    except Exception:
+        pass
     result = {"authorized": False}
     machine_var = tk.StringVar(value=status.machine_code)
     token_var = tk.StringVar()
@@ -357,6 +363,10 @@ def authorize_startup(root: Any) -> bool:
     x = max(0, (dialog.winfo_screenwidth() - dialog.winfo_width()) // 2)
     y = max(0, (dialog.winfo_screenheight() - dialog.winfo_height()) // 2)
     dialog.geometry(f"+{x}+{y}")
+    dialog.deiconify()
+    dialog.wait_visibility()
+    dialog.lift()
+    dialog.grab_set()
     token_entry.focus_set()
     root.wait_window(dialog)
     return result["authorized"]

@@ -2,12 +2,13 @@
 
 面向 **Windows 11 + WPS 表格 + 无宏 XLSX** 的 GUI 工具。程序使用模板临时副本生成主结果，不覆盖模板或源文件。
 
-## 本次更新（v13）
+## 本次更新（v14）
 
 - 将 `TextToColumns`、`Deduplicate`、`FormatConvert` 在界面中的名称改为**文本分列、去重、格式转换**，并新增**区域筛选**。
 - 移除独立区域 XLSX 导出及其关联的 PNG 输出；文本预览/复制仍保留。
 - 文本分列、区域筛选、去重、格式转换的**每条规则均可选“源文件”或“目标工作簿”**。源文件规则只处理本次读取到的内存数据，不回写源 XLSX；目标工作簿规则处理输出模板。
 - 旧配置中的 `image_outputs`、`export_region_pngs`、`open_region_exports` 和 `image_output` 工作流模块会被忽略并移除，配置升级为 v9。
+- 修复 Windows 启动时授权窗口可能随隐藏主窗口一起不可见的问题；启动失败会弹出错误详情并写入 `%LOCALAPPDATA%\\WpsSheetAutomation\\logs\\startup.log`。
 
 ## 数据与模板设置
 
@@ -77,4 +78,4 @@
 
 ## Windows 构建
 
-main-only 包附带 `install_and_build.bat` 和 Inno Setup 脚本。Windows 上需要 Python 3.10+、WPS 表格和可选的 Inno Setup 6；运行构建脚本后会执行语法检查、自检、静态回归测试，并生成 PyInstaller 程序目录；检测到 Inno Setup 时还会生成 v13 安装器。当前代码在 Linux 上完成静态及合成工作簿测试；Windows/WPS COM 与 EXE 仍需在目标 Windows 环境验证。
+main-only 包附带 `install_and_build.bat` 和 Inno Setup 脚本。Windows 上需要 Python 3.10+、WPS 表格和可选的 Inno Setup 6；运行构建脚本后会执行语法检查、自检、静态回归测试，并生成 PyInstaller 程序目录；检测到 Inno Setup 时还会生成 v14 安装器。当前代码在 Linux 上完成静态及合成工作簿测试；Windows/WPS COM 与 EXE 仍需在目标 Windows 环境验证。

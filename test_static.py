@@ -281,6 +281,27 @@ class WindowsLaunchPackagingTests(unittest.TestCase):
         self.assertTrue("install_and_build.log" in launcher or "build_main.log" in launcher)
         self.assertNotRegex(launcher, r"(?m)^\s*python(?:\.exe)?\s")
 
+    def test_startup_authorization_dialog_is_visible_with_hidden_root(self):
+        licensing_source = (self.project_dir / "licensing.py").read_text(encoding="utf-8")
+        main_source = (self.project_dir / "main.py").read_text(encoding="utf-8")
+        self.assertIn('if root.state() != "withdrawn":', licensing_source)
+        self.assertNotIn("dialog.transient(root)\n    dialog.grab_set()", licensing_source)
+        self.assertLess(licensing_source.index("dialog.wait_visibility()"), licensing_source.index("dialog.grab_set()"))
+        self.assertIn('root.withdraw()', main_source)
+        self.assertIn('_write_startup_log("授权通过，开始构建主界面")', main_source)
+
+    def test_windowed_startup_failures_are_logged_and_shown(self):
+        main_source = (self.project_dir / "main.py").read_text(encoding="utf-8")
+        self.assertIn('"logs" / "startup.log"', main_source)
+        self.assertIn("messagebox.showerror(APP_NAME, message, parent=root)", main_source)
+        self.assertIn("traceback.format_exc()", main_source)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "logs" / "startup.log"
+            with mock.patch.object(main, "_startup_log_path", return_value=path):
+                self.assertEqual(path, main._write_startup_log("构建主界面失败", "诊断堆栈"))
+            self.assertIn("构建主界面失败", path.read_text(encoding="utf-8"))
+            self.assertIn("诊断堆栈", path.read_text(encoding="utf-8"))
+
     def test_missing_pywin32_guidance_identifies_wrong_interpreter_and_launcher(self):
         with mock.patch.object(main.sys, "executable", r"C:\Program Files\Python312\python.exe"):
             message = main._pywin32_import_error_message(ModuleNotFoundError("No module named 'pythoncom'"))
