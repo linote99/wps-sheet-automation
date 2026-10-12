@@ -21,7 +21,9 @@ MODULE_LABELS = {
     "source_copy": "多源数据复制",
     "formula_fill": "公式填充",
     "formula_recalc": "首次完整重算",
+    "result_mapping": "结果映射",
     "post_mapping": "后映射",
+    "CustomFormula": "区域公式填充",
     "TextToColumns": "文本分列",
     "RegionFilter": "区域筛选",
     "Deduplicate": "去重",
@@ -69,8 +71,11 @@ def validate_workflow(settings: dict[str, Any]) -> None:
         required.append(("pre_mapping", "配置了前映射规则"))
     if settings.get("post_mappings"):
         required.append(("post_mapping", "配置了后映射规则"))
-    operation_map = (("TextToColumns", "TextToColumns"), ("RegionFilter", "RegionFilter"),
-                     ("Deduplicate", "Deduplicate"), ("FormatConvert", "FormatConvert"))
+    if any(isinstance(job, dict) and job.get("mappings") for job in settings.get("jobs", [])):
+        required.append(("result_mapping", "配置了结果映射规则"))
+    operation_map = (("CustomFormula", "CustomFormula"), ("TextToColumns", "TextToColumns"),
+                     ("RegionFilter", "RegionFilter"), ("Deduplicate", "Deduplicate"),
+                     ("FormatConvert", "FormatConvert"))
     for key, module_id in operation_map:
         operation = settings.get(key, {})
         if isinstance(operation, dict) and operation.get("enabled", False):
@@ -90,15 +95,22 @@ def validate_workflow(settings: dict[str, Any]) -> None:
     edges.extend((
         ("template_cleanup", "pre_mapping", "前映射需在模板旧内容清理后应用"),
         ("pre_mapping", "source_copy", "前映射必须在主源数据复制前完成"),
+        ("formula_recalc", "result_mapping", "结果映射必须读取首次完整重算后的公式结果"),
+        ("result_mapping", "post_mapping", "后映射应在结果映射之后执行"),
+        ("result_mapping", "final_recalc_save", "结果映射必须在最终重算和保存前完成"),
         ("formula_recalc", "post_mapping", "后映射必须在首次完整重算后应用"),
         ("post_mapping", "final_recalc_save", "后映射必须在最终重算和保存前完成"),
     ))
-    region_modules = ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert")
+    region_modules = ("CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert")
     for module_id in region_modules:
         edges.append(("formula_recalc", module_id, f"{MODULE_LABELS[module_id]}必须在首次完整重算后执行"))
         edges.append((module_id, "final_recalc_save", f"{MODULE_LABELS[module_id]}必须在最终重算和保存之前执行"))
+        if "result_mapping" in positions:
+            edges.append(("result_mapping", module_id, f"{MODULE_LABELS[module_id]}必须在结果映射之后执行"))
         if "post_mapping" in positions:
             edges.append(("post_mapping", module_id, f"{MODULE_LABELS[module_id]}必须在后映射之后执行"))
+    for module_id in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
+        edges.append(("CustomFormula", module_id, f"{MODULE_LABELS[module_id]}必须在区域公式填充后执行"))
     for before, after, reason in edges:
         if before in positions and after in positions and positions[before] >= positions[after]:
             raise ValueError(f"工作流顺序无效：“{MODULE_LABELS[before]}”必须位于“{MODULE_LABELS[after]}”之前；{reason}。")

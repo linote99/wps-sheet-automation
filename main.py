@@ -50,7 +50,7 @@ def _window_size_path() -> Path:
 
 
 WINDOW_SIZE_PATH = _window_size_path()
-CONFIG_VERSION = 11
+CONFIG_VERSION = 13
 LEGACY_FORMULA_ROW_KEYS = ("formula_seed_row", "formula_template_row", "formula_row", "seed_row")
 MAX_PROCESSING_CELLS = 500_000
 MAX_REGION_XLSX_CELLS = 100_000
@@ -79,6 +79,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "post_mappings": [],
     "image_outputs": [],
     "text_outputs": [],
+    "CustomFormula": {"enabled": False, "rules": []},
     "TextToColumns": {"enabled": False, "rules": []},
     "Deduplicate": {"enabled": False, "rules": []},
     "FormatConvert": {"enabled": False, "rules": []},
@@ -86,11 +87,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Kept for migration of first-version configurations.
     "source_start_row": 2,
     "jobs": [
-        {"template_sheet": "1当天派单", "header_rows": 2, "start_row": 3, "formula_range": "EB:EN",
+        {"template_sheet": "1当天派单", "header_rows": 2, "start_row": 3, "formula_range": "EB:EN", "mappings": [],
          "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None, "_optional_placeholder": True}]},
-        {"template_sheet": "2当天归档", "header_rows": 2, "start_row": 3, "formula_range": "EB:EU",
+        {"template_sheet": "2当天归档", "header_rows": 2, "start_row": 3, "formula_range": "EB:EU", "mappings": [],
          "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None, "_optional_placeholder": True}]},
-        {"template_sheet": "3装移全业务在途", "header_rows": 3, "start_row": 4, "formula_range": "EB:FV",
+        {"template_sheet": "3装移全业务在途", "header_rows": 3, "start_row": 4, "formula_range": "EB:FV", "mappings": [],
          "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None, "_optional_placeholder": True}]},
     ],
 }
@@ -237,16 +238,12 @@ def configuration_migration_notes(raw: Any) -> list[str]:
         )
     if version < 11:
         notes.append("配置已升级到 v11：源文件规则先在临时副本中由 WPS 执行；目标表可不关联源文件并直接保留模板内容处理。可选保留的源副本会写入输出目录，原件不变。")
+    if version < 12:
+        notes.append("配置已升级到 v12：新增 WPS 公式填充规则，支持输入自定义公式或从指定单元格取公式，并按相对引用填充所选范围；规则可用于源文件临时副本或模板工作簿。")
+    if version < 13:
+        notes.append("配置已升级到 v13：结果映射已恢复为可选步骤，与后映射分别保留；旧配置中的结果列设置会迁移为结果映射规则。")
     if "open_region_exports" in raw:
         notes.append("旧版自动打开区域 XLSX 的选项已停用；区域 XLSX 将输出到所选目录，不再自动打开。")
-    legacy_workflow = raw.get("workflow", [])
-    if not isinstance(legacy_workflow, list):
-        legacy_workflow = []
-    if "result_mapping" in legacy_workflow or any(
-        isinstance(job, dict) and any(key in job for key in ("mappings", "result_col", "target_col"))
-        for job in jobs
-    ):
-        notes.append("公式结果列映射已取消；旧配置中的结果列映射规则会被移除。前映射和后映射保留。")
     for index, job in enumerate(jobs, 1):
         if not isinstance(job, dict):
             continue
@@ -277,6 +274,13 @@ def _validate_sheet_name(value: Any, label: str) -> str:
 def _parse_area(value: Any, label: str) -> tuple[int, int, int, int]:
     """Parse one worksheet-local A1 rectangle as (min_col, min_row, max_col, max_row)."""
     text = str(value or "").strip().upper()
+    column_range = re.fullmatch(r"\$?([A-Z]{1,3})(?::\$?([A-Z]{1,3}))?", text)
+    if column_range:
+        min_col = column_number(column_range.group(1))
+        max_col = column_number(column_range.group(2) or column_range.group(1))
+        if min_col > max_col:
+            raise ProcessingError(f"{label}区域“{text}”的起点不能在终点之后。")
+        return min_col, 1, max_col, 1_048_576
     if not re.fullmatch(r"\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}(?::\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6})?", text):
         raise ProcessingError(f"{label}区域“{text or '(空)'}”无效；请填写 A1 或 A1:C10 这样的单一单元格区域。")
     try:
@@ -297,6 +301,13 @@ def _parse_selection_details(value: Any, label: str = "区域") -> tuple[tuple[i
     """Parse the shared UI/JSON selector, normalizing reversed endpoint rectangles."""
     text = str(value or "").strip().upper()
     coordinate = r"\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}"
+    column_range = re.fullmatch(r"\$?([A-Z]{1,3})(?::\$?([A-Z]{1,3}))?", text)
+    if column_range:
+        min_col = column_number(column_range.group(1))
+        max_col = column_number(column_range.group(2) or column_range.group(1))
+        if min_col > max_col:
+            raise ProcessingError(f"{label}区域“{text}”的起点不能在终点之后。")
+        return (min_col, 1, max_col, 1_048_576), "column"
 
     def point(token: str) -> tuple[int, int]:
         token = token.strip().upper()
@@ -388,7 +399,7 @@ def _resolve_com_selection_bounds(worksheet, bounds: tuple[int, int, int, int],
         return used_min_col, used_min_row, used_max_col, used_max_row
     if selection_kind == "row":
         return used_min_col, bounds[1], used_max_col, bounds[1]
-    return bounds[0], 1, bounds[0], used_max_row
+    return bounds[0], 1, bounds[2], used_max_row
 
 
 def _area_cell_count(bounds: tuple[int, int, int, int]) -> int:
@@ -418,9 +429,17 @@ def _check_region_xlsx_area_size(bounds: tuple[int, int, int, int], label: str) 
 
 def _area_address(bounds: tuple[int, int, int, int]) -> str:
     min_col, min_row, max_col, max_row = bounds
+    if min_row == 1 and max_row == 1_048_576:
+        first_col = get_column_letter(min_col)
+        last_col = get_column_letter(max_col)
+        return f"{first_col}:{last_col}"
     first = f"{get_column_letter(min_col)}{min_row}"
     last = f"{get_column_letter(max_col)}{max_row}"
     return first if first == last else f"{first}:{last}"
+
+
+def _is_full_column_area(bounds: tuple[int, int, int, int]) -> bool:
+    return bounds[1] == 1 and bounds[3] == 1_048_576
 
 
 def _expand_bounds_for_merged_cells(worksheet, bounds: tuple[int, int, int, int],
@@ -487,9 +506,6 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
             src_path = old_sources[idx] if idx < len(old_sources) else ""
             job["sources"] = [{"path": src_path, "source_sheet": job.pop("source_sheet", ""),
                                "copy_start_row": global_start, "copy_end_row": None}]
-            job.pop("result_col", None)
-            job.pop("target_col", None)
-            job.pop("mappings", None)
             migrated.append(job)
         raw_jobs = migrated
     normalized_jobs = []
@@ -500,8 +516,17 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
         job = deepcopy(original)
         for legacy_key in LEGACY_FORMULA_ROW_KEYS:
             job.pop(legacy_key, None)
-        for removed_key in ("mappings", "result_col", "target_col"):
-            job.pop(removed_key, None)
+        legacy_result_col = job.pop("result_col", "")
+        legacy_target_col = job.pop("target_col", "")
+        mappings = job.get("mappings")
+        if mappings is None:
+            mappings = []
+            if str(legacy_result_col or "").strip() or str(legacy_target_col or "").strip():
+                mappings.append({"result_col": legacy_result_col, "target_col": legacy_target_col,
+                                 "write_as": "value"})
+        elif isinstance(mappings, list):
+            mappings = [dict(mapping) if isinstance(mapping, dict) else mapping for mapping in mappings]
+        job["mappings"] = mappings
         source_items = job.get("sources", [])
         if isinstance(source_items, list):
             converted = []
@@ -529,7 +554,7 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
             settings[key] = []
     settings["export_region_pngs"] = bool(settings.get("export_region_pngs", False))
     settings["retain_edited_sources"] = bool(settings.get("retain_edited_sources", False))
-    for key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
+    for key in ("CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
         operation = settings.get(key)
         if operation is None:
             settings[key] = {"enabled": False, "rules": []}
@@ -540,9 +565,21 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
         settings["workflow"] = list(DEFAULT_WORKFLOW)
     if not isinstance(settings.get("workflow"), list):
         raise ProcessingError("配置中的 workflow 必须是模块 ID 数组。")
-    settings["workflow"] = [module_id for module_id in settings["workflow"] if module_id != "result_mapping"]
+    try:
+        source_config_version = int(raw.get("config_version", 1))
+    except (TypeError, ValueError):
+        source_config_version = 1
+    if source_config_version < 13 and "result_mapping" not in settings["workflow"]:
+        insert_at = settings["workflow"].index("formula_recalc") + 1 if "formula_recalc" in settings["workflow"] else len(settings["workflow"])
+        settings["workflow"].insert(insert_at, "result_mapping")
     if "source_preprocess" not in settings["workflow"]:
         settings["workflow"].insert(0, "source_preprocess")
+    if "CustomFormula" not in settings["workflow"]:
+        insertion_candidates = [settings["workflow"].index(module_id) for module_id in
+                                ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert",
+                                 "final_recalc_save", "image_output", "text_output")
+                                if module_id in settings["workflow"]]
+        settings["workflow"].insert(min(insertion_candidates, default=len(settings["workflow"])), "CustomFormula")
     if settings["image_outputs"] and "image_output" not in settings["workflow"]:
         settings["workflow"].append("image_output")
     try:
@@ -603,6 +640,28 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
         if start_row <= header_rows:
             raise ProcessingError(f"第 {idx} 项目标起始行必须大于保留标题行数。")
         formula_range = parse_column_range(job["formula_range"])
+        mappings = job.get("mappings", [])
+        if not isinstance(mappings, list):
+            raise ProcessingError(f"第 {idx} 个目标表的 mappings 必须是结果映射规则数组。")
+        mapped_targets: dict[int, int] = {}
+        for map_idx, mapping in enumerate(mappings, 1):
+            if not isinstance(mapping, dict):
+                raise ProcessingError(f"第 {idx} 个目标表的第 {map_idx} 条结果映射必须是对象。")
+            try:
+                result_col = column_number(mapping.get("result_col", ""))
+                target_col = column_number(mapping.get("target_col", ""))
+            except ProcessingError as exc:
+                raise ProcessingError(f"第 {idx} 个目标表第 {map_idx} 条结果映射：{exc}") from exc
+            if not formula_range[0] <= result_col <= formula_range[1]:
+                raise ProcessingError(f"第 {idx} 个目标表结果列 {mapping['result_col']} 不在公式范围 {job['formula_range']} 内。")
+            if formula_range[0] <= target_col <= formula_range[1]:
+                raise ProcessingError(f"第 {idx} 个目标表第 {map_idx} 条结果映射的目标列 {mapping['target_col']} 位于公式范围 {job['formula_range']} 内；写回会覆盖必须保留的公式列。")
+            if target_col in mapped_targets:
+                raise ProcessingError(f"第 {idx} 个目标表第 {mapped_targets[target_col]} 条和第 {map_idx} 条结果映射都写入目标列 {mapping['target_col']}，会互相覆盖。")
+            mapped_targets[target_col] = map_idx
+            mode = str(mapping.get("write_as", "value")).strip().lower()
+            if mode not in ("value", "text"):
+                raise ProcessingError(f"第 {idx} 个目标表第 {map_idx} 条结果映射的写入类型只能是 value（值）或 text（文本）。")
         if copy_range is not None and ranges_overlap(copy_range, formula_range):
             raise ProcessingError(f"第 {idx} 项数据复制列范围与公式区域 {job['formula_range']} 重叠。")
         sources = job["sources"]
@@ -671,7 +730,7 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
         if selection_kind not in ("sheet", "row", "column"):
             _check_text_area_size(bounds, f"第 {output_idx} 项文本输出")
 
-    operation_labels = {"TextToColumns": "文本分列", "RegionFilter": "区域筛选",
+    operation_labels = {"CustomFormula": "公式填充", "TextToColumns": "文本分列", "RegionFilter": "区域筛选",
                         "Deduplicate": "去重", "FormatConvert": "格式转换"}
     for key, label in operation_labels.items():
         operation = settings.get(key)
@@ -736,6 +795,22 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
             elif key == "FormatConvert":
                 if str(rule.get("mode", "")).lower() not in ("text", "number", "date"):
                     raise ProcessingError(f"第 {idx} 条格式转换规则 mode 只能是 text、number 或 date。")
+            elif key == "CustomFormula":
+                formula_mode = str(rule.get("formula_mode", "custom")).strip().lower()
+                if formula_mode == "custom":
+                    formula = str(rule.get("formula", "")).strip()
+                    if not formula.startswith("="):
+                        raise ProcessingError(f"第 {idx} 条公式填充规则的自定义公式必须以 = 开头。")
+                    if len(formula) > 8_192:
+                        raise ProcessingError(f"第 {idx} 条公式填充规则超过 WPS/Excel 公式长度上限 8192 字符。")
+                    if _find_external_formula(formula):
+                        raise ProcessingError(f"第 {idx} 条公式填充规则包含外部工作簿引用或外部访问函数，已拒绝。")
+                elif formula_mode == "cell":
+                    seed_bounds = _parse_area(rule.get("seed_cell", ""), f"第 {idx} 条公式来源单元格")
+                    if seed_bounds[0] != seed_bounds[2] or seed_bounds[1] != seed_bounds[3]:
+                        raise ProcessingError(f"第 {idx} 条公式填充规则的公式来源必须是单个单元格，例如 B2。")
+                else:
+                    raise ProcessingError(f"第 {idx} 条公式填充规则的 formula_mode 只能是 custom 或 cell。")
 
     _validate_region_module_dependencies(settings)
 
@@ -1457,11 +1532,11 @@ def _apply_source_region_processing(raw_ws, val_ws, sheet_name: str, settings: d
             used_rules.add((operation_key, rule_idx - 1))
             if operation_key == "RegionFilter":
                 bounds, selection_kind = _parse_region_filter_area(rule["range"], f"第 {rule_idx} 条{label}")
-                if selection_kind == "column":
-                    last_row = used_last_row or _last_nonempty_source_row(raw_ws)[0] or 1
-                    bounds = (bounds[0], 1, bounds[2], last_row)
             else:
-                bounds = _parse_selected_area(rule["range"], f"第 {rule_idx} 条{label}")
+                bounds, selection_kind = _parse_selection_details(rule["range"], f"第 {rule_idx} 条{label}")
+            if selection_kind == "column":
+                last_row = used_last_row or _last_nonempty_source_row(raw_ws)[0] or 1
+                bounds = (bounds[0], 1, bounds[2], last_row)
             _check_processing_area_size(bounds, f"第 {rule_idx} 条{label}")
             raw_matrix, matrix = matrices(bounds)
             if operation_key == "TextToColumns":
@@ -1592,7 +1667,7 @@ def _validate_template_area_sheets(workbook, settings: dict[str, Any]) -> None:
         sheet_name = str(output["sheet"]).strip()
         if sheet_name not in workbook.sheetnames:
             raise ProcessingError(f"第 {idx} 项文本输出配置引用了模板中不存在的工作表“{sheet_name}”。")
-    for key, label in (("TextToColumns", "文本分列"), ("RegionFilter", "区域筛选"),
+    for key, label in (("CustomFormula", "公式填充"), ("TextToColumns", "文本分列"), ("RegionFilter", "区域筛选"),
                        ("Deduplicate", "去重"), ("FormatConvert", "格式转换")):
         for idx, rule in enumerate(settings.get(key, {}).get("rules", []), 1):
             if str(rule.get("scope", "target")).strip().lower() != "target":
@@ -1610,6 +1685,10 @@ def _capture_pre_mapping_values(workbook, settings: dict[str, Any]):
         bounds = _parse_area(rule["source_range"], f"第 {idx} 条前映射源")
         min_col, min_row, max_col, max_row = bounds
         worksheet = workbook[str(rule["source_sheet"]).strip()]
+        target_bounds = _parse_area(rule["target_range"], f"第 {idx} 条前映射目标")
+        if _is_full_column_area(bounds) and _is_full_column_area(target_bounds):
+            target_sheet = workbook[str(rule["target_sheet"]).strip()]
+            max_row = min(max_row, max(1, worksheet.max_row, target_sheet.max_row))
         values = [[worksheet.cell(row=row, column=col).value
                    for col in range(min_col, max_col + 1)]
                   for row in range(min_row, max_row + 1)]
@@ -1640,7 +1719,7 @@ def _apply_pre_mapping_values(workbook, captured, log: Callable[[str], None]) ->
 
 
 def _validate_pre_mapping_conflicts(settings: dict[str, Any], source_records: list[list[list[Any]]]) -> None:
-    """Reject pre-map targets that overlap any main-data/formula/post-map write area."""
+    """Reject pre-map targets that overlap main-data, formula, result-map or post-map writes."""
     copy_start = column_number(str(settings.get("copy_start_col", "A")).strip() or "A")
     copy_end_value = str(settings.get("copy_end_col", "")).strip()
     copy_end = column_number(copy_end_value) if copy_end_value else copy_start
@@ -1655,6 +1734,9 @@ def _validate_pre_mapping_conflicts(settings: dict[str, Any], source_records: li
             protected[sheet].append(("主数据复制", (copy_start, start_row, copy_end, end_row)))
             formula_start, formula_end = parse_column_range(job["formula_range"])
             protected[sheet].append(("公式填充", (formula_start, start_row, formula_end, end_row)))
+            for mapping in job.get("mappings", []):
+                col = column_number(mapping["target_col"])
+                protected[sheet].append(("结果映射", (col, start_row, col, end_row)))
     for rule in settings.get("post_mappings", []):
         bounds = _parse_area(rule["target_range"], "后映射目标")
         protected.setdefault(str(rule["target_sheet"]).strip(), []).append(("后映射", bounds))
@@ -1740,7 +1822,11 @@ def _create_staging_workbook_from_copy(template_path: Path, load_path: _Temporar
                         ws[target] = Translator(formula, origin=origin).translate_formula(target)
                     except Exception as exc:
                         raise ProcessingError(f"无法将模板公式 {job['template_sheet']}!{origin} 填充到 {target}：{exc}") from exc
-            formula_jobs.append((str(job["template_sheet"]).strip(), start_row, end_row, []))
+            mappings = [{"result_col": str(mapping["result_col"]).strip().upper(),
+                         "target_col": str(mapping["target_col"]).strip().upper(),
+                         "write_as": str(mapping.get("write_as", "value")).strip().lower()}
+                        for mapping in job.get("mappings", [])]
+            formula_jobs.append((str(job["template_sheet"]).strip(), start_row, end_row, mappings))
             log(f"已准备“{job['template_sheet']}”：按配置顺序追加 {len(records)} 行，填充第 {start_row} 至 {end_row} 行公式。")
         wb.save(staging_path)
         return formula_jobs
@@ -1763,6 +1849,18 @@ def _com_value_matrix(value, rows: int, cols: int) -> list[list[Any]]:
     if cols == 1:
         return [[row[0]] if isinstance(row, (tuple, list)) else [row] for row in value]
     return [list(row) for row in value]
+
+
+def _write_mapped_values(destination, values: list[Any], write_as: str) -> None:
+    """Write one column to a COM-like range; text mode forces string values and text format."""
+    mode = str(write_as).strip().lower()
+    if mode == "text":
+        values = [None if value is None else str(value) for value in values]
+        try:
+            destination.NumberFormat = "@"
+        except Exception:
+            pass
+    destination.Value2 = tuple((value,) for value in values)
 
 
 def _recalculate_and_wait(app, log: Callable[[str], None], phase: str) -> None:
@@ -1829,8 +1927,11 @@ def _excel_number_format(mode: str) -> str:
     return {"text": "@", "number": "0.###############", "date": "yyyy-mm-dd"}[mode]
 
 
-def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, log: Callable[[str], None]) -> bool:
+def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, log: Callable[[str], None],
+                             application=None) -> bool:
     formula_areas: dict[str, list[tuple[int, int, int, int]]] = {}
+    result_mapping_areas: dict[str, list[tuple[int, int, int, int]]] = {}
+    custom_formula_areas: dict[str, list[tuple[int, int, int, int]]] = {}
     formula_jobs_by_sheet = {item[0]: item[1:3] for item in formula_jobs}
     for job in settings.get("jobs", []):
         sheet_name = str(job["template_sheet"]).strip()
@@ -1841,8 +1942,14 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
                 formula_areas.setdefault(sheet_name, []).append((col_start, start_row, col_end, end_row))
         template_row = _formula_template_row(job)
         formula_areas.setdefault(sheet_name, []).append((1, template_row, 16_384, template_row))
+    for sheet_name, start_row, end_row, mappings in formula_jobs:
+        if end_row < start_row:
+            continue
+        for mapping in mappings:
+            col = column_number(mapping["target_col"])
+            result_mapping_areas.setdefault(sheet_name, []).append((col, start_row, col, end_row))
     applied_any = False
-    operation_labels = {"TextToColumns": "文本分列", "RegionFilter": "区域筛选",
+    operation_labels = {"CustomFormula": "公式填充", "TextToColumns": "文本分列", "RegionFilter": "区域筛选",
                         "Deduplicate": "去重", "FormatConvert": "格式转换"}
     configured_order = settings.get("workflow", DEFAULT_WORKFLOW)
     for operation_key in (module_id for module_id in configured_order if module_id in operation_labels):
@@ -1850,6 +1957,7 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
         operation = settings.get(operation_key, {"enabled": False, "rules": []})
         if not operation.get("enabled", False):
             continue
+        formula_fill_applied = False
         for rule_idx, rule in enumerate(operation.get("rules", []), 1):
             if str(rule.get("scope", "target")).strip().lower() != "target":
                 continue
@@ -1861,10 +1969,56 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
             worksheet = workbook.Worksheets(sheet_name)
             bounds = _resolve_com_selection_bounds(worksheet, bounds, selection_kind, f"第 {rule_idx} 条{label}")
             _check_processing_area_size(bounds, f"第 {rule_idx} 条{label}")
-            if any(_areas_overlap(bounds, protected) for protected in formula_areas.get(sheet_name, [])):
-                raise ProcessingError(f"第 {rule_idx} 条{label}规则区域 {sheet_name}!{_area_address(bounds)} 与本次填充的公式区域重叠；为避免删除保留公式，已停止。")
+            if any(_areas_overlap(bounds, protected) for protected in result_mapping_areas.get(sheet_name, [])):
+                raise ProcessingError(f"第 {rule_idx} 条{label}规则区域 {sheet_name}!{_area_address(bounds)} 与结果映射目标区域重叠；为避免覆盖映射结果，已停止。")
+            protected_areas = custom_formula_areas if operation_key == "CustomFormula" else formula_areas
+            if any(_areas_overlap(bounds, protected) for protected in protected_areas.get(sheet_name, [])):
+                raise ProcessingError(f"第 {rule_idx} 条{label}规则区域 {sheet_name}!{_area_address(bounds)} 与已配置的公式区域重叠；为避免覆盖其他公式规则，已停止。")
             source_range = worksheet.Range(_area_address(bounds))
-            if operation_key == "TextToColumns":
+            if operation_key == "CustomFormula":
+                try:
+                    merge_state = source_range.MergeCells
+                except Exception as exc:
+                    raise ProcessingError(f"无法检查第 {rule_idx} 条公式填充区域是否含合并单元格；为安全起见已停止。") from exc
+                if merge_state not in (False, 0):
+                    raise ProcessingError(f"第 {rule_idx} 条公式填充区域 {sheet_name}!{_area_address(bounds)} 含合并单元格或混合合并区域，不支持填充。")
+                formula_mode = str(rule.get("formula_mode", "custom")).strip().lower()
+                if formula_mode == "custom":
+                    formula = str(rule.get("formula", "")).strip()
+                    if not formula.startswith("=") or _find_external_formula(formula):
+                        raise ProcessingError(f"第 {rule_idx} 条自定义公式无效或包含外部访问；已拒绝填充。")
+                    top_left_address = f"{get_column_letter(bounds[0])}{bounds[1]}"
+                    top_left = worksheet.Range(top_left_address)
+                    try:
+                        top_left.Formula = formula
+                        formula_r1c1 = top_left.FormulaR1C1
+                    except Exception as exc:
+                        raise ProcessingError(f"WPS 无法将第 {rule_idx} 条自定义公式写入 {sheet_name}!{top_left_address}：{exc}") from exc
+                else:
+                    seed_address = str(rule.get("seed_cell", "")).strip().upper()
+                    seed_bounds = _parse_area(seed_address, f"第 {rule_idx} 条公式来源单元格")
+                    seed_range = worksheet.Range(_area_address(seed_bounds))
+                    try:
+                        seed_formula = seed_range.Formula
+                        formula_r1c1 = seed_range.FormulaR1C1
+                    except Exception as exc:
+                        raise ProcessingError(f"无法读取第 {rule_idx} 条公式来源单元格 {sheet_name}!{seed_address}：{exc}") from exc
+                    if not isinstance(seed_formula, str) or not seed_formula.startswith("="):
+                        raise ProcessingError(f"公式来源单元格 {sheet_name}!{seed_address} 不含公式。")
+                    if _find_external_formula(seed_formula):
+                        raise ProcessingError(f"公式来源单元格 {sheet_name}!{seed_address} 包含外部工作簿引用或外部访问函数，已拒绝。")
+                if not isinstance(formula_r1c1, str) or not formula_r1c1.startswith("="):
+                    raise ProcessingError(f"第 {rule_idx} 条公式填充规则无法取得有效的 WPS R1C1 公式。")
+                try:
+                    source_range.FormulaR1C1 = formula_r1c1
+                except Exception as exc:
+                    raise ProcessingError(f"WPS 无法将第 {rule_idx} 条公式按相对引用填充到 {sheet_name}!{_area_address(bounds)}：{exc}") from exc
+                custom_formula_areas.setdefault(sheet_name, []).append(bounds)
+                formula_areas.setdefault(sheet_name, []).append(bounds)
+                mode_label = "自定义公式" if formula_mode == "custom" else f"来源单元格 {rule['seed_cell']}"
+                log(f"已执行公式填充规则 {rule_idx}：{sheet_name}!{_area_address(bounds)}，使用{mode_label}并按相对引用向下/向右填充。")
+                formula_fill_applied = True
+            elif operation_key == "TextToColumns":
                 values_matrix = _read_com_area(source_range, bounds)
                 values = [row[0] for row in values_matrix]
                 formats = [str(value).lower() for value in rule.get("column_formats", ["text"])]
@@ -1916,6 +2070,10 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
                 source_range.NumberFormat = _excel_number_format(mode)
                 log(f"已执行格式转换规则 {rule_idx}：{sheet_name}!{_area_address(bounds)} → {mode}。")
             applied_any = True
+        if formula_fill_applied:
+            if application is None:
+                raise ProcessingError("区域公式填充需要 WPS 应用程序执行完整重算；已停止。")
+            _recalculate_and_wait(application, log, "区域公式填充后")
     return applied_any
 
 
@@ -1957,6 +2115,75 @@ def _connect_wps(log: Callable[[str], None]):
                           "本程序不会改用 Microsoft Excel，也不会在连接失败后留下最终输出文件。\n\n连接错误详情：\n" + "\n".join(failures))
 
 
+def _configured_job_data_ranges(jobs: list[dict[str, Any]], source_records=None, formula_jobs=None):
+    """Map configured template sheets to the rows containing this run's data."""
+    formula_ranges = {
+        str(sheet).strip(): (int(start_row), int(end_row))
+        for sheet, start_row, end_row, _formulas in (formula_jobs or [])
+    }
+    data_ranges = {}
+    for index, job in enumerate(jobs):
+        sheet = str(job["template_sheet"]).strip()
+        if source_records is not None:
+            records = source_records[index] if index < len(source_records) else []
+            start_row = int(job["start_row"])
+            data_ranges[sheet] = (start_row, start_row + len(records) - 1) if records else None
+        else:
+            data_ranges[sheet] = formula_ranges.get(sheet)
+    return data_ranges
+
+
+def _resolve_post_mapping_areas(rule: dict[str, Any], job_data_ranges: dict[str, tuple[int, int] | None],
+                                index: int) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]] | None:
+    """Resolve whole-column post mappings to the applicable data rows when jobs define them."""
+    source_bounds = _parse_area(rule["source_range"], f"第 {index} 条后映射源")
+    target_bounds = _parse_area(rule["target_range"], f"第 {index} 条后映射目标")
+    source_sheet = str(rule["source_sheet"]).strip()
+    target_sheet = str(rule["target_sheet"]).strip()
+    source_is_column = _is_full_column_area(source_bounds)
+    target_is_column = _is_full_column_area(target_bounds)
+    if not source_is_column and not target_is_column:
+        return source_bounds, target_bounds
+
+    source_known = source_sheet in job_data_ranges
+    target_known = target_sheet in job_data_ranges
+    source_rows = job_data_ranges.get(source_sheet)
+    target_rows = job_data_ranges.get(target_sheet)
+
+    # A configured target with no imported records has no applicable data rows.
+    if target_is_column and target_known and target_rows is None:
+        return None
+    if source_is_column and source_known and source_rows is None:
+        if target_is_column and target_known and target_rows is not None:
+            raise ProcessingError(f"第 {index} 条后映射源工作表“{source_sheet}”没有可映射数据行，但目标“{target_sheet}”有数据。")
+        return None
+
+    known_ranges = [rows for rows in (source_rows if source_is_column else None,
+                                      target_rows if target_is_column else None)
+                    if rows is not None]
+    if len(known_ranges) == 2:
+        source_count = source_rows[1] - source_rows[0] + 1
+        target_count = target_rows[1] - target_rows[0] + 1
+        if source_count != target_count:
+            raise ProcessingError(f"第 {index} 条后映射源/目标工作表的数据行数不一致，无法安全应用整列映射。")
+    if not known_ranges:
+        return source_bounds, target_bounds
+
+    fallback_rows = known_ranges[0]
+    if source_is_column:
+        rows = source_rows if source_rows is not None else fallback_rows
+        source_bounds = (source_bounds[0], rows[0], source_bounds[2], rows[1])
+    if target_is_column:
+        rows = target_rows if target_rows is not None else fallback_rows
+        target_bounds = (target_bounds[0], rows[0], target_bounds[2], rows[1])
+
+    source_shape = (source_bounds[2] - source_bounds[0], source_bounds[3] - source_bounds[1])
+    target_shape = (target_bounds[2] - target_bounds[0], target_bounds[3] - target_bounds[1])
+    if source_shape != target_shape:
+        raise ProcessingError(f"第 {index} 条后映射源/目标区域解析为实际数据行后行列数不一致。")
+    return source_bounds, target_bounds
+
+
 def _calculate_in_wps(staging_path: Path, formula_jobs: list[tuple[str, int, int, list[dict[str, str]]]],
                       log: Callable[[str], None], post_mappings: list[dict[str, Any]] | None = None,
                       region_processing: dict[str, Any] | None = None) -> None:
@@ -1980,30 +2207,65 @@ def _calculate_in_wps(staging_path: Path, formula_jobs: list[tuple[str, int, int
             raise ProcessingError(f"已连接 WPS（{progid}），但无法在禁用外部链接更新模式下打开中间工作簿：{exc}") from exc
         log("已在 WPS 中打开中间工作簿，开始完整重算公式。")
         _recalculate_and_wait(app, log, "映射前")
-        log("首次完整重算完成；将直接保留公式结果，并应用配置的后映射区域。")
+        log("首次完整重算完成；开始应用可选结果映射及配置的后映射区域。")
+        for sheet_name, start_row, end_row, mappings in formula_jobs:
+            if end_row < start_row:
+                continue
+            worksheet = workbook.Worksheets(sheet_name)
+            count = end_row - start_row + 1
+            for mapping in mappings:
+                result_col = str(mapping["result_col"]).strip().upper()
+                target_col = str(mapping["target_col"]).strip().upper()
+                source = worksheet.Range(f"{result_col}{start_row}:{result_col}{end_row}")
+                values = [row[0] for row in _com_value_matrix(source.Value2, count, 1)]
+                destination = worksheet.Range(f"{target_col}{start_row}:{target_col}{end_row}")
+                _write_mapped_values(destination, values, mapping.get("write_as", "value"))
+                mode = "文本" if str(mapping.get("write_as", "value")).lower() == "text" else "值"
+                log(f"已将 {sheet_name}!{result_col}{start_row}:{result_col}{end_row} 按{mode}写入 {target_col} 列。")
+        job_data_ranges = _configured_job_data_ranges((region_processing or {}).get("jobs", []),
+                                                      formula_jobs=formula_jobs)
         for idx, rule in enumerate(post_mappings or [], 1):
-            source_bounds = _parse_area(rule["source_range"], f"第 {idx} 条后映射源")
-            target_bounds = _parse_area(rule["target_range"], f"第 {idx} 条后映射目标")
+            resolved = _resolve_post_mapping_areas(rule, job_data_ranges, idx)
+            if resolved is None:
+                log(f"第 {idx} 条后映射没有对应的数据行，已跳过整列映射。")
+                continue
+            source_bounds, target_bounds = resolved
             rows = source_bounds[3] - source_bounds[1] + 1
             cols = source_bounds[2] - source_bounds[0] + 1
             source_address = _area_address(source_bounds)
             target_address = _area_address(target_bounds)
-            source_range = workbook.Worksheets(str(rule["source_sheet"]).strip()).Range(source_address)
-            source_values = _com_value_matrix(source_range.Value2, rows, cols)
-            target_range = workbook.Worksheets(str(rule["target_sheet"]).strip()).Range(target_address)
-            target_range.Value2 = tuple(tuple(row) for row in source_values)
+            source_sheet = workbook.Worksheets(str(rule["source_sheet"]).strip())
+            target_sheet = workbook.Worksheets(str(rule["target_sheet"]).strip())
+            if _is_full_column_area(source_bounds):
+                chunk_rows = max(1, 50_000 // cols)
+                for first_row in range(source_bounds[1], source_bounds[3] + 1, chunk_rows):
+                    last_row = min(source_bounds[3], first_row + chunk_rows - 1)
+                    chunk_bounds = (source_bounds[0], first_row, source_bounds[2], last_row)
+                    chunk_rows_count = last_row - first_row + 1
+                    source_range = source_sheet.Range(_area_address(chunk_bounds))
+                    source_values = _com_value_matrix(source_range.Value2, chunk_rows_count, cols)
+                    target_range = target_sheet.Range(_area_address(
+                        (target_bounds[0], first_row, target_bounds[2], last_row)
+                    ))
+                    target_range.Value2 = tuple(tuple(row) for row in source_values)
+            else:
+                source_range = source_sheet.Range(source_address)
+                source_values = _com_value_matrix(source_range.Value2, rows, cols)
+                target_range = target_sheet.Range(target_address)
+                target_range.Value2 = tuple(tuple(row) for row in source_values)
             log(f"已应用后映射 {rule['source_sheet']}!{source_address} → {rule['target_sheet']}!{target_address}。")
 
         step_settings = dict(region_processing or {})
+        step_settings.setdefault("CustomFormula", {"enabled": False, "rules": []})
         step_settings.setdefault("TextToColumns", {"enabled": False, "rules": []})
         step_settings.setdefault("Deduplicate", {"enabled": False, "rules": []})
         step_settings.setdefault("FormatConvert", {"enabled": False, "rules": []})
         step_settings.setdefault("RegionFilter", {"enabled": False, "rules": []})
         step_settings.setdefault("workflow", list(DEFAULT_WORKFLOW))
-        applied_steps = _apply_region_processing(workbook, step_settings, formula_jobs, log)
+        applied_steps = _apply_region_processing(workbook, step_settings, formula_jobs, log, application=app)
 
-        # Rebuild once after all post-mapping and region-processing writes so dependent formulas are current.
-        recalc_phase = "后映射及区域处理后" if applied_steps else "后映射写入后"
+        # Rebuild once after all result/post-mapping and region-processing writes so dependent formulas are current.
+        recalc_phase = "结果映射、后映射及区域处理后" if applied_steps else "结果映射/后映射写入后"
         _recalculate_and_wait(app, log, recalc_phase)
         workbook.Save()
         log("WPS 已完成处理、第二次完整重算并保存工作簿；接下来只读取已配置的文本预览，不再改动工作簿。")
@@ -2031,6 +2293,8 @@ def _calculate_in_wps(staging_path: Path, formula_jobs: list[tuple[str, int, int
 
 def _validate_post_mapping_conflicts(settings: dict[str, Any], source_records: list[list[list[Any]]]) -> None:
     formula_areas: dict[str, list[tuple[int, int, int, int]]] = {}
+    result_mapping_areas: dict[str, list[tuple[int, int, int, int]]] = {}
+    job_data_ranges = _configured_job_data_ranges(settings["jobs"], source_records=source_records)
     for job, records in zip(settings["jobs"], source_records):
         sheet = str(job["template_sheet"]).strip()
         start_row = int(job["start_row"])
@@ -2040,13 +2304,22 @@ def _validate_post_mapping_conflicts(settings: dict[str, Any], source_records: l
             end_row = start_row + len(records) - 1
             c1, c2 = parse_column_range(job["formula_range"])
             formula_areas[sheet].append((c1, start_row, c2, end_row))
+            for mapping in job.get("mappings", []):
+                col = column_number(mapping["target_col"])
+                result_mapping_areas.setdefault(sheet, []).append((col, start_row, col, end_row))
 
     for idx, rule in enumerate(settings.get("post_mappings", []), 1):
         sheet = str(rule["target_sheet"]).strip()
-        target = _parse_area(rule["target_range"], f"第 {idx} 条后映射目标")
+        resolved = _resolve_post_mapping_areas(rule, job_data_ranges, idx)
+        if resolved is None:
+            continue
+        _source, target = resolved
         for protected in formula_areas.get(sheet, []):
             if _areas_overlap(target, protected):
                 raise ProcessingError(f"第 {idx} 条后映射目标 {sheet}!{_area_address(target)} 会覆盖保留公式区域 {_area_address(protected)}；已停止处理。")
+        for protected in result_mapping_areas.get(sheet, []):
+            if _areas_overlap(target, protected):
+                raise ProcessingError(f"第 {idx} 条后映射目标 {sheet}!{_area_address(target)} 与结果映射目标 {_area_address(protected)} 重复；已停止处理。")
 
 
 def _sanitize_filename_fragment(value: str) -> str:
@@ -2100,7 +2373,7 @@ def _source_rules_for_sheets(settings: dict[str, Any], sheet_names: set[str]):
     source_settings["jobs"] = []
     used_rules: set[tuple[str, int]] = set()
     any_rules = False
-    for operation_key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
+    for operation_key in ("CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
         operation = settings.get(operation_key, {})
         selected = []
         if operation.get("enabled", False):
@@ -2127,7 +2400,7 @@ def _read_source_records_with_rules(path: Path, sheet_name: str, start_row: int,
         operation.get("enabled", False) and any(
             str(rule.get("scope", "target")).strip().lower() == "source"
             for rule in operation.get("rules", []))
-        for operation in (settings.get(key, {}) for key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"))
+        for operation in (settings.get(key, {}) for key in ("CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"))
     )
     if not any_source_rules:
         return _read_source_records(path, sheet_name, start_row, col_start, col_end, log,
@@ -2157,11 +2430,15 @@ def _read_source_records_with_rules(path: Path, sheet_name: str, start_row: int,
                 except Exception:
                     pass
             try:
+                app.Calculation = -4105
+            except Exception:
+                pass
+            try:
                 workbook = app.Workbooks.Open(str(safe_copy.path), UpdateLinks=0, ReadOnly=False, AddToMru=False)
             except Exception as exc:
                 raise ProcessingError(f"已连接 WPS（{progid}），但无法打开源工作簿处理副本“{path.name}”：{exc}") from exc
             log(f"先在 WPS 临时副本中按规则处理源工作簿 {path.name}；原文件不修改。")
-            _apply_region_processing(workbook, source_settings, [], log)
+            _apply_region_processing(workbook, source_settings, [], log, application=app)
             workbook.Save()
         except ProcessingError:
             raise
@@ -2218,7 +2495,7 @@ def _resolve_selected_output_bounds(worksheet, selected_bounds: tuple[int, int, 
     if selection_kind == "row":
         return 1, min_row, used_cols, min_row
     if selection_kind == "column":
-        return min_col, 1, min_col, used_rows
+        return min_col, 1, max_col, used_rows
     return selected_bounds
 
 
@@ -3095,7 +3372,7 @@ def _read_text_output_areas_loaded(workbook, text_outputs: list[dict[str, Any]])
             elif selection_kind == "row":
                 bounds = (1, min_row, used_cols, min_row)
             elif selection_kind == "column":
-                bounds = (min_col, 1, min_col, used_rows)
+                bounds = (min_col, 1, max_col, used_rows)
             else:
                 bounds = selected_bounds
             _check_text_area_size(bounds, f"第 {index} 项文本输出（实际范围 {_area_address(bounds)}）")
@@ -3161,7 +3438,7 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
             )
             job_records.extend(records)
         all_records.append(job_records)
-    for operation_key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
+    for operation_key in ("CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
         operation = settings.get(operation_key, {})
         if not operation.get("enabled", False):
             continue
@@ -3483,8 +3760,8 @@ class App:
         actions.grid(row=0, column=0, sticky="ew")
         ttk.Button(actions, text="添加目标表", command=self._add_job).pack(side="left", padx=3)
         ttk.Button(actions, text="删除目标表", command=self._delete_job).pack(side="left", padx=3)
-        self.job_tree = ttk.Treeview(target_box, columns=("sheet", "start", "formula", "sources"), show="headings", height=4, selectmode="browse")
-        for col, title, width in (("sheet", "模板子表", 230), ("start", "粘贴起始行", 90), ("formula", "公式列范围", 120), ("sources", "源文件数（按顺序）", 140)):
+        self.job_tree = ttk.Treeview(target_box, columns=("sheet", "start", "formula", "sources", "mappings"), show="headings", height=4, selectmode="browse")
+        for col, title, width in (("sheet", "模板子表", 230), ("start", "粘贴起始行", 90), ("formula", "公式列范围", 120), ("sources", "源文件数（按顺序）", 140), ("mappings", "结果映射（可选）", 220)):
             self.job_tree.heading(col, text=title)
             self.job_tree.column(col, width=width, anchor="w")
         self.job_tree.grid(row=1, column=0, sticky="nsew", padx=3, pady=4)
@@ -3515,9 +3792,21 @@ class App:
         source_buttons.grid(row=2, column=0, columnspan=2, sticky="w", padx=3)
         for label, command in (("添加源文件…", self._add_source), ("编辑…", self._edit_source), ("删除", self._delete_source), ("上移", lambda: self._move_source(-1)), ("下移", lambda: self._move_source(1))):
             ttk.Button(source_buttons, text=label, command=command).pack(side="left", padx=2)
+        self.mapping_tree = ttk.Treeview(editor, columns=("result", "target", "mode"), show="headings", height=3, selectmode="browse")
+        for col, title, width in (("result", "公式结果列", 140), ("target", "写入目标列", 140), ("mode", "写入类型", 100)):
+            self.mapping_tree.heading(col, text=title)
+            self.mapping_tree.column(col, width=width, anchor="w")
+        self.mapping_tree.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=3, pady=(4, 2))
+        mapping_buttons = ttk.Frame(editor)
+        mapping_buttons.grid(row=4, column=0, columnspan=2, sticky="w", padx=3)
+        for label, command in (("添加结果映射", lambda: self._manage_job_mapping("add")),
+                               ("编辑映射…", lambda: self._manage_job_mapping("edit")),
+                               ("删除映射", lambda: self._manage_job_mapping("delete"))):
+            ttk.Button(mapping_buttons, text=label, command=command).pack(side="left", padx=2)
         editor.rowconfigure(1, weight=1)
-        note = "可只处理模板，无需添加源文件；无源目标子表会保留模板原内容。若配置源文件，先在 WPS 临时副本中执行源范围规则并读取处理结果，再填充或编辑模板。勾选“保留源文件处理结果”会将处理副本另存到输出目录，原件不修改。"
-        ttk.Label(editor, text=note, foreground="#4b5563", wraplength=1180, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 0))
+        editor.rowconfigure(3, weight=1)
+        note = "结果映射可留空；配置后在首次完整重算后，将所选公式结果列按值/文本写入目标列，随后仍可单独执行后映射。目标列须在公式范围之外。\n可只处理模板，无需添加源文件；无源目标子表会保留模板原内容。源文件规则先在 WPS 临时副本中处理，原件不修改。"
+        ttk.Label(editor, text=note, foreground="#4b5563", wraplength=1180, justify="left").grid(row=5, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 0))
 
         area_box = ttk.LabelFrame(outer, text="模板内部前/后映射、区域处理及文本输出", padding=5)
         area_box.grid(row=3, column=0, sticky="nsew", pady=(7, 0))
@@ -3534,6 +3823,8 @@ class App:
         self.post_mapping_tree = self._create_area_tab(area_tabs, "后映射", "post_mappings",
             (("source_sheet", "源工作表", 180), ("source_range", "源范围", 110), ("target_sheet", "目标工作表", 180), ("target_range", "目标范围", 110)))
         rule_columns = (("scope", "处理对象", 110), ("sheet", "工作表", 150), ("range", "处理范围", 120))
+        self.custom_formula_tree = self._create_operation_tab(area_tabs, "公式填充", "CustomFormula",
+            rule_columns + (("formula_mode", "公式来源", 120), ("formula", "自定义公式", 260), ("seed_cell", "来源单元格", 100)))
         self.text_to_columns_tree = self._create_operation_tab(area_tabs, "文本分列", "TextToColumns",
             rule_columns + (("delimiter", "分隔符", 80), ("output_start_col", "输出起始列", 90), ("column_formats", "结果列格式", 190)))
         self.region_filter_tree = self._create_operation_tab(area_tabs, "区域筛选", "RegionFilter",
@@ -3543,8 +3834,8 @@ class App:
         self.format_convert_tree = self._create_operation_tab(area_tabs, "格式转换", "FormatConvert",
             rule_columns + (("mode", "目标类型", 100),))
         self.workflow_tree = self._create_workflow_tab(area_tabs)
-        selector_help = ("范围选择：A1=整张工作表，按 WPS UsedRange 裁剪；D1=整列，A5=整行，B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形。区域筛选另支持单填 A 表示 A 列、或小写 a1 表示 A1 单元格；也可填写 A1:F100。超过处理上限时会安全停止。"
-                         f"每条处理规则最多 {MAX_PROCESSING_CELLS:,} 格。筛选会在选定区域内保留匹配行并压缩该区域，表头可选择保留；源文件规则仅改变本次读取数据，不回写源文件。")
+        selector_help = ("结果映射与后映射是独立可选步骤：结果映射将公式计算结果写到指定列，后映射则复制任意区域。所有源/目标区域均可只填列字母（如 A、DG）表示整列，也可填 A:A 或 A:C；前/后映射源与目标区域的行列数必须一致。后映射在结果映射之后执行；目标整列后映射只写 start_row 至本轮数据末行，保留上一行公式模板；区域处理整列按已用范围裁剪。范围选择：A1=整张工作表，按 WPS UsedRange 裁剪；D1=整列，A5=整行，B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形；也可填写 A1:F100。公式填充支持输入自定义公式或从同表指定单元格取公式，按 WPS 相对引用填满范围；填充会替换所选范围的原有内容。"
+                         f"每条处理规则最多 {MAX_PROCESSING_CELLS:,} 格。源文件规则在临时副本中由 WPS 执行，模板规则作用于结果副本；原始源文件不回写。")
         ttk.Label(area_box, text=selector_help, foreground="#4b5563", wraplength=1180,
                   justify="left").grid(row=1, column=0, sticky="w", padx=4, pady=(4, 1))
         self.export_region_pngs_var = self.tk.BooleanVar(value=bool(self.settings.get("export_region_pngs", False)))
@@ -3595,7 +3886,7 @@ class App:
         notebook.add(page, text="模块工作流")
         page.columnconfigure(0, weight=1)
         page.rowconfigure(1, weight=1)
-        ttk.Label(page, text="添加模块并用上移/下移定制执行顺序。核心依赖不可颠倒；四类区域处理模块可互换。非法顺序会在保存或开始处理时给出具体原因。",
+        ttk.Label(page, text="添加模块并用上移/下移定制执行顺序。核心依赖不可颠倒；公式填充必须早于文本分列、筛选、去重和格式转换。非法顺序会在保存或开始处理时给出具体原因。",
                   wraplength=1080, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 5))
         self.workflow_tree = ttk.Treeview(page, columns=("label", "role"), show="headings", height=7, selectmode="browse")
         for column, title, width in (("label", "模块名称", 210), ("role", "配置/依赖说明", 600)):
@@ -3624,7 +3915,9 @@ class App:
             "source_copy": "按目标表及源文件列表追加数据",
             "formula_fill": "按复制数据行数填充公式",
             "formula_recalc": "首次完整重算并保留公式结果",
-            "post_mapping": "首次重算后执行模板内部写入",
+            "result_mapping": "可选：把指定公式列结果写入目标列",
+            "post_mapping": "可选：首次重算后逐行复制源区域的已计算值",
+            "CustomFormula": "按自定义公式或同表种子单元格，用 WPS R1C1 相对引用填满所选区域",
             "TextToColumns": "区域处理阶段；规则可指定源文件或目标工作簿",
             "RegionFilter": "按条件筛选指定区域并压缩匹配记录",
             "Deduplicate": "稳定去重并保留首次记录",
@@ -3740,6 +4033,7 @@ class App:
             for idx, rule in enumerate(self.settings.get(key, [])):
                 tree.insert("", "end", iid=str(idx), values=tuple(rule.get(column, "") for column in columns))
         operation_trees = (
+            ("CustomFormula", self.custom_formula_tree, ("scope", "sheet", "range", "formula_mode", "formula", "seed_cell")),
             ("TextToColumns", self.text_to_columns_tree, ("scope", "sheet", "range", "delimiter", "output_start_col", "column_formats")),
             ("RegionFilter", self.region_filter_tree, ("scope", "sheet", "range", "filter_column", "operator", "criteria", "has_header")),
             ("Deduplicate", self.deduplicate_tree, ("scope", "sheet", "range", "has_header", "key_mode", "key_columns")),
@@ -3756,6 +4050,8 @@ class App:
                     value = rule.get(column, "")
                     if column == "scope":
                         value = "源文件" if value == "source" else "目标工作簿"
+                    elif column == "formula_mode":
+                        value = {"custom": "自定义公式", "cell": "从单元格取公式"}.get(value, value)
                     elif column == "operator":
                         value = FILTER_OPERATOR_LABELS.get(value, value)
                     elif column == "has_header":
@@ -3841,11 +4137,18 @@ class App:
                 tree.selection_set(str(selected_index))
 
     def _operation_rule_dialog(self, key: str, existing: dict[str, Any] | None = None):
-        title = {"TextToColumns": "文本分列规则", "RegionFilter": "区域筛选规则",
+        title = {"CustomFormula": "公式填充规则", "TextToColumns": "文本分列规则", "RegionFilter": "区域筛选规则",
                  "Deduplicate": "去重规则", "FormatConvert": "格式转换规则"}[key]
         base_fields = (("scope", "处理对象", "scope"), ("sheet", "工作表名", "entry"))
-        if key == "TextToColumns":
-            fields = base_fields + (("range", "单列源范围", "entry"),
+        if key == "CustomFormula":
+            fields = base_fields + (("range", "填充范围（A 表示整列；A1 表示整表）", "entry"),
+                ("formula_mode", "公式来源", "formula_mode"),
+                ("formula", "自定义公式（以 = 开头）", "entry"),
+                ("seed_cell", "来源单元格（如 B2）", "entry"))
+            initial = {"scope": "target", "sheet": "", "range": "", "formula_mode": "custom",
+                       "formula": "", "seed_cell": ""}
+        elif key == "TextToColumns":
+            fields = base_fields + (("range", "单列源范围（如 A）", "entry"),
                 ("delimiter", r"分隔符（可填 \t / \n）", "entry"), ("output_start_col", "输出起始列", "entry"),
                 ("column_formats", "结果列格式（text/number/date，逗号分隔）", "entry"))
             initial = {"scope": "target", "sheet": "", "range": "", "delimiter": ",", "output_start_col": "A", "column_formats": ["text"]}
@@ -3855,11 +4158,11 @@ class App:
             initial = {"scope": "target", "sheet": "", "range": "", "has_header": True,
                        "filter_column": "A", "operator": "equals", "criteria": ""}
         elif key == "Deduplicate":
-            fields = base_fields + (("range", "整行/选列数据范围", "entry"), ("has_header", "表头", "header"),
+            fields = base_fields + (("range", "整行/选列数据范围（如 A）", "entry"), ("has_header", "表头", "header"),
                 ("key_mode", "判重方式", "keymode"), ("key_columns", "关键列（如 A,C）", "entry"))
             initial = {"scope": "target", "sheet": "", "range": "", "has_header": False, "key_mode": "row", "key_columns": []}
         else:
-            fields = base_fields + (("range", "转换范围", "entry"), ("mode", "目标类型", "mode"))
+            fields = base_fields + (("range", "转换范围（如 A 表示整列）", "entry"), ("mode", "目标类型", "mode"))
             initial = {"scope": "target", "sheet": "", "range": "", "mode": "text"}
         data = {**initial, **(existing or {})}
         dialog = self.tk.Toplevel(self.root)
@@ -3885,6 +4188,10 @@ class App:
                 mode_labels = {"text": "文本", "number": "数字", "date": "日期"}
                 variable = self.tk.StringVar(value=mode_labels.get(str(data.get(field, "text")), "文本"))
                 widget = self.ttk.Combobox(dialog, textvariable=variable, values=tuple(mode_labels.values()), state="readonly", width=28)
+            elif kind == "formula_mode":
+                formula_mode_labels = {"custom": "自定义公式", "cell": "从单元格取公式"}
+                variable = self.tk.StringVar(value=formula_mode_labels.get(str(data.get(field, "custom")), "自定义公式"))
+                widget = self.ttk.Combobox(dialog, textvariable=variable, values=tuple(formula_mode_labels.values()), state="readonly", width=28)
             else:
                 value = data.get(field, "")
                 if field in ("column_formats", "key_columns"):
@@ -3897,6 +4204,7 @@ class App:
         def accept():
             rule = {}
             mode_labels = {"文本": "text", "数字": "number", "日期": "date"}
+            formula_mode_ids = {"自定义公式": "custom", "从单元格取公式": "cell"}
             operator_ids = {label: operator for operator, label in FILTER_OPERATOR_LABELS.items()}
             for field, _label, _kind in fields:
                 value = variables[field].get().strip()
@@ -3910,6 +4218,8 @@ class App:
                     rule[field] = operator_ids.get(value, "equals")
                 elif field == "mode":
                     rule[field] = mode_labels.get(value, "text")
+                elif field == "formula_mode":
+                    rule[field] = formula_mode_ids.get(value, "custom")
                 elif field in ("column_formats", "key_columns"):
                     rule[field] = [part.strip().lower() if field == "column_formats" else part.strip().upper()
                                    for part in value.split(",") if part.strip()]
@@ -3969,7 +4279,9 @@ class App:
             self.job_tree.delete(item)
         for idx, job in enumerate(self.settings.get("jobs", [])):
             source_count = sum(bool(str(source.get("path") or "").strip()) for source in job.get("sources", []))
-            self.job_tree.insert("", "end", iid=str(idx), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), source_count))
+            mapping_summary = ", ".join(f"{item.get('result_col', '')}→{item.get('target_col', '')}({item.get('write_as', 'value')})"
+                                         for item in job.get("mappings", [])) or "（无）"
+            self.job_tree.insert("", "end", iid=str(idx), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), source_count, mapping_summary))
         if self.settings.get("jobs"):
             index = 0 if select_index is None else max(0, min(select_index, len(self.settings["jobs"]) - 1))
             self.job_tree.selection_set(str(index))
@@ -4027,6 +4339,96 @@ class App:
                 continue
             sheet_display = str(source.get("source_sheet") or "").strip() or "（首个工作表）"
             self.source_tree.insert("", "end", iid=str(src_idx), values=(source.get("path", ""), sheet_display, source.get("copy_start_row", ""), source.get("copy_end_row") or ""))
+        for item in self.mapping_tree.get_children():
+            self.mapping_tree.delete(item)
+        for map_idx, mapping in enumerate(job.get("mappings", [])):
+            mode = "文本" if str(mapping.get("write_as", "value")).lower() == "text" else "值"
+            self.mapping_tree.insert("", "end", iid=str(map_idx),
+                                     values=(mapping.get("result_col", ""), mapping.get("target_col", ""), mode))
+
+    def _mapping_dialog(self, job, existing=None, ignore_index=None):
+        dialog = self.tk.Toplevel(self.root)
+        dialog.title("结果映射规则")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        data = {"result_col": "", "target_col": "", "write_as": "value", **(existing or {})}
+        variables = {}
+        for row, (field, label) in enumerate((("result_col", "公式结果列（须在公式范围内）"),
+                                               ("target_col", "写入目标列（须在公式范围外）"))):
+            variables[field] = self.tk.StringVar(value=str(data.get(field, "")))
+            self.ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=5)
+            self.ttk.Entry(dialog, textvariable=variables[field], width=24).grid(row=row, column=1, sticky="w", padx=5, pady=5)
+        variables["write_as"] = self.tk.StringVar(value=str(data.get("write_as", "value")))
+        self.ttk.Label(dialog, text="写入方式").grid(row=2, column=0, sticky="w", padx=8, pady=5)
+        self.ttk.Combobox(dialog, textvariable=variables["write_as"], values=("value", "text"),
+                          state="readonly", width=20).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+        result = {"value": None}
+
+        def accept():
+            try:
+                mapping = {key: variable.get().strip() for key, variable in variables.items()}
+                result_col = column_number(mapping["result_col"])
+                target_col = column_number(mapping["target_col"])
+                formula_start, formula_end = parse_column_range(job["formula_range"])
+                if not formula_start <= result_col <= formula_end:
+                    raise ProcessingError(f"结果列 {mapping['result_col']} 必须位于公式范围 {job['formula_range']} 内。")
+                if formula_start <= target_col <= formula_end:
+                    raise ProcessingError(f"目标列 {mapping['target_col']} 不能位于公式范围 {job['formula_range']} 内。")
+                for map_idx, previous in enumerate(job.get("mappings", [])):
+                    if map_idx != ignore_index and column_number(previous["target_col"]) == target_col:
+                        raise ProcessingError(f"目标列 {mapping['target_col']} 已被此目标表的另一条结果映射占用。")
+                if mapping["write_as"] not in ("value", "text"):
+                    raise ProcessingError("写入方式只能是 value 或 text。")
+                mapping["result_col"] = get_column_letter(result_col)
+                mapping["target_col"] = get_column_letter(target_col)
+                trial = deepcopy(self.settings)
+                trial["jobs"][self.active_job_index]["mappings"] = list(job.get("mappings", []))
+                if ignore_index is None:
+                    trial["jobs"][self.active_job_index]["mappings"].append(mapping)
+                else:
+                    trial["jobs"][self.active_job_index]["mappings"][ignore_index] = mapping
+                if "result_mapping" not in trial.get("workflow", []):
+                    trial["workflow"] = add_workflow_module(trial["workflow"], "result_mapping")
+                validate_static_settings(trial)
+                result["value"] = mapping
+                dialog.destroy()
+            except (ProcessingError, ValueError) as exc:
+                self.messagebox.showerror(APP_NAME, str(exc), parent=dialog)
+
+        buttons = self.ttk.Frame(dialog)
+        buttons.grid(row=3, column=0, columnspan=2, pady=8)
+        self.ttk.Button(buttons, text="确定", command=accept).pack(side="left", padx=5)
+        self.ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="left", padx=5)
+        dialog.wait_window()
+        return result["value"]
+
+    def _manage_job_mapping(self, action):
+        job = self._selected_job()
+        if job is None:
+            return
+        mappings = job.setdefault("mappings", [])
+        selected = self.mapping_tree.selection()
+        if action in ("edit", "delete") and not selected:
+            return
+        mapping_index = int(selected[0]) if selected else None
+        if action == "delete":
+            del mappings[mapping_index]
+        else:
+            mapping = self._mapping_dialog(job, mappings[mapping_index] if mapping_index is not None else None, mapping_index)
+            if mapping is None:
+                return
+            if mapping_index is None:
+                mappings.append(mapping)
+                mapping_index = len(mappings) - 1
+            else:
+                mappings[mapping_index] = mapping
+            if "result_mapping" not in self.settings.get("workflow", []):
+                self.settings["workflow"] = add_workflow_module(self.settings["workflow"], "result_mapping")
+            self._render_workflow()
+        index = self._current_index()
+        self._render_jobs(index)
+        if action != "delete" and mapping_index is not None and mapping_index < len(mappings):
+            self.mapping_tree.selection_set(str(mapping_index))
 
     def _on_job_select(self, _event=None):
         if not self._commit_job_editor(show_errors=False):
@@ -4059,13 +4461,15 @@ class App:
             return
         job = self.settings["jobs"][index]
         source_count = sum(bool(str(source.get("path") or "").strip()) for source in job.get("sources", []))
-        self.job_tree.item(str(index), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), source_count))
+        mapping_summary = ", ".join(f"{item.get('result_col', '')}→{item.get('target_col', '')}({item.get('write_as', 'value')})"
+                                     for item in job.get("mappings", [])) or "（无）"
+        self.job_tree.item(str(index), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), source_count, mapping_summary))
 
     def _add_job(self):
         if not self._commit_job_editor():
             return
         self.settings["jobs"].append({"template_sheet": "新目标表", "header_rows": 0, "start_row": 2, "formula_range": "A:A",
-                                      "sources": []})
+                                      "mappings": [], "sources": []})
         self._render_jobs(len(self.settings["jobs"]) - 1)
 
     def _delete_job(self):
@@ -4210,7 +4614,7 @@ class App:
         settings["retain_edited_sources"] = bool(self.retain_edited_sources_var.get())
         for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs"):
             settings[key] = deepcopy(self.settings.get(key, []))
-        for key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
+        for key in ("CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
             operation = deepcopy(self.settings.get(key, {"enabled": False, "rules": []}))
             operation["enabled"] = bool(self.operation_enabled[key].get())
             settings[key] = operation
@@ -4479,7 +4883,7 @@ def self_check() -> int:
                            {"template_sheet": "三", "source_sheet": "源", "header_rows": 3, "start_row": 4, "formula_range": "EB:FV", "result_col": "FQ", "target_col": "DG"}]}
         if len(normalize_settings(legacy)["jobs"]) != 3:
             raise AssertionError("v1 配置迁移失败")
-        print(f"静态检查通过：v{CONFIG_VERSION} 默认配置有效；公式范围/映射、两阶段映射、四类区域处理配置、源/目标处理范围及旧区域导出配置迁移和首版配置迁移均通过。")
+        print(f"静态检查通过：v{CONFIG_VERSION} 默认配置有效；公式范围/映射、两阶段映射、区域公式填充和四类区域处理配置、源/目标处理范围及旧配置迁移均通过。")
         print("未连接 WPS COM；未读取真实业务文件；未验证 Windows GUI 或 EXE。")
         return 0
     except Exception as exc:

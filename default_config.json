@@ -1,5 +1,5 @@
 {
-  "config_version": 11,
+  "config_version": 13,
   "config_name": "",
   "template_prefix_length": 5,
   "workflow": [
@@ -9,7 +9,9 @@
     "source_copy",
     "formula_fill",
     "formula_recalc",
+    "result_mapping",
     "post_mapping",
+    "CustomFormula",
     "TextToColumns",
     "RegionFilter",
     "Deduplicate",
@@ -30,6 +32,10 @@
   "post_mappings": [],
   "image_outputs": [],
   "text_outputs": [],
+  "CustomFormula": {
+    "enabled": false,
+    "rules": []
+  },
   "TextToColumns": {
     "enabled": false,
     "rules": []
@@ -53,6 +59,7 @@
       "header_rows": 2,
       "start_row": 3,
       "formula_range": "EB:EN",
+      "mappings": [],
       "sources": []
     },
     {
@@ -60,6 +67,7 @@
       "header_rows": 2,
       "start_row": 3,
       "formula_range": "EB:EU",
+      "mappings": [],
       "sources": []
     },
     {
@@ -67,6 +75,7 @@
       "header_rows": 3,
       "start_row": 4,
       "formula_range": "EB:FV",
+      "mappings": [],
       "sources": []
     }
   ]

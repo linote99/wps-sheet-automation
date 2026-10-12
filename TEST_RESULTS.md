@@ -2,6 +2,23 @@
 
 日期：2026-10-07。验证环境：Linux，Python 3.12.3，openpyxl 3.1.5，cryptography 50.0.1。工作簿回归使用自动生成的虚构 XLSX；未读取或修改真实模板、源文件或业务输出。
 
+## v17 修订版：可选结果映射与 WPS 区域公式填充双模式
+
+在源码目录 `/workspace/wps_sheet_automation/` 验证：
+
+```bash
+python3 -m py_compile main.py wps_automation_workflow.py licensing.py keygen.py make_fake_data.py test_static.py test_licensing.py
+python3 -m json.tool default_config.json
+python3 main.py --self-check
+python3 -m unittest -q test_static.py test_licensing.py
+```
+
+编译、JSON 解析及 v13 静态自检通过；main-only 发布目录静态套件 **103 项通过、0 项失败**。新增覆盖结果映射/后映射并存与顺序、可选性、旧配置迁移、映射目标冲突保护和区域公式覆盖保护，以及既有自定义公式与种子单元格两种模式、WPS `FormulaR1C1` 写入与重算、源文件公式先在 WPS 临时副本中重算再读取等。
+
+main-only 发布目录 `/workspace/releases/split/WpsSheetAutomation_main_v17/` 已独立通过编译、JSON 解析、v13 自检及静态套件 **103 项通过、0 项失败**；结果映射可选、后映射可选且两者并存；Inno Setup 产品版本和安装器输出名仍为 v17。
+
+Fake WPS/COM 验证调用和数据流，不等同真实 WPS 函数兼容性测试；当前 Linux 环境未运行 Windows GUI、WPS COM 或 EXE，仍需在目标 Windows + WPS 环境验收公式输入语法、函数计算和相对引用结果。
+
 ## v16：模板独立编辑、WPS 源副本处理与区域输出
 
 在源码目录 `/workspace/wps_sheet_automation/` 验证：

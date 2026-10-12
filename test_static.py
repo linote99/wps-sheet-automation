@@ -40,6 +40,26 @@ class FakeMappedRange:
         )
         return values[0][0] if len(values) == 1 and len(values[0]) == 1 else values
 
+    @Formula.setter
+    def Formula(self, value):
+        self.events.append(("formula", self.address, value))
+        self.worksheet.cell(row=self.min_row, column=self.min_col).value = value
+
+    @property
+    def FormulaR1C1(self):
+        return self.worksheet.cell(row=self.min_row, column=self.min_col).value
+
+    @FormulaR1C1.setter
+    def FormulaR1C1(self, value):
+        self.events.append(("formula-r1c1", self.address, value))
+        for row in range(self.min_row, self.max_row + 1):
+            for col in range(self.min_col, self.max_col + 1):
+                self.worksheet.cell(row=row, column=col).value = value
+
+    @property
+    def MergeCells(self):
+        return False
+
     @property
     def NumberFormat(self):
         return self.worksheet.cell(row=self.min_row, column=self.min_col).number_format
@@ -129,9 +149,10 @@ class FakeWpsApplication:
 
     def CalculateFullRebuild(self):
         self.events.append("calculate")
-        worksheet = self.workbook.workbook["1当天派单"]
-        for row, value in self.calculated_values.items():
-            worksheet[f"EJ{row}"] = value
+        if self.workbook is not None and "1当天派单" in self.workbook.workbook.sheetnames:
+            worksheet = self.workbook.workbook["1当天派单"]
+            for row, value in self.calculated_values.items():
+                worksheet[f"EJ{row}"] = value
 
     def Quit(self):
         self.events.append("quit")
@@ -391,14 +412,21 @@ class StaticConfigurationTests(unittest.TestCase):
         migrated = main.normalize_settings(legacy)
         self.assertEqual("1.xlsx", migrated["jobs"][0]["sources"][0]["path"])
         self.assertEqual(4, migrated["jobs"][0]["sources"][0]["copy_start_row"])
-        self.assertNotIn("mappings", migrated["jobs"][1])
-        self.assertNotIn("result_col", migrated["jobs"][1])
-        self.assertNotIn("target_col", migrated["jobs"][1])
+        self.assertEqual({"result_col": "EQ", "target_col": "DG", "write_as": "value"},
+                         migrated["jobs"][1]["mappings"][0])
+        self.assertIn("result_mapping", migrated["workflow"])
         main.validate_static_settings(migrated)
         migrated_v5 = main.normalize_settings({"config_version": 5, "jobs": deepcopy(main.DEFAULT_SETTINGS["jobs"])})
         self.assertEqual(main.CONFIG_VERSION, migrated_v5["config_version"])
         self.assertEqual(main.DEFAULT_WORKFLOW, migrated_v5["workflow"])
         self.assertEqual(5, migrated_v5["template_prefix_length"])
+
+        legacy_v12 = deepcopy(main.DEFAULT_SETTINGS)
+        legacy_v12["config_version"] = 12
+        legacy_v12["workflow"].remove("result_mapping")
+        migrated_v12 = main.normalize_settings(legacy_v12)
+        self.assertLess(migrated_v12["workflow"].index("formula_recalc"), migrated_v12["workflow"].index("result_mapping"))
+        self.assertLess(migrated_v12["workflow"].index("result_mapping"), migrated_v12["workflow"].index("post_mapping"))
 
     def test_v6_v7_formula_seed_fields_are_ignored_and_migration_is_explained(self):
         for version in (6, 7):
@@ -490,18 +518,145 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual(((1, 1, 16_384, 1_048_576), "sheet"), main._parse_selection_details("A1"))
         self.assertEqual(((1, 5, 16_384, 5), "row"), main._parse_selection_details("A5"))
         self.assertEqual(((4, 1, 4, 1_048_576), "column"), main._parse_selection_details("D1"))
+        self.assertEqual(((4, 1, 4, 1_048_576), "column"), main._parse_selection_details("D"))
+        self.assertEqual(((4, 1, 4, 1_048_576), "column"), main._parse_selection_details("D:D"))
+        self.assertEqual(((1, 1, 3, 1_048_576), "column"), main._parse_selection_details("A:C"))
         self.assertEqual(((2, 3, 2, 3), "cell"), main._parse_selection_details("B3,B3"))
         self.assertEqual(((2, 3, 4, 8), "rectangle"), main._parse_selection_details("D8,B3"))
         self.assertEqual(((2, 3, 4, 8), "rectangle"), main._parse_selection_details("D8:B3"))
         self.assertEqual(((16_384, 1_048_576, 16_384, 1_048_576), "cell"),
                          main._parse_selection_details("XFD1048576"))
-        for invalid in ("", "A0", "XFE1", "A1048577", "A1,B3,C5", "not-a-cell"):
+        for invalid in ("", "A0", "XFE", "XFE1", "A1048577", "A1,B3,C5", "not-a-cell"):
             with self.subTest(invalid=invalid), self.assertRaises(main.ProcessingError):
                 main._parse_selection_details(invalid)
         with self.assertRaisesRegex(main.ProcessingError, "独立 XLSX 区域输出上限"):
             main._check_region_xlsx_area_size(main._parse_selected_area("A1:DV1000"), "测试区域")
         with self.assertRaisesRegex(main.ProcessingError, "处理上限"):
             main._check_processing_area_size(main._parse_selected_area("A1"), "测试去重")
+
+    def test_mapping_area_accepts_column_only_as_full_column(self):
+        for value, expected, canonical in (
+            ("A", (1, 1, 1, 1_048_576), "A:A"),
+            ("$DG", (111, 1, 111, 1_048_576), "DG:DG"),
+            ("A:A", (1, 1, 1, 1_048_576), "A:A"),
+            ("A:C", (1, 1, 3, 1_048_576), "A:C"),
+        ):
+            with self.subTest(value=value):
+                bounds = main._parse_area(value, "映射源")
+                self.assertEqual(expected, bounds)
+                self.assertEqual(canonical, main._area_address(bounds))
+
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["pre_mappings"] = [{
+            "source_sheet": "源", "source_range": "A",
+            "target_sheet": "目标", "target_range": "B",
+        }]
+        settings["post_mappings"] = [{
+            "source_sheet": "目标", "source_range": "C:C",
+            "target_sheet": "结果", "target_range": "D",
+        }]
+        main.validate_static_settings(settings)
+
+        settings["pre_mappings"][0]["target_range"] = "B1:B5"
+        with self.assertRaisesRegex(main.ProcessingError, "行列数必须相同"):
+            main.validate_static_settings(settings)
+
+        for invalid in ("XFE", "A0", "A1:B", "A:C1"):
+            with self.subTest(invalid=invalid), self.assertRaises(main.ProcessingError):
+                main._parse_area(invalid, "映射区域")
+
+    def test_post_mapping_full_columns_start_at_each_jobs_data_row(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        records = [[ ["one"] ], [["two"]], [["three"], ["four"]]]
+        columns = ("EJ", "EQ", "FQ")
+        settings["post_mappings"] = [
+            {"source_sheet": job["template_sheet"], "source_range": f"{column}:{column}",
+             "target_sheet": job["template_sheet"], "target_range": "DG:DG"}
+            for job, column in zip(settings["jobs"], columns)
+        ]
+
+        main._validate_post_mapping_conflicts(settings, records)
+        expected_rows = ((3, 3), (3, 3), (4, 5))
+        for index, (job, column, rows) in enumerate(zip(settings["jobs"], columns, expected_rows), 1):
+            resolved = main._resolve_post_mapping_areas(settings["post_mappings"][index - 1],
+                                                        main._configured_job_data_ranges(
+                                                            settings["jobs"], source_records=records),
+                                                        index)
+            self.assertIsNotNone(resolved)
+            source_bounds, target_bounds = resolved
+            self.assertEqual((column_index_from_string(column), rows[0], column_index_from_string(column), rows[1]),
+                             source_bounds)
+            self.assertEqual((column_index_from_string("DG"), rows[0], column_index_from_string("DG"), rows[1]),
+                             target_bounds)
+            self.assertEqual(job["start_row"] - 1, rows[0] - 1)
+
+        settings["post_mappings"][0]["source_range"] = "EJ2"
+        settings["post_mappings"][0]["target_range"] = "DG2"
+        with self.assertRaisesRegex(main.ProcessingError, "DG2.*会覆盖保留公式区域"):
+            main._validate_post_mapping_conflicts(settings, records)
+
+    def test_post_mapping_is_optional_but_configured_rules_require_workflow_stage(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["workflow"].remove("post_mapping")
+        main.validate_static_settings(settings)
+
+        settings["post_mappings"] = [{
+            "source_sheet": "1当天派单", "source_range": "EJ3:EJ3",
+            "target_sheet": "1当天派单", "target_range": "DG3:DG3",
+        }]
+        with self.assertRaisesRegex(main.ProcessingError, "工作流中移除了“后映射”模块"):
+            main.validate_static_settings(settings)
+
+    def test_result_mapping_is_optional_but_configured_rules_require_workflow_stage(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["workflow"].remove("result_mapping")
+        main.validate_static_settings(settings)
+
+        settings["jobs"][0]["mappings"] = [{"result_col": "EJ", "target_col": "DG", "write_as": "text"}]
+        with self.assertRaisesRegex(main.ProcessingError, "工作流中移除了“结果映射”模块"):
+            main.validate_static_settings(settings)
+
+        settings["workflow"] = main.add_workflow_module(settings["workflow"], "result_mapping")
+        main.validate_static_settings(settings)
+
+        settings["jobs"][0]["mappings"].append({"result_col": "EJ", "target_col": "DG", "write_as": "value"})
+        with self.assertRaisesRegex(main.ProcessingError, "都写入目标列 DG"):
+            main.validate_static_settings(settings)
+
+    def test_result_mapping_targets_cannot_be_overwritten_by_pre_or_post_mapping(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["jobs"] = [deepcopy(settings["jobs"][0])]
+        settings["jobs"][0]["mappings"] = [{"result_col": "EJ", "target_col": "DG", "write_as": "value"}]
+        records = [[ ["one"] ]]
+        settings["pre_mappings"] = [{"source_sheet": "S", "source_range": "A1",
+                                      "target_sheet": "1当天派单", "target_range": "DG3"}]
+        with self.assertRaisesRegex(main.ProcessingError, "与结果映射区域 DG3 冲突"):
+            main._validate_pre_mapping_conflicts(settings, records)
+
+        settings["pre_mappings"] = []
+        settings["post_mappings"] = [{"source_sheet": "1当天派单", "source_range": "A3",
+                                       "target_sheet": "1当天派单", "target_range": "DG3"}]
+        with self.assertRaisesRegex(main.ProcessingError, "与结果映射目标 DG3 重复"):
+            main._validate_post_mapping_conflicts(settings, records)
+
+    def test_region_formula_cannot_overwrite_result_mapping_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "mapping-protection.xlsx"
+            make_test_workbook(path, [("Data", {3: {1: "x"}, 4: {1: "y"}})])
+            fake_workbook = FakeComWorkbook(path, [])
+            mappings = [{"result_col": "A", "target_col": "D", "write_as": "value"}]
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [{"template_sheet": "Data", "start_row": 3, "formula_range": "A:A",
+                                  "mappings": mappings}]
+            settings["CustomFormula"] = {"enabled": True, "rules": [{
+                "scope": "target", "sheet": "Data", "range": "D3:D4", "formula_mode": "custom",
+                "formula": "=1", "seed_cell": ""}]}
+            try:
+                with self.assertRaisesRegex(main.ProcessingError, "与结果映射目标区域重叠"):
+                    main._apply_region_processing(fake_workbook, settings,
+                        [("Data", 3, 4, mappings)], lambda _msg: None)
+            finally:
+                fake_workbook.workbook.close()
 
     def test_sample_json_validates(self):
         sample = json.loads((Path(__file__).parent / "default_config.json").read_text(encoding="utf-8"))
@@ -574,7 +729,7 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertEqual(main.CONFIG_VERSION, loaded["config_version"])
             for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert", "workflow", "config_name", "template_prefix_length", "export_region_pngs", "retain_edited_sources"):
                 self.assertEqual(settings[key], loaded[key])
-            self.assertNotIn("mappings", loaded["jobs"][0])
+            self.assertEqual([], loaded["jobs"][0]["mappings"])
 
     def test_named_profile_save_load_and_template_prefix_match_cardinality(self):
         with tempfile.TemporaryDirectory() as td:
@@ -726,6 +881,29 @@ class StaticConfigurationTests(unittest.TestCase):
             finally:
                 result.close()
             self.assertEqual(original_bytes, template_path.read_bytes())
+
+    def test_pre_mapping_column_only_copies_full_column_contents_and_clears_target_used_rows(self):
+        workbook = Workbook()
+        source = workbook.active
+        source.title = "源"
+        target = workbook.create_sheet("目标")
+        source["A1"] = "标题"
+        source["A3"] = "数据"
+        target["B1"] = "旧标题"
+        target["B8"] = "需清除"
+        settings = {"pre_mappings": [{
+            "source_sheet": "源", "source_range": "A",
+            "target_sheet": "目标", "target_range": "B",
+        }]}
+
+        captured = main._capture_pre_mapping_values(workbook, settings)
+        self.assertEqual((1, 1, 1, 1_048_576), captured[0][1])
+        self.assertEqual(8, len(captured[0][2]))
+        main._apply_pre_mapping_values(workbook, captured, lambda _message: None)
+        self.assertEqual("标题", target["B1"].value)
+        self.assertEqual("数据", target["B3"].value)
+        self.assertIsNone(target["B8"].value)
+        workbook.close()
 
     def test_pre_mapping_conflict_with_main_write_area_is_rejected_before_staging(self):
         settings = deepcopy(main.DEFAULT_SETTINGS)
@@ -1364,6 +1542,39 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertFalse(any(isinstance(event, tuple) and event[0] in ("read", "write") and "EJ" in event[1]
                                  for event in events))
 
+    def test_post_mapping_column_alias_only_writes_data_rows_and_preserves_template_formula(self):
+        with tempfile.TemporaryDirectory() as td:
+            staging = Path(td) / "post-column.xlsx"
+            make_test_workbook(staging, [("1当天派单", {
+                2: {111: "=A2*2", 140: "SEED"},
+                3: {111: "OLD-3", 140: "OLD-SOURCE-3"},
+                4: {111: "OLD-4", 140: "OLD-SOURCE-4"},
+            })])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [deepcopy(settings["jobs"][0])]
+            settings["jobs"][0].update({"template_sheet": "1当天派单", "start_row": 3, "formula_range": "EB:EN"})
+            rule = {"source_sheet": "1当天派单", "source_range": "EJ:EJ",
+                    "target_sheet": "1当天派单", "target_range": "DG:DG"}
+            settings["post_mappings"] = [rule]
+            formula_jobs = [("1当天派单", 3, 4, [])]
+            events = []
+            fake_app = FakeWpsApplication(events, {3: "CALC-3", 4: "CALC-4"})
+            fake_pythoncom = FakePythonCom(events)
+            with mock.patch.object(main, "_connect_wps", return_value=(fake_app, fake_pythoncom, "fake.WPS")):
+                main._calculate_in_wps(staging, formula_jobs, lambda _message: None, [rule], settings)
+
+            output = load_workbook(staging, data_only=False)
+            try:
+                self.assertEqual("=A2*2", output["1当天派单"]["DG2"].value)
+                self.assertEqual("CALC-3", output["1当天派单"]["DG3"].value)
+                self.assertEqual("CALC-4", output["1当天派单"]["DG4"].value)
+            finally:
+                output.close()
+            self.assertIn(("read", "EJ3:EJ4"), events)
+            self.assertIn(("write", "DG3:DG4"), events)
+            self.assertNotIn(("write", "DG1:DG1048576"), events)
+            self.assertNotIn(("write", "DG2"), events)
+
     def test_wps_order_is_recalc_post_mapping_three_independent_functions_recalc_save(self):
         with tempfile.TemporaryDirectory() as td:
             staging = Path(td) / "ordered.xlsx"
@@ -1383,7 +1594,9 @@ class StaticConfigurationTests(unittest.TestCase):
                 "sheet": "1当天派单", "range": "H3:H5", "mode": "text"}]}
             post_mappings = [{"source_sheet": "2当天归档", "source_range": "A1:B1",
                               "target_sheet": "3装移全业务在途", "target_range": "D1:E1"}]
-            formula_jobs = [("1当天派单", 3, 5, [])]
+            mappings = [{"result_col": "EJ", "target_col": "DG", "write_as": "text"}]
+            settings["jobs"][0]["mappings"] = mappings
+            formula_jobs = [("1当天派单", 3, 5, mappings)]
             events = []
             fake_app = FakeWpsApplication(events, {3: "CALC-3", 4: "CALC-4", 5: "CALC-5"})
             fake_pythoncom = FakePythonCom(events)
@@ -1393,6 +1606,8 @@ class StaticConfigurationTests(unittest.TestCase):
             output = load_workbook(staging, data_only=False)
             try:
                 self.assertEqual(("POST-A", "POST-B"), (output["3装移全业务在途"]["D1"].value, output["3装移全业务在途"]["E1"].value))
+                self.assertEqual(("CALC-3", "CALC-4", "CALC-5"), tuple(output["1当天派单"][f"DG{row}"].value for row in range(3, 6)))
+                self.assertEqual("@", output["1当天派单"]["DG3"].number_format)
                 self.assertEqual("11", output["1当天派单"]["H3"].value)
                 self.assertEqual("12", output["1当天派单"]["H4"].value)
                 self.assertIsNone(output["1当天派单"]["H5"].value)
@@ -1401,11 +1616,16 @@ class StaticConfigurationTests(unittest.TestCase):
                 output.close()
 
             first_recalc = events.index("calculate")
+            result_read = events.index(("read", "EJ3:EJ5"))
+            result_write = events.index(("write", "DG3:DG5"))
             post_write = events.index(("write", "D1:E1"))
             split_write = events.index(("write", "H3:I5"))
             convert_write = events.index(("write", "H3:H5"))
             second_recalc = events.index("calculate", first_recalc + 1)
             save = events.index("save")
+            self.assertLess(first_recalc, result_read)
+            self.assertLess(result_read, result_write)
+            self.assertLess(result_write, post_write)
             self.assertLess(first_recalc, post_write)
             self.assertLess(post_write, split_write)
             self.assertLess(split_write, convert_write)
@@ -2355,6 +2575,175 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertEqual(original, path.read_bytes())
 
 
+class CustomFormulaFillTests(unittest.TestCase):
+    def _run_formula_rule(self, rule, initial_cells=None):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "formula.xlsx"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "Data"
+            for address, value in (initial_cells or {}).items():
+                worksheet[address] = value
+            workbook.save(path)
+            workbook.close()
+            events = []
+            com_workbook = FakeComWorkbook(path, events)
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = []
+            settings["CustomFormula"] = {"enabled": True, "rules": [rule]}
+            app = FakeWpsApplication(events, {})
+            app.workbook = com_workbook
+            logs = []
+            try:
+                applied = main._apply_region_processing(com_workbook, settings, [], logs.append, application=app)
+                values = {
+                    address: com_workbook.workbook["Data"][address].value
+                    for address in ("B2", "C2", "B3", "C3")
+                }
+            finally:
+                com_workbook.workbook.close()
+            return applied, events, values, logs
+
+    def test_custom_formula_fills_used_range_as_relative_r1c1(self):
+        rule = {"scope": "target", "sheet": "Data", "range": "A1", "formula_mode": "custom",
+                "formula": "=$A2+B$1", "seed_cell": ""}
+        applied, events, values, logs = self._run_formula_rule(
+            rule, {"B2": 1, "C2": 2, "B3": 3, "C3": 4})
+        self.assertTrue(applied)
+        self.assertEqual({address: "=$A2+B$1" for address in ("B2", "C2", "B3", "C3")}, values)
+        self.assertIn(("formula-r1c1", "B2:C3", "=$A2+B$1"), events)
+        self.assertIn("calculate", events)
+        self.assertTrue(any("按相对引用向下/向右填充" in message for message in logs))
+
+    def test_seed_cell_formula_fills_selected_region(self):
+        rule = {"scope": "target", "sheet": "Data", "range": "B2:C3", "formula_mode": "cell",
+                "formula": "", "seed_cell": "A1"}
+        applied, events, values, _logs = self._run_formula_rule(
+            rule, {"A1": "=$A$1+1", "B2": 1, "C2": 2, "B3": 3, "C3": 4})
+        self.assertTrue(applied)
+        self.assertEqual({address: "=$A$1+1" for address in ("B2", "C2", "B3", "C3")}, values)
+        self.assertIn(("formula-r1c1", "B2:C3", "=$A$1+1"), events)
+
+    def test_seed_cell_without_formula_is_rejected(self):
+        rule = {"scope": "target", "sheet": "Data", "range": "B2:C3", "formula_mode": "cell",
+                "formula": "", "seed_cell": "A1"}
+        with self.assertRaisesRegex(main.ProcessingError, "不含公式"):
+            self._run_formula_rule(rule, {"A1": "普通文本", "B2": 1, "C2": 2, "B3": 3, "C3": 4})
+
+    def test_custom_formula_can_override_template_formula_area_and_protects_it_later(self):
+        rule = {"scope": "target", "sheet": "Data", "range": "B3:C4", "formula_mode": "custom",
+                "formula": "=A3+1", "seed_cell": ""}
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "formula-area.xlsx"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "Data"
+            worksheet["B3"] = "old"
+            worksheet["C3"] = "old"
+            worksheet["B4"] = "old"
+            worksheet["C4"] = "old"
+            workbook.save(path)
+            workbook.close()
+            events = []
+            com_workbook = FakeComWorkbook(path, events)
+            app = FakeWpsApplication(events, {})
+            app.workbook = com_workbook
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [{"template_sheet": "Data", "start_row": 3, "formula_range": "A:C"}]
+            settings["CustomFormula"] = {"enabled": True, "rules": [rule]}
+            formula_jobs = [("Data", 3, 4, [])]
+            try:
+                self.assertTrue(main._apply_region_processing(
+                    com_workbook, settings, formula_jobs, lambda _msg: None, application=app))
+                settings["FormatConvert"] = {"enabled": True, "rules": [{
+                    "scope": "target", "sheet": "Data", "range": "B3:C4", "mode": "text"}]}
+                with self.assertRaisesRegex(main.ProcessingError, "与已配置的公式区域重叠"):
+                    main._apply_region_processing(
+                        com_workbook, settings, formula_jobs, lambda _msg: None, application=app)
+            finally:
+                com_workbook.workbook.close()
+
+    def test_workflow_requires_formula_module_and_places_it_before_region_operations(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["CustomFormula"] = {"enabled": True, "rules": [{
+            "scope": "target", "sheet": "1当天派单", "range": "B5", "formula_mode": "custom",
+            "formula": "=1+1", "seed_cell": ""}]}
+        main.validate_workflow(settings)
+        workflow = list(settings["workflow"])
+        workflow.remove("CustomFormula")
+        workflow.insert(workflow.index("TextToColumns") + 1, "CustomFormula")
+        settings["workflow"] = workflow
+        with self.assertRaisesRegex(ValueError, "区域公式填充.*文本分列"):
+            main.validate_workflow(settings)
+
+    def test_source_formula_runs_in_wps_copy_before_read_and_original_is_preserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "source.xlsx"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "Data"
+            worksheet["A1"] = 2
+            worksheet["A2"] = 3
+            workbook.save(source_path)
+            workbook.close()
+            original_bytes = source_path.read_bytes()
+            output_dir = root / "output"
+            output_dir.mkdir()
+            final_path = output_dir / "result.xlsx"
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["retain_edited_sources"] = True
+            settings["CustomFormula"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "Data", "range": "B1:B2", "formula_mode": "custom",
+                "formula": "=A1+1", "seed_cell": ""}]}
+            events = []
+            fake_app = FakeWpsApplication(events, {})
+            used = set()
+
+            def read_after_wps(_path, *_args):
+                events.append("read-records")
+                return [[2], [3]]
+
+            with mock.patch.object(main, "_connect_wps", return_value=(fake_app, None, "fake.WPS")), \
+                 mock.patch.object(main, "_read_source_records", side_effect=read_after_wps):
+                records = main._read_source_records_with_rules(
+                    source_path, "Data", 1, 1, 1, lambda _msg: None, None, settings, used,
+                    True, output_dir, final_path)
+
+            self.assertEqual([[2], [3]], records)
+            self.assertIn(("CustomFormula", 0), used)
+            self.assertLess(events.index("calculate"), events.index("save"))
+            self.assertLess(events.index("save"), events.index("read-records"))
+            self.assertEqual(original_bytes, source_path.read_bytes())
+            retained = list(output_dir.glob("source_已编辑*.xlsx"))
+            self.assertEqual(1, len(retained))
+            saved = load_workbook(retained[0], data_only=False)
+            try:
+                self.assertTrue(str(saved["Data"]["B1"].value).startswith("="))
+                self.assertTrue(str(saved["Data"]["B2"].value).startswith("="))
+            finally:
+                saved.close()
+
+    def test_formula_rule_static_validation_accepts_both_modes_and_rejects_unsafe_input(self):
+        settings = deepcopy(main.DEFAULT_SETTINGS)
+        settings["CustomFormula"] = {"enabled": True, "rules": [{
+            "scope": "target", "sheet": "1当天派单", "range": "B5:C6", "formula_mode": "custom",
+            "formula": "=SUM(B1:B2)", "seed_cell": ""}]}
+        main.validate_static_settings(settings)
+        settings["CustomFormula"]["rules"][0].update({"formula_mode": "cell", "formula": "", "seed_cell": "B2"})
+        main.validate_static_settings(settings)
+        for mode, formula, seed, expected in (
+            ("custom", "SUM(A1:A2)", "", "以 = 开头"),
+            ("custom", '=WEBSERVICE("https://example.invalid")', "", "外部工作簿引用或外部访问函数"),
+            ("cell", "", "A1:B2", "单个单元格"),
+        ):
+            settings["CustomFormula"]["rules"][0].update(
+                {"formula_mode": mode, "formula": formula, "seed_cell": seed})
+            with self.subTest(mode=mode, formula=formula, seed=seed):
+                with self.assertRaisesRegex(main.ProcessingError, expected):
+                    main.validate_static_settings(settings)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -2382,6 +2771,23 @@ class RegionFilterRangeShorthandTests(unittest.TestCase):
         }]}
         main.validate_static_settings(settings)
 
+    def test_all_source_and_target_region_modules_accept_column_only(self):
+        rules = {
+            "CustomFormula": {"formula_mode": "custom", "formula": "=A1"},
+            "TextToColumns": {"delimiter": "|", "output_start_col": "B", "column_formats": ["text"]},
+            "RegionFilter": {"has_header": False, "filter_column": "A", "operator": "equals", "criteria": "x"},
+            "Deduplicate": {"has_header": False, "key_mode": "row", "key_columns": []},
+            "FormatConvert": {"mode": "text"},
+        }
+        for key, rule_fields in rules.items():
+            for scope in ("source", "target"):
+                with self.subTest(module=key, scope=scope):
+                    settings = deepcopy(main.DEFAULT_SETTINGS)
+                    settings[key] = {"enabled": True, "rules": [{
+                        **rule_fields, "scope": scope, "sheet": "Data", "range": "A",
+                    }]}
+                    main.validate_static_settings(settings)
+
     def test_sheet_row_and_column_selectors_resolve_to_used_range(self):
         workbook = Workbook()
         worksheet = workbook.active
@@ -2394,6 +2800,8 @@ class RegionFilterRangeShorthandTests(unittest.TestCase):
             fake_sheet, (1, 3, 16_384, 3), "row", "整行测试"))
         self.assertEqual((3, 1, 3, 4), main._resolve_com_selection_bounds(
             fake_sheet, (3, 1, 3, 1_048_576), "column", "整列测试"))
+        self.assertEqual((3, 1, 5, 4), main._resolve_com_selection_bounds(
+            fake_sheet, (3, 1, 5, 1_048_576), "column", "多列整列测试"))
         workbook.close()
 
     def test_whole_sheet_region_filter_runs_only_on_used_range(self):
@@ -2461,6 +2869,43 @@ class RegionFilterRangeShorthandTests(unittest.TestCase):
             self.assertEqual(["状态", "保留", "保留", None], [sheet.cell(row=row, column=1).value for row in range(1, 5)])
             self.assertEqual(["关联列", "记录-1", "记录-2", "记录-3"], [sheet.cell(row=row, column=2).value for row in range(1, 5)])
             fake_workbook.workbook.close()
+
+    def test_target_non_filter_region_module_column_only_uses_used_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "target-format-column.xlsx"
+            make_test_workbook(path, [("数据", {1: {1: "12"}, 3: {1: "13"}})])
+            fake_workbook = FakeComWorkbook(path, [])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = []
+            settings["workflow"] = ["FormatConvert"]
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "scope": "target", "sheet": "数据", "range": "A", "mode": "number",
+            }]}
+
+            self.assertTrue(main._apply_region_processing(fake_workbook, settings, [], lambda _msg: None))
+            sheet = fake_workbook.workbook["数据"]
+            self.assertEqual(12, sheet["A1"].value)
+            self.assertEqual(13, sheet["A3"].value)
+            self.assertTrue(any(event == ("read", "A1:A3") for event in fake_workbook.events))
+            fake_workbook.workbook.close()
+
+    def test_source_non_filter_region_module_column_only_uses_actual_source_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "source-format-column.xlsx"
+            make_test_workbook(path, [("Data", {1: {1: "ID", 2: "Name"},
+                                                  2: {1: 12, 2: "first"},
+                                                  3: {1: 13, 2: "last"}})])
+            original = path.read_bytes()
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["workflow"] = ["FormatConvert"]
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "Data", "range": "A", "mode": "text",
+            }]}
+
+            records = main._read_source_records(path, "Data", 1, 1, 2, lambda _msg: None,
+                                               source_processing=settings)
+            self.assertEqual([["ID", "Name"], ["12", "first"], ["13", "last"]], records)
+            self.assertEqual(original, path.read_bytes())
 
     def test_source_region_filter_single_column_covers_blank_key_rows_through_sheet_data(self):
         with tempfile.TemporaryDirectory() as td:
