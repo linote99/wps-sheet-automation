@@ -52,7 +52,7 @@ def _window_size_path() -> Path:
 
 
 WINDOW_SIZE_PATH = _window_size_path()
-CONFIG_VERSION = 17
+CONFIG_VERSION = 18
 LEGACY_FORMULA_ROW_KEYS = ("formula_seed_row", "formula_template_row", "formula_row", "seed_row")
 MAX_PROCESSING_CELLS = 500_000
 MAX_REGION_XLSX_CELLS = 100_000
@@ -78,6 +78,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "merge_output_filename": "合并结果.xlsx",
     "merge_sources": [],
     "retain_merged_sources": False,
+    "delete_processed_sources_after_success": False,
     # Deprecated compatibility alias; normalized to retain_merged_sources.
     "retain_edited_sources": False,
     "copy_start_col": "A",
@@ -257,6 +258,8 @@ def configuration_migration_notes(raw: Any) -> list[str]:
         notes.append("配置已升级到 v16：模板模式可为每个目标表设置合并源工作簿文件名；留空时使用模板子表名。可选择保存合并源副本，不保存时会在模板处理完成后清理临时文件。旧保留选项将自动兼容。")
     if version < 17:
         notes.append("配置已升级到 v17：区域规则的工作表名可留空以使用第一张表，名称匹配不区分大小写；区域筛选范围可留空以筛选整张工作表。源文件规则先处理合并后的源副本，再将处理结果用于模板。")
+    if version < 18:
+        notes.append("配置已升级到 v18：新增“模板处理全部成功后删除已另存的源副本”选项；默认关闭并保留副本，启用后仅在模板处理成功时删除，失败时保留供排查。")
     if "open_region_exports" in raw:
         notes.append("旧版自动打开区域 XLSX 的选项已停用；区域 XLSX 将输出到所选目录，不再自动打开。")
     legacy_workflow = raw.get("workflow", [])
@@ -634,6 +637,10 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
     ))
     settings["retain_merged_sources"] = retain_merged_sources
     settings["retain_edited_sources"] = retain_merged_sources
+    settings["delete_processed_sources_after_success"] = bool(raw.get(
+        "delete_processed_sources_after_success",
+        settings.get("delete_processed_sources_after_success", False),
+    ))
     for key in ("CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
         operation = settings.get(key)
         if operation is None:
@@ -2795,7 +2802,7 @@ def _process_merged_source_workbook(merged: dict[str, Any], settings: dict[str, 
                                    save_merged_source: bool, output_dir: Path,
                                    final_path: Path,
                                    retained_filename: str | None = None) -> tuple[list[list[Any]], Path | None]:
-    """Apply source-scoped rules to the merged temporary workbook, then read only that merge for template input."""
+    """Process the merged copy, publish processed source rules, and read the published copy for template input."""
     if merged["has_rules"]:
         app = workbook = pythoncom = None
         com_initialized = False
@@ -2840,13 +2847,20 @@ def _process_merged_source_workbook(merged: dict[str, Any], settings: dict[str, 
                 except Exception:
                     pass
     retained_path = None
-    if save_merged_source:
+    # A source-rule result must be materialized as a separate workbook before
+    # it becomes template input. The optional setting still controls saving a
+    # merged workbook when no source rules were applied.
+    if save_merged_source or merged["has_rules"]:
         retained_path = _publish_processed_source_copy(
             merged["path"], merged["first_source"], output_dir, reserved_paths={final_path},
             filename_stem=retained_filename,
         )
-        log(f"已保存合并源工作簿（原始源文件均未修改）：{retained_path}")
-    records = _read_source_records(merged["path"], merged["sheet"], 1, col_start, col_end,
+        if merged["has_rules"]:
+            log(f"源侧规则处理完成，已另存独立副本；模板数据将从该副本读取（原始源文件均未修改）：{retained_path}")
+        else:
+            log(f"已保存合并源工作簿（原始源文件均未修改）：{retained_path}")
+    source_input_path = retained_path or merged["path"]
+    records = _read_source_records(source_input_path, merged["sheet"], 1, col_start, col_end,
                                    log, merged["last_row"], None, merged["used_rules"])
     return records, retained_path
 
@@ -4073,8 +4087,9 @@ def _process_template_workbooks(settings: dict[str, Any], log: Callable[[str], N
         copy_start = copy_end = 1
     all_records: list[list[list[Any]]] = []
     source_rules_used: set[tuple[str, int]] = set()
+    source_output_paths: list[Path] = []
     if any(job.get("sources") for job in settings["jobs"]):
-        log("先按每个目标表的源文件顺序合并为安全临时工作簿，再对合并副本执行源规则；模板只读取合并结果，原始源文件不修改。")
+        log("先按每个目标表的源文件顺序合并并执行源规则；命中源规则时先另存处理结果副本，再从副本读取模板数据，原始源文件不修改。")
     else:
         log("未配置源文件；将直接在模板临时副本上执行模板范围规则，并保留现有模板数据。")
     for job_idx, job in enumerate(settings["jobs"], 1):
@@ -4090,8 +4105,8 @@ def _process_template_workbooks(settings: dict[str, Any], log: Callable[[str], N
                                    or f"{job['template_sheet']}.xlsx"),
             )
             source_rules_used.update(merged["used_rules"])
-            if retained_path is not None and on_source_outputs is not None:
-                on_source_outputs([retained_path])
+            if retained_path is not None:
+                source_output_paths.append(retained_path)
         all_records.append(job_records)
     for operation_key in ("CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
         operation = settings.get(operation_key, {})
@@ -4155,6 +4170,27 @@ def _process_template_workbooks(settings: dict[str, Any], log: Callable[[str], N
             on_text_previews(text_previews)
         if on_region_outputs is not None:
             on_region_outputs(list(region_xlsx_files))
+        if settings.get("delete_processed_sources_after_success", False):
+            protected_paths = {Path(template_path).resolve()}
+            for job in settings.get("jobs", []):
+                for source in job.get("sources", []):
+                    source_path = str(source.get("path") or "").strip()
+                    if source_path:
+                        protected_paths.add(Path(source_path).expanduser().resolve())
+            for source_copy in source_output_paths:
+                try:
+                    if source_copy.resolve() in protected_paths:
+                        log(f"安全保护：跳过删除与原始源文件或模板同路径的副本：{source_copy}")
+                        continue
+                    source_copy.unlink(missing_ok=True)
+                    log(f"模板处理成功，已按设置删除处理源副本：{source_copy}")
+                except OSError as exc:
+                    log(f"警告：模板处理成功，但无法删除处理源副本，已保留供检查：{source_copy}（{exc}）")
+        if on_source_outputs is not None:
+            try:
+                on_source_outputs([path for path in source_output_paths if path.is_file()])
+            except Exception as exc:
+                log(f"警告：模板处理已成功，但无法通知界面源副本的保留状态：{exc}")
         return final_path
     except Exception:
         try:
@@ -4438,14 +4474,18 @@ class App:
         self.format_convert_tree = self._create_operation_tab(area_tabs, "格式转换", "FormatConvert",
             rule_columns + (("mode", "目标类型", 100),))
         self.workflow_tree = self._create_workflow_tab(area_tabs)
-        selector_help = ("目标表结果映射可选：将公式列的已计算结果写入公式范围外的目标列；前/后映射的源和目标范围可用列字母（如 A、DG）或 A:A 表示整列；后映射可留空，配置时在首次完整重算及结果映射后逐行复制源区域的已计算值。整列后映射目标在目标表只写 start_row 至本轮数据末行，保留上一行公式模板。范围选择：A1=整张工作表，按 WPS UsedRange 裁剪；D1=整列，A5=整行，B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形。区域筛选专用范围：留空=整张工作表，A/a=整列，A1/a1=单格 A1，也可填 A1:F100。工作表名留空=第一张表，名称匹配不区分大小写。源规则先处理合并后的源副本，再由模板读取处理结果。公式填充支持输入自定义公式或从同表指定单元格取公式，按 WPS 相对引用填满范围；填充会替换所选范围的原有内容。"
-                         f"每条处理规则最多 {MAX_PROCESSING_CELLS:,} 格。源文件规则在临时副本中由 WPS 执行，模板规则作用于结果副本；原始源文件不回写。")
+        selector_help = ("目标表结果映射可选：将公式列的已计算结果写入公式范围外的目标列；前/后映射的源和目标范围可用列字母（如 A、DG）或 A:A 表示整列；后映射可留空，配置时在首次完整重算及结果映射后逐行复制源区域的已计算值。整列后映射目标在目标表只写 start_row 至本轮数据末行，保留上一行公式模板。范围选择：A1=整张工作表，按 WPS UsedRange 裁剪；D1=整列，A5=整行，B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形。区域筛选专用范围：留空=整张工作表，A/a=整列，A1/a1=单格 A1，也可填 A1:F100。工作表名留空=第一张表，名称匹配不区分大小写。源规则先处理合并后的源副本，再将处理结果另存为独立副本，模板从该副本读取。公式填充支持输入自定义公式或从同表指定单元格取公式，按 WPS 相对引用填满范围；填充会替换所选范围的原有内容。"
+                         f"每条处理规则最多 {MAX_PROCESSING_CELLS:,} 格。源文件规则在临时副本中由 WPS 执行，处理结果另存后才用于模板；模板规则作用于结果副本，原始源文件不回写。")
         ttk.Label(area_box, text=selector_help, foreground="#4b5563", wraplength=1180,
                   justify="left").grid(row=1, column=0, sticky="w", padx=4, pady=(4, 1))
         self.retain_merged_sources_var = self.tk.BooleanVar(value=bool(
             self.settings.get("retain_merged_sources", self.settings.get("retain_edited_sources", False))))
-        ttk.Checkbutton(area_box, text="保存合并源工作簿：将每个目标表的合并后 .xlsx 另存到输出目录；未勾选时仅作临时输入并在模板处理完成后清理（原始源不修改，已有文件不覆盖）。",
+        ttk.Checkbutton(area_box, text="保存合并源工作簿：源侧规则命中时，处理结果始终先另存为独立副本并用于模板输入；勾选后无源侧规则时也保留合并副本。未勾选的未处理副本会在任务后清理（原始源及模板不覆盖）。",
                         variable=self.retain_merged_sources_var).grid(row=2, column=0, sticky="w", padx=4, pady=(3, 4))
+        self.delete_processed_sources_after_success_var = self.tk.BooleanVar(value=bool(
+            self.settings.get("delete_processed_sources_after_success", False)))
+        ttk.Checkbutton(area_box, text="模板处理全部成功后删除已另存的源副本（默认保留；开启后仅在模板、区域输出和文本读取均成功后删除；处理中失败时保留副本供排查，不删除原始源文件或模板）。",
+                        variable=self.delete_processed_sources_after_success_var).grid(row=3, column=0, sticky="w", padx=4, pady=(0, 4))
 
         controls = ttk.Frame(outer)
         controls.grid(row=5, column=0, sticky="ew", pady=7)
@@ -4514,7 +4554,7 @@ class App:
         workflow = self.settings.get("workflow", DEFAULT_WORKFLOW)
         descriptions = {
             "source_merge": "先将同一目标表的源文件按顺序纵向合并；首份保留首行，后续首行可选",
-            "source_preprocess": "合并完成后只在合并源文件临时副本中执行源范围规则",
+            "source_preprocess": "在合并源副本中执行源规则，另存处理结果副本后再供模板读取",
             "template_cleanup": "保留模板格式/公式种子，清理旧数据",
             "pre_mapping": "读取模板原值并在源数据前写入",
             "source_copy": "按目标表及源文件列表追加数据",
@@ -5345,6 +5385,8 @@ class App:
         settings["merge_sources"] = deepcopy(self.settings.get("merge_sources", []))
         settings["workflow"] = deepcopy(self.settings.get("workflow", DEFAULT_WORKFLOW))
         settings["retain_merged_sources"] = bool(self.retain_merged_sources_var.get())
+        settings["delete_processed_sources_after_success"] = bool(
+            self.delete_processed_sources_after_success_var.get())
         for key in ("pre_mappings", "post_mappings", "region_xlsx_outputs", "text_outputs"):
             settings[key] = deepcopy(self.settings.get(key, []))
         for key in ("CustomFormula", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
@@ -5401,6 +5443,8 @@ class App:
         self._on_merge_mode_changed()
         self.retain_merged_sources_var.set(bool(normalized.get(
             "retain_merged_sources", normalized.get("retain_edited_sources", False))))
+        self.delete_processed_sources_after_success_var.set(bool(
+            normalized.get("delete_processed_sources_after_success", False)))
         self._suppress_output_filename_trace = True
         try:
             for key, var in self.vars.items():
@@ -5604,7 +5648,7 @@ class App:
 选择无宏 .xlsx 模板、输出目录和输出文件名。源数据复制起始列/末列用于定义从源表复制的列范围；有关联源文件时末列必填，无源文件仅编辑模板时可留空。模板前缀匹配长度用于选择模板时查找已保存的命名配置；只有唯一匹配或明确选择后才载入。
 
 二、目标子表与多源文件
-每个目标子表单独设置模板表名、标题行、粘贴起始行和公式列范围。多份源文件先按列表顺序合并为该目标表的工作簿，再对合并结果执行源规则并用于编辑模板；首份源文件保留复制范围首行，后续源文件可分别选择是否保留复制范围首行（默认保留）。合并源文件名可自定义，留空默认为对应模板子表名。勾选“保存合并源工作簿”时将副本存入输出目录；未勾选时仅作为临时输入，在整个模板处理结束后清理。源工作表名留空时取首个工作表，复制结束行留空时按首个整行空白边界判断。无源目标表保留模板原数据，仅运行配置的模板规则。
+每个目标子表单独设置模板表名、标题行、粘贴起始行和公式列范围。多份源文件先按列表顺序合并为该目标表的工作簿，再对合并结果执行源规则；命中源规则时处理结果必须先另存为独立副本，模板从该副本读取。首份源文件保留复制范围首行，后续源文件可分别选择是否保留复制范围首行（默认保留）。合并源文件名可自定义，留空默认为对应模板子表名。无源侧规则时，“保存合并源工作簿”控制是否保留合并副本。可选勾选“模板处理全部成功后删除已另存的源副本”；默认保留，开启后只在模板、区域输出及文本读取均成功后删除，任何失败都保留副本供排查。源工作表名留空时取首个工作表，复制结束行留空时按首个整行空白边界判断。无源目标表保留模板原数据，仅运行配置的模板规则。
 
 三、结果映射、前映射与后映射
 结果映射在每个目标表内配置：首次完整重算后，把指定公式结果列复制为值或文本到公式范围之外的目标列；结果列须在公式范围内。前映射在复制主数据前写入模板已有区域；后映射在首次重算和结果映射之后复制任意源/目标区域。结果映射和后映射彼此独立，均可不配置。
@@ -5613,7 +5657,7 @@ class App:
 目标表“公式列范围”按本轮数据行数自动填公式。区域“公式填充”可选择源文件或目标工作簿，使用自定义公式或同表公式种子单元格，并由 WPS 按相对引用填满范围；它会覆盖所选区域原内容。处理规则的工作表名留空时默认第一张表，名称匹配不区分大小写。区域筛选范围仅留空时表示整表；A/a 表示整列，A1/a1 表示单格 A1，A1:F100 表示矩形。其他常见范围：D1=整列，A5=整行，B3,B3=单格，A1:F100=矩形。规则按 UsedRange 裁剪并设有单条单元格上限。
 
 五、区域处理功能
-“文本分列”按分隔符拆分指定单列并选择输出起始列及各列格式，输出区域须为空。“区域筛选”按列和值筛选记录，只压缩所选区域，不删除工作表物理行。“去重”按整行或指定关键列去重，保留首次出现记录。“格式转换”将范围转换为文本、数字或日期。规则可指定源文件或目标工作簿；源端公式填充、文本分列、筛选、去重和格式转换均在源文件合并后、模板编辑前对合并临时副本执行，模板只读取处理后的源数据，原始文件不会被改写。
+“文本分列”按分隔符拆分指定单列并选择输出起始列及各列格式，输出区域须为空。“区域筛选”按列和值筛选记录，只压缩所选区域，不删除工作表物理行。“去重”按整行或指定关键列去重，保留首次出现记录。“格式转换”将范围转换为文本、数字或日期。规则可指定源文件或目标工作簿；源端公式填充、文本分列、筛选、去重和格式转换均在源文件合并后、模板编辑前对合并临时副本执行，处理结果先另存为独立副本，模板从该副本读取；原始文件不会被改写。默认保留已另存副本，可选在模板处理全部成功后删除；失败时会保留副本供排查。
 
 六、区域 XLSX 输出与文本预览
 “区域 XLSX 输出”添加模板表和范围；区域 XLSX 会独立导出并保留单元格样式。“文本预览/复制”添加工作表范围；处理并保存成功后显示预览，可复制完整区域或分块内容，列之间以 Tab 分隔。
@@ -5629,7 +5673,7 @@ class App:
 “设置 → 秘钥管理”显示本机机器码、当前授权状态和当前秘钥到期日期；粘贴新秘钥后点击“验证并更新秘钥”，仅通过本机绑定、签名和有效期验证的秘钥才会替换现有秘钥。更新秘钥不会更改程序内置公钥。
 
 十、数据安全提示
-主工作簿和原始源文件不会被直接覆盖；模板处理使用安全临时副本，独立合并以只读方式读取 CSV/XLSX 并将结果写入新的 XLSX。模板模式的合并源副本可另存到输出目录；未另存时待整个模板处理流程完成后清理。秘钥与业务配置分别存放；主程序不包含签名私钥。恢复默认只替换当前界面配置，不删除命名配置或已导出的 JSON 文件。
+主工作簿和原始源文件不会被直接覆盖；模板处理使用安全临时副本，独立合并以只读方式读取 CSV/XLSX 并将结果写入新的 XLSX。命中源侧规则时，处理结果另存为独立源副本并作为模板输入；默认保留，可选在模板处理全部成功后删除。发生失败时保留副本供排查。无源侧规则时，合并源副本由保留选项控制。秘钥与业务配置分别存放；主程序不包含签名私钥。恢复默认只替换当前界面配置，不删除命名配置或已导出的 JSON 文件。
 """
         text.insert("1.0", guide)
         text.configure(state="disabled")

@@ -453,7 +453,7 @@ class StaticConfigurationTests(unittest.TestCase):
             "filter_column": "A", "operator": "not_blank", "criteria": "",
         }]}
         migrated_v16 = main.normalize_settings(legacy_v16)
-        self.assertEqual(17, migrated_v16["config_version"])
+        self.assertEqual(main.CONFIG_VERSION, migrated_v16["config_version"])
         self.assertEqual("sheet", main._parse_region_filter_area(
             migrated_v16["RegionFilter"]["rules"][0]["range"]
         )[1])
@@ -1862,7 +1862,9 @@ class StaticConfigurationTests(unittest.TestCase):
             fake_app = FakeWpsApplication(events, {})
             fake_pythoncom = FakePythonCom(events)
             merged_paths = []
+            source_read_paths = []
             real_merge = main._merge_source_workbooks
+            real_read_source = main._read_source_records
 
             def capture_merge(*args, **kwargs):
                 merged = real_merge(*args, **kwargs)
@@ -1872,19 +1874,30 @@ class StaticConfigurationTests(unittest.TestCase):
             def fake_calculate(path, _formula_jobs, _log, _post_mappings, _settings):
                 self.assertEqual(1, len(merged_paths))
                 self.assertTrue(merged_paths[0].is_file())
+                self.assertTrue((output_dir / "Target.xlsx").is_file())
+                self.assertEqual([output_dir / "Target.xlsx"], source_read_paths)
                 events.append("template-processing")
                 workbook = load_workbook(path, data_only=False)
                 workbook.save(path)
                 workbook.close()
 
+            def capture_source_read(path, *args, **kwargs):
+                source_path_used = Path(path)
+                self.assertTrue(source_path_used.is_file())
+                source_read_paths.append(source_path_used)
+                return real_read_source(path, *args, **kwargs)
+
             with mock.patch.object(main, "_merge_source_workbooks", side_effect=capture_merge), \
                     mock.patch.object(main, "_connect_wps", return_value=(fake_app, fake_pythoncom, "fake.WPS")), \
+                    mock.patch.object(main, "_read_source_records", side_effect=capture_source_read), \
                     mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate):
                 final_path = main.process_workbooks(settings, lambda _msg: None)
 
             self.assertLess(events.index("save"), events.index("template-processing"))
             self.assertTrue(merged_paths)
             self.assertTrue(all(not merged_path.exists() for merged_path in merged_paths))
+            self.assertTrue((output_dir / "Target.xlsx").is_file())
+            self.assertEqual([output_dir / "Target.xlsx"], source_read_paths)
             self.assertEqual(original_bytes, source_path.read_bytes())
             result = load_workbook(final_path, data_only=False)
             try:
@@ -1892,6 +1905,66 @@ class StaticConfigurationTests(unittest.TestCase):
                 self.assertEqual(2, result["Target"]["A3"].value)
             finally:
                 result.close()
+
+    def test_processed_source_copy_deletion_waits_for_success_and_is_opt_in(self):
+        for template_fails in (False, True):
+            with self.subTest(template_fails=template_fails), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                source_path = root / "source.xlsx"
+                make_test_workbook(source_path, [("Data", {1: {1: "ID"}, 2: {1: "001"}})])
+                source_bytes = source_path.read_bytes()
+                template_path = root / "template.xlsx"
+                template = Workbook()
+                template.active.title = "Target"
+                template.active["EB1"] = "=ROW()"
+                template.save(template_path)
+                template.close()
+                template_bytes = template_path.read_bytes()
+                output_dir = root / "output"
+                output_dir.mkdir()
+
+                settings = deepcopy(main.DEFAULT_SETTINGS)
+                settings.update({
+                    "template_path": str(template_path), "output_dir": str(output_dir),
+                    "output_filename": "result.xlsx", "copy_start_col": "A", "copy_end_col": "A",
+                    "delete_processed_sources_after_success": True,
+                })
+                settings["jobs"] = [{
+                    "template_sheet": "Target", "header_rows": 0, "start_row": 2,
+                    "formula_range": "EB:EB", "sources": [{
+                        "path": str(source_path), "source_sheet": "Data",
+                        "copy_start_row": 1, "copy_end_row": 2,
+                    }],
+                }]
+                settings["FormatConvert"] = {"enabled": True, "rules": [{
+                    "scope": "source", "sheet": "Data", "range": "A2", "mode": "number",
+                }]}
+                events = []
+                fake_app = FakeWpsApplication(events, {})
+                fake_pythoncom = FakePythonCom(events)
+                processed_copy = output_dir / "Target.xlsx"
+
+                def calculate_template(path, _formula_jobs, _log, _post_mappings, _settings):
+                    self.assertTrue(processed_copy.is_file())
+                    if template_fails:
+                        raise main.ProcessingError("模拟模板处理失败")
+                    workbook = load_workbook(path, data_only=False)
+                    workbook.save(path)
+                    workbook.close()
+
+                with mock.patch.object(main, "_connect_wps",
+                                       return_value=(fake_app, fake_pythoncom, "fake.WPS")), \
+                        mock.patch.object(main, "_calculate_in_wps", side_effect=calculate_template):
+                    if template_fails:
+                        with self.assertRaisesRegex(main.ProcessingError, "模拟模板处理失败"):
+                            main.process_workbooks(settings, lambda _msg: None)
+                    else:
+                        final_path = main.process_workbooks(settings, lambda _msg: None)
+                        self.assertTrue(final_path.is_file())
+
+                self.assertEqual(source_bytes, source_path.read_bytes())
+                self.assertEqual(template_bytes, template_path.read_bytes())
+                self.assertEqual(template_fails, processed_copy.is_file())
 
     def test_formula_templates_use_previous_row_and_fill_only_pasted_rows(self):
         for start_row in (3, 4):
@@ -3050,7 +3123,9 @@ class SourceMergeTests(unittest.TestCase):
                         merged, settings, 1, 2, lambda _msg: None,
                         False, root, root / "result.xlsx",
                     )
-                self.assertIsNone(retained)
+                self.assertIsNotNone(retained)
+                self.assertTrue(retained.is_file())
+                self.assertNotEqual(merged["path"], retained)
                 self.assertEqual([["ID", "Status"], ["KEEP", "Keep"]], records)
                 self.assertEqual(original, source.read_bytes())
             finally:
@@ -3206,7 +3281,8 @@ class StandaloneMergeTests(unittest.TestCase):
     def test_v14_configuration_migrates_without_enabling_standalone_mode(self):
         legacy = deepcopy(main.DEFAULT_SETTINGS)
         legacy["config_version"] = 14
-        for key in ("merge_only", "merge_sources", "merge_output_filename", "retain_merged_sources"):
+        for key in ("merge_only", "merge_sources", "merge_output_filename", "retain_merged_sources",
+                    "delete_processed_sources_after_success"):
             legacy.pop(key, None)
         legacy["retain_edited_sources"] = True
         for job in legacy["jobs"]:
@@ -3217,5 +3293,6 @@ class StandaloneMergeTests(unittest.TestCase):
         self.assertEqual([], migrated["merge_sources"])
         self.assertEqual("合并结果.xlsx", migrated["merge_output_filename"])
         self.assertTrue(migrated["retain_merged_sources"])
+        self.assertFalse(migrated["delete_processed_sources_after_success"])
         self.assertTrue(all(job["merged_source_filename"] == "" for job in migrated["jobs"]))
         self.assertIn("独立源文件合并", " ".join(main.configuration_migration_notes(legacy)))

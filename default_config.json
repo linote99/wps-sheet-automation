@@ -1,5 +1,5 @@
 {
-  "config_version": 17,
+  "config_version": 18,
   "config_name": "",
   "template_prefix_length": 5,
   "workflow": [
@@ -30,6 +30,7 @@
   "merge_sources": [],
   "retain_merged_sources": false,
   "retain_edited_sources": false,
+  "delete_processed_sources_after_success": false,
   "copy_start_col": "A",
   "copy_end_col": "",
   "pre_mappings": [],
