@@ -2,6 +2,10 @@
 
 这是面向 **Windows 11 + WPS 表格 + 无宏 XLSX** 的 GUI 工具。程序以模板临时副本处理数据，模板和源工作簿原件不会被覆盖；正常情况下，终端区域文件与预览处理成功后才提交完整工作簿。若独立区域 `.xlsx` 导出失败，程序仍会保留 WPS 已保存的主 XLSX，并在错误提示中给出准确路径。
 
+## 授权与发行
+
+当前版本支持 7 天试用、机器码绑定秘钥、到期提示、Windows 秘钥生成器和 UFI-TOOLS HTML 插件；授权签发、私钥保管与 Windows EXE 构建说明见 [LICENSING_README.md](LICENSING_README.md)。
+
 ## 窗口尺寸与滚动（v7）
 
 主窗口可拖动调整宽度和高度，默认尺寸为 **1500×960**，最小尺寸目标为 **1024×680**；启动时会按当前屏幕可用尺寸安全收缩默认值或已保存尺寸。超出可视区域的主界面内容可通过水平/垂直滚动条查看，扩大窗口时配置区和日志区会随之扩展。上次窗口宽高会独立保存到用户配置目录（Windows：`%APPDATA%\WpsSheetAutomation\window_size.json`；其他平台：`$XDG_CONFIG_HOME/wps_sheet_automation/window_size.json` 或 `~/.config/wps_sheet_automation/window_size.json`），该文件仅包含 `width` 和 `height`，不保存模板、源文件或其他敏感路径；损坏/不合法尺寸会回退到安全默认值。此窗口状态与业务 JSON 配置版本 v7 无关。
@@ -139,9 +143,11 @@
 
 ## 安装、运行与测试
 
-需要 Windows 11、Python 3.10+ 和 WPS 表格。首次安装时，在解压后的项目目录双击 `install_and_build.bat`。它会创建或复用项目内 `.venv`，将依赖安装到该环境，先检查 `pythoncom`、`win32com.client` 和 pywin32 版本，再运行语法、自检和单元测试，最后由 PyInstaller 构建 `dist\\WpsSheetAutomation\\`。安装/构建输出会追加保存在 `install_and_build.log`；若脚本失败，窗口会显示失败步骤并暂停，检查该日志中的 pip、导入或构建错误后再重试。只有出现 `Build complete` 才表示脚本流程成功结束；这不代表已在目标电脑验收 WPS COM 或 EXE。
+构建需要 Windows 11、Python 3.10+ 和网络连接；应用运行需要 Windows 11 与 WPS 表格。若要生成可分发的单文件安装程序，还需先安装 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。在解压后的项目目录双击 `install_and_build.bat`，脚本会创建或复用项目内 `.venv`、安装依赖、检查 `pythoncom`/`win32com.client`，再运行语法、自检、单元测试并由 PyInstaller 构建 `dist\\WpsSheetAutomation\\`。检测到 Inno Setup 后，还会生成 `dist\\WpsSheetAutomation_Setup_v12.exe`；若未检测到，则只生成程序目录并在窗口与 `build_main.log` 中明确说明没有生成安装器。
 
-每次源码运行都双击同一目录中的 `run_app.bat`。它会用本目录 `.venv\\Scripts\\python.exe` 检查 COM 导入并启动 `main.py`，不依赖当前目录或系统 `PATH`。**不要直接双击 `main.py`，也不要用系统 Python 执行 `python main.py`**：那会绕过安装器中的 `.venv`，即使 `.venv` 已正确安装 pywin32，系统 Python 仍可能报 `No module named 'pythoncom'`。若误用其他 Python 启动，错误弹窗会列出当前解释器的完整路径和正确入口；若通过 `run_app.bat` 仍缺少依赖，请检查 `install_and_build.log`。Linux 等非 Windows 环境不能运行 WPS COM 主处理流程，可运行：
+安装器按当前 Windows 用户安装到 `%LOCALAPPDATA%\\Programs\\WpsSheetAutomation`，不需要管理员权限；安装后的主程序快捷方式会直接启动 `WpsSheetAutomation.exe`，目标电脑不需要另装 Python。安装包只包含主程序，不含密钥生成器或签发私钥。构建日志保存在 `build_main.log`；如构建失败，按窗口显示的失败步骤检查日志后再重试。打包完成不等于已在目标电脑验收 WPS COM。
+
+每次源码运行都双击同一目录中的 `run_app.bat`。它会用本目录 `.venv\\Scripts\\python.exe` 检查 COM 导入并启动 `main.py`，不依赖当前目录或系统 `PATH`。**不要直接双击 `main.py`，也不要用系统 Python 执行 `python main.py`**：那会绕过安装器中的 `.venv`，即使 `.venv` 已正确安装 pywin32，系统 Python 仍可能报 `No module named 'pythoncom'`。若误用其他 Python 启动，错误弹窗会列出当前解释器的完整路径和正确入口；若通过 `run_app.bat` 仍缺少依赖，请检查 `build_main.log`。Linux 等非 Windows 环境不能运行 WPS COM 主处理流程，可运行：
 
 ```bash
 python3 main.py --self-check

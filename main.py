@@ -1712,7 +1712,7 @@ def _pywin32_import_error_message(exc: ImportError) -> str:
         "请从本程序目录双击 run_app.bat，它会使用本项目 .venv 中的 Python。"
         "不要直接双击 main.py，也不要用系统 Python 运行。\n"
         "如果 run_app.bat 仍提示缺少依赖，请先运行 install_and_build.bat；"
-        "安装失败诊断保存在 install_and_build.log。\n"
+        "安装失败诊断保存在 build_main.log。\n"
         f"导入错误详情：{type(exc).__name__}: {exc}"
     )
 
@@ -4116,7 +4116,13 @@ def main() -> int:
     try:
         import tkinter as tk
         root = tk.Tk()
+        root.withdraw()
+        from licensing import authorize_startup
+        if not authorize_startup(root):
+            root.destroy()
+            return 0
         App(root)
+        root.deiconify()
         root.mainloop()
         return 0
     except Exception as exc:

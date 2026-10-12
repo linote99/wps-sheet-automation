@@ -231,8 +231,8 @@ class WindowsLaunchPackagingTests(unittest.TestCase):
     def test_installer_pins_runtime_commands_to_venv_and_checks_com_first(self):
         installer = (self.project_dir / "install_and_build.bat").read_text(encoding="utf-8").lower()
         self.assertIn('set "venv_py=%~dp0.venv\\scripts\\python.exe"', installer)
-        self.assertIn('set "log_file=%~dp0install_and_build.log"', installer)
-        self.assertIn('"%venv_py%" -c "import sys, importlib.metadata as metadata, pythoncom, win32com.client;', installer)
+        self.assertIn('set "log_file=%~dp0build_main.log"', installer)
+        self.assertIn('"%venv_py%" -c "import pythoncom, win32com.client, win32crypt;', installer)
         self.assertIn('"%venv_py%" -m pip install -r "%~dp0requirements.txt"', installer)
         self.assertIn('"%venv_py%" -m pyinstaller', installer)
         self.assertIn("--hidden-import=pythoncom", installer)
@@ -250,13 +250,28 @@ class WindowsLaunchPackagingTests(unittest.TestCase):
             line.strip() for line in installer.splitlines()
             if any(marker in line for marker in (
                 "-m pip", "-m py_compile", " main.py --self-check", "-m unittest", "-m pyinstaller",
-                "-c \"import sys, importlib.metadata",
+                "-c \"import pythoncom",
             ))
         ]
-        self.assertGreaterEqual(len(python_lines), 6)
+        self.assertGreaterEqual(len(python_lines), 7)
         self.assertTrue(all(line.startswith('"%venv_py%"') for line in python_lines), python_lines)
-        self.assertLess(installer.index("import sys, importlib.metadata"), installer.index("-m py_compile"))
-        self.assertLess(installer.index("import sys, importlib.metadata"), installer.index("-m pyinstaller"))
+        self.assertLess(installer.index("import pythoncom"), installer.index("-m py_compile"))
+        self.assertLess(installer.index("import pythoncom"), installer.index("-m pyinstaller"))
+        self.assertNotIn("issuer_private_key", installer)
+        self.assertNotIn("keygen.py", installer)
+
+    def test_inno_setup_definition_builds_a_per_user_main_app_installer(self):
+        setup_script = (self.project_dir / "WpsSheetAutomation.iss").read_text(encoding="utf-8").lower()
+        installer = (self.project_dir / "install_and_build.bat").read_text(encoding="utf-8").lower()
+        self.assertIn("privilegesrequired=lowest", setup_script)
+        self.assertIn("{localappdata}\\programs\\wpssheetautomation", setup_script)
+        self.assertIn("dist\\wpssheetautomation\\*", setup_script)
+        self.assertIn("wpssheetautomation.exe", setup_script)
+        self.assertIn("wpssheetautomation_setup_v12", setup_script)
+        self.assertIn("iscc.exe", installer)
+        self.assertIn("wpssheetautomation.iss", installer)
+        self.assertNotIn("keygen.py", setup_script)
+        self.assertNotIn("issuer_private_key", setup_script)
 
     def test_run_app_resolves_its_directory_and_launches_with_venv_python(self):
         launcher = (self.project_dir / "run_app.bat").read_text(encoding="utf-8").lower()
@@ -264,7 +279,7 @@ class WindowsLaunchPackagingTests(unittest.TestCase):
         self.assertIn('set "venv_py=%~dp0.venv\\scripts\\python.exe"', launcher)
         self.assertIn('"%venv_py%" -c "import sys, pythoncom, win32com.client;', launcher)
         self.assertIn('"%venv_py%" "%~dp0main.py" %*', launcher)
-        self.assertIn("install_and_build.log", launcher)
+        self.assertIn("build_main.log", launcher)
         self.assertNotRegex(launcher, r"(?m)^\s*python(?:\.exe)?\s")
 
     def test_missing_pywin32_guidance_identifies_wrong_interpreter_and_launcher(self):
@@ -273,7 +288,7 @@ class WindowsLaunchPackagingTests(unittest.TestCase):
         self.assertIn(r"C:\Program Files\Python312\python.exe", message)
         self.assertIn("run_app.bat", message)
         self.assertIn("不要直接双击 main.py", message)
-        self.assertIn("install_and_build.log", message)
+        self.assertIn("build_main.log", message)
 
 
 class WindowSizingTests(unittest.TestCase):
@@ -967,9 +982,11 @@ class StaticConfigurationTests(unittest.TestCase):
             workbook.save(source_path)
             workbook.close()
 
-            paths = main._export_table_areas(
-                source_path, [{"sheet": "工单表", "range": "A1:C4"}], output_dir, lambda _msg: None
-            )
+            # This test validates the number-format fallback; never launch a real WPS COM server.
+            with mock.patch.object(main, "_read_wps_display_text", return_value={}):
+                paths = main._export_table_areas(
+                    source_path, [{"sheet": "工单表", "range": "A1:C4"}], output_dir, lambda _msg: None
+                )
             exported = load_workbook(paths[0], data_only=False)
             original = load_workbook(source_path, data_only=False)
             try:

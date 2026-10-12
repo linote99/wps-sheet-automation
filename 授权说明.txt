@@ -1,0 +1,9 @@
+WPS 表格多源汇总处理器——主程序包
+
+本包只含主程序源文件和授权验证逻辑，不含密钥生成器、UFI 签发插件或签发私钥。
+
+Windows 11 构建：确认安装 Python 3 和 WPS 表格，在本目录双击 install_and_build.bat。脚本会运行依赖安装、自检与静态测试，然后生成 dist\WpsSheetAutomation\WpsSheetAutomation.exe。主程序依赖 WPS COM，真实环境仍需验收。
+
+仅向用户分发构建后的 dist\WpsSheetAutomation 整个目录；不要把管理员密钥生成包发给用户。用户首次启动可试用 7 个自然日；到期后按授权窗口将机器码发至 cmccmail@qq.com。
+
+本包提供源码打包，不包含已构建、已实测的 Windows EXE。PyInstaller 是打包而非强加密；纯离线许可无法绝对防止逆向或系统日期回拨。

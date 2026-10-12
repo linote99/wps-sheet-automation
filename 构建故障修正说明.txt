@@ -1,0 +1,3 @@
+本次修正了两个构建测试问题：其一，区域导出单测不再启动真实 WPS COM；其二，主程序分包的安装脚本自检已与“仅构建主程序”的独立脚本对应。主程序包内 73 项静态回归测试通过。
+
+请关闭旧命令窗口，重新解压本包到全新文件夹并运行 install_and_build.bat。成功后从 dist\WpsSheetAutomation\WpsSheetAutomation.exe 启动。当前环境没有 Windows，未能实测 EXE。

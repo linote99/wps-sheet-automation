@@ -1,5 +1,10 @@
 # 变更记录
 
+## 2026-10-07：补充主程序 Windows 安装包构建
+- 新增 Inno Setup 安装定义；现有 Windows 构建批处理在找到 Inno Setup 6 编译器时，会在 PyInstaller 目录版构建通过后生成 `dist/WpsSheetAutomation_Setup_v12.exe`。
+- 安装器按当前用户安装，不需要管理员权限；安装目录之外的用户配置和授权状态不会随卸载删除。安装包仍只包含主程序，不包含密钥生成器或签发私钥。
+- 当前执行环境为 Linux，未在此处生成或运行 Windows 安装器；仍需在 Windows 11 上完成构建并在目标环境验收 WPS COM。
+
 ## 2026-10-06：区域 XLSX 可选转 PNG 并清理表格
 
 - 独立 Python 程序的区域输出设置改为默认关闭的 `export_region_pngs`：勾选时从已生成的区域 XLSX 导出同名 PNG；全部图片成功后才删除对应 XLSX。发生图片转换失败时保留主工作簿和区域 XLSX 作为兜底；已有同名 PNG 不覆盖。
