@@ -80,11 +80,16 @@ class FakeComWorksheet:
     @property
     def UsedRange(self):
         rows = [cell.row for cell in self.worksheet._cells.values() if cell.value is not None]
+        cols = [cell.column for cell in self.worksheet._cells.values() if cell.value is not None]
         first = min(rows, default=1)
         last = max(rows, default=1)
+        first_col = min(cols, default=1)
+        last_col = max(cols, default=1)
         return type("FakeUsedRange", (), {
             "Row": first,
             "Rows": type("FakeRows", (), {"Count": last - first + 1})(),
+            "Column": first_col,
+            "Columns": type("FakeColumns", (), {"Count": last_col - first_col + 1})(),
         })()
 
     def Range(self, address):
@@ -369,10 +374,11 @@ class WindowSizingTests(unittest.TestCase):
 class StaticConfigurationTests(unittest.TestCase):
     def test_default_and_legacy_configuration(self):
         main.validate_static_settings(main.DEFAULT_SETTINGS)
-        expected = [("EJ", "DG", 2, 3), ("EQ", "DG", 2, 3), ("FQ", "DG", 3, 4)]
-        actual = [(j["mappings"][0]["result_col"], j["mappings"][0]["target_col"], j["header_rows"], j["start_row"])
-                  for j in main.DEFAULT_SETTINGS["jobs"]]
+        expected = [(2, 3), (2, 3), (3, 4)]
+        actual = [(j["header_rows"], j["start_row"]) for j in main.DEFAULT_SETTINGS["jobs"]]
         self.assertEqual(expected, actual)
+        self.assertTrue(all(not main.normalize_settings({**main.DEFAULT_SETTINGS, "jobs": [job]})["jobs"][0]["sources"]
+                            for job in main.DEFAULT_SETTINGS["jobs"]))
         self.assertEqual([(132, 144), (132, 151), (132, 178)], [main.parse_column_range(j["formula_range"]) for j in main.DEFAULT_SETTINGS["jobs"]])
         legacy = {
             "sources": ["1.xlsx", "2.xlsx", "3.xlsx"], "source_start_row": 4,
@@ -385,7 +391,9 @@ class StaticConfigurationTests(unittest.TestCase):
         migrated = main.normalize_settings(legacy)
         self.assertEqual("1.xlsx", migrated["jobs"][0]["sources"][0]["path"])
         self.assertEqual(4, migrated["jobs"][0]["sources"][0]["copy_start_row"])
-        self.assertEqual({"result_col": "EQ", "target_col": "DG", "write_as": "value"}, migrated["jobs"][1]["mappings"][0])
+        self.assertNotIn("mappings", migrated["jobs"][1])
+        self.assertNotIn("result_col", migrated["jobs"][1])
+        self.assertNotIn("target_col", migrated["jobs"][1])
         main.validate_static_settings(migrated)
         migrated_v5 = main.normalize_settings({"config_version": 5, "jobs": deepcopy(main.DEFAULT_SETTINGS["jobs"])})
         self.assertEqual(main.CONFIG_VERSION, migrated_v5["config_version"])
@@ -409,7 +417,7 @@ class StaticConfigurationTests(unittest.TestCase):
                 self.assertIn("formula_seed_row=4", notes)
                 self.assertIn("不会用于选取公式", notes)
 
-    def test_ranges_and_mapping_validation(self):
+    def test_ranges_and_formula_validation(self):
         self.assertEqual(111, main.column_number("DG"))
         self.assertTrue(main.ranges_overlap((132, 144), (140, 150)))
         self.assertFalse(main.ranges_overlap((1, 10), (11, 20)))
@@ -417,19 +425,14 @@ class StaticConfigurationTests(unittest.TestCase):
             main.parse_column_range("EN:EB")
         with self.assertRaises(main.ProcessingError):
             main.column_number("XFE")
+        overlapping_copy_and_formula = deepcopy(main.DEFAULT_SETTINGS)
+        overlapping_copy_and_formula["jobs"][0]["sources"][0]["path"] = "C:/data/source.xlsx"
+        overlapping_copy_and_formula["copy_start_col"] = "EB"
+        overlapping_copy_and_formula["copy_end_col"] = "EB"
+        with self.assertRaisesRegex(main.ProcessingError, "与公式区域 EB:EN 重叠"):
+            main.validate_static_settings(overlapping_copy_and_formula)
         invalid = deepcopy(main.DEFAULT_SETTINGS)
-        invalid["jobs"][0]["mappings"][0]["target_col"] = "EB"
-        with self.assertRaisesRegex(main.ProcessingError, "位于公式范围 EB:EN 内"):
-            main.validate_static_settings(invalid)
-        overlapping_copy_and_mapping = deepcopy(main.DEFAULT_SETTINGS)
-        overlapping_copy_and_mapping["copy_start_col"] = "DG"
-        overlapping_copy_and_mapping["copy_end_col"] = "DG"
-        main.validate_static_settings(overlapping_copy_and_mapping)
-        duplicate_mapping = deepcopy(main.DEFAULT_SETTINGS)
-        duplicate_mapping["jobs"][0]["mappings"].append(deepcopy(duplicate_mapping["jobs"][0]["mappings"][0]))
-        with self.assertRaisesRegex(main.ProcessingError, "第 1 条和第 2 条映射都写入目标列 DG"):
-            main.validate_static_settings(duplicate_mapping)
-        invalid = deepcopy(main.DEFAULT_SETTINGS)
+        invalid["jobs"][0]["sources"][0]["path"] = "C:/data/source.xlsx"
         invalid["jobs"][0]["sources"][0]["copy_end_row"] = 1
         with self.assertRaises(main.ProcessingError):
             main.validate_static_settings(invalid)
@@ -511,20 +514,24 @@ class StaticConfigurationTests(unittest.TestCase):
     def test_missing_source_path_is_located_and_reported_before_processing(self):
         settings = deepcopy(main.DEFAULT_SETTINGS)
         settings["jobs"][1]["sources"][0]["path"] = "C:/data/second.xlsx"
-        self.assertEqual((0, 0), main._first_missing_source_location(settings))
+        self.assertIsNone(main._first_missing_source_location(settings))
         settings["jobs"][0]["sources"][0]["path"] = "  "
+        settings["jobs"][0]["sources"][0].pop("_optional_placeholder", None)
         self.assertEqual((0, 0), main._first_missing_source_location(settings))
         settings["jobs"][0]["sources"][0]["path"] = "C:/data/first.xlsx"
+        settings["jobs"][2]["sources"][0].pop("_optional_placeholder", None)
         self.assertEqual((2, 0), main._first_missing_source_location(settings))
         settings["jobs"][2]["sources"][0]["path"] = "C:/data/third.xlsx"
         self.assertIsNone(main._first_missing_source_location(settings))
 
         with tempfile.TemporaryDirectory() as td:
             fake = create_fake_data(Path(td) / "fake")
-            invalid = deepcopy(main.DEFAULT_SETTINGS)
-            invalid["template_path"] = str(fake / "template.xlsx")
-            with self.assertRaisesRegex(main.ProcessingError, '目标表“1当天派单”的第 1 份源工作簿尚未配置文件路径'):
-                main._validate_inputs(invalid)
+            template_only = deepcopy(main.DEFAULT_SETTINGS)
+            template_only["template_path"] = str(fake / "template.xlsx")
+            template_only["output_dir"] = str(fake / "output")
+            template_only["copy_start_col"] = ""
+            validated_template, _final = main._validate_inputs(template_only)
+            self.assertEqual(Path(template_only["template_path"]).resolve(), validated_template)
 
     def test_output_name_matching_template_in_same_directory_is_rejected_without_overwrite(self):
         with tempfile.TemporaryDirectory() as td:
@@ -549,10 +556,12 @@ class StaticConfigurationTests(unittest.TestCase):
                 {"path": "C:/data/one.xlsx", "source_sheet": "甲", "copy_start_row": 5, "copy_end_row": 8},
                 {"path": "C:/data/two.xlsx", "source_sheet": "乙", "copy_start_row": 2, "copy_end_row": None},
             ]
-            settings["jobs"][0]["mappings"].append({"result_col": "EK", "target_col": "DH", "write_as": "text"})
             settings["pre_mappings"] = [{"source_sheet": "模板甲", "source_range": "A1:B2", "target_sheet": "模板乙", "target_range": "C3:D4"}]
             settings["post_mappings"] = [{"source_sheet": "模板乙", "source_range": "A1:B2", "target_sheet": "模板丙", "target_range": "C3:D4"}]
+            settings["image_outputs"] = [{"sheet": "模板丙", "range": "A1:B2"}]
             settings["text_outputs"] = [{"sheet": "模板丙", "range": "A1"}]
+            settings["export_region_pngs"] = True
+            settings["retain_edited_sources"] = True
             settings["TextToColumns"] = {"enabled": True, "rules": [{"scope": "source", "sheet": "模板甲", "range": "A2:A8", "delimiter": "|", "output_start_col": "D", "column_formats": ["text", "number"]}]}
             settings["RegionFilter"] = {"enabled": True, "rules": [{"scope": "target", "sheet": "模板乙", "range": "A1:C8", "has_header": True, "filter_column": "A", "operator": "equals", "criteria": "OK"}]}
             settings["Deduplicate"] = {"enabled": True, "rules": [{"scope": "target", "sheet": "模板乙", "range": "A1:C8", "has_header": True, "key_mode": "columns", "key_columns": ["A", "C"]}]}
@@ -563,9 +572,9 @@ class StaticConfigurationTests(unittest.TestCase):
             loaded = main.load_settings(path)
             self.assertEqual(settings["jobs"][0], loaded["jobs"][0])
             self.assertEqual(main.CONFIG_VERSION, loaded["config_version"])
-            for key in ("pre_mappings", "post_mappings", "text_outputs", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert", "workflow", "config_name", "template_prefix_length"):
+            for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert", "workflow", "config_name", "template_prefix_length", "export_region_pngs", "retain_edited_sources"):
                 self.assertEqual(settings[key], loaded[key])
-            self.assertNotIn("image_outputs", loaded)
+            self.assertNotIn("mappings", loaded["jobs"][0])
 
     def test_named_profile_save_load_and_template_prefix_match_cardinality(self):
         with tempfile.TemporaryDirectory() as td:
@@ -737,19 +746,6 @@ class StaticConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(main.ProcessingError, "前映射目标.*与公式模板区域.*冲突"):
             main._validate_pre_mapping_conflicts(settings, [[ ["DATA"] ]])
 
-    def test_text_and_value_mapping_writer(self):
-        text_range = FakeComRange()
-        main._write_mapped_values(text_range, [12, None, "001"], "text")
-        self.assertEqual("@", text_range.NumberFormat)
-        self.assertEqual((("12",), (None,), ("001",)), text_range.Value2)
-        value_range = FakeComRange()
-        main._write_mapped_values(value_range, [12, None], "value")
-        self.assertEqual("General", value_range.NumberFormat)
-        self.assertEqual(((12,), (None,)), value_range.Value2)
-        single_range = FakeComRange()
-        main._write_mapped_values(single_range, ["one"], "text")
-        self.assertEqual((("one",),), single_range.Value2)
-
     def test_multiple_region_outputs_are_standalone_xlsx_and_never_overwrite(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -845,7 +841,18 @@ class StaticConfigurationTests(unittest.TestCase):
             root = Path(td)
             source_path = root / "saved.xlsx"
             output_dir = root / "exports"
-            make_test_workbook(source_path, [("工资表", {1: {1: "员工"}, 2: {1: "FAKE-EMPLOYEE"}})])
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "工资表"
+            worksheet["A1"] = "员工"
+            worksheet["A1"].fill = PatternFill(fill_type="solid", fgColor="FFFF0000")
+            worksheet["A1"].font = Font(color="FF0000FF", bold=True)
+            worksheet["A2"] = 12.3
+            worksheet["A2"].fill = PatternFill(fill_type="solid", fgColor="FF00FF00")
+            worksheet["A2"].font = Font(color="FFFF0000")
+            worksheet["A2"].number_format = "0.00"
+            workbook.save(source_path)
+            workbook.close()
             reserved_main_path = output_dir / "工资表.xlsx"
             paths = main._export_table_areas(
                 source_path, [{"sheet": "工资表", "range": "A1:A2"}], output_dir,
@@ -854,8 +861,19 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertEqual("工资表_2.xlsx", paths[0].name)
             self.assertFalse(reserved_main_path.exists())
             self.assertTrue(paths[0].is_file())
+            exported = load_workbook(paths[0], data_only=False)
+            try:
+                ws = exported["工资表"]
+                self.assertEqual("FFFF0000", ws["A1"].fill.fgColor.rgb)
+                self.assertEqual("FF0000FF", ws["A1"].font.color.rgb)
+                self.assertEqual("FF00FF00", ws["A2"].fill.fgColor.rgb)
+                self.assertEqual("FFFF0000", ws["A2"].font.color.rgb)
+                self.assertEqual("0.00", ws["A2"].number_format)
+                self.assertEqual("12.30", ws["A2"].value)
+            finally:
+                exported.close()
 
-    def test_removed_legacy_region_export_does_not_create_sidecar_files(self):
+    def test_region_xlsx_is_always_exported_and_png_is_optional(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             fake = create_fake_data(root / "fake")
@@ -870,13 +888,48 @@ class StaticConfigurationTests(unittest.TestCase):
             def fake_calculate(path, _formula_jobs, _log, _post_mappings, _settings):
                 workbook = load_workbook(path, data_only=False)
                 workbook.save(path); workbook.close()
+            def fake_pngs(paths, _log):
+                generated = []
+                for path in paths:
+                    png_path = path.with_suffix(".png")
+                    png_path.write_bytes(b"test-png")
+                    generated.append(png_path)
+                return generated
+            region_outputs = []
             with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
-                 mock.patch.object(main, "_export_table_areas", side_effect=AssertionError("removed export called")):
+                 mock.patch.object(main, "_read_wps_display_text", return_value={}), \
+                 mock.patch.object(main, "_export_region_xlsx_as_pngs", side_effect=fake_pngs):
+                result = main.process_workbooks(settings, lambda _msg: None,
+                                                on_region_outputs=region_outputs.extend)
+            self.assertTrue(result.is_file())
+            self.assertTrue((Path(settings["output_dir"]) / "1当天派单.xlsx").is_file())
+            self.assertTrue((Path(settings["output_dir"]) / "1当天派单.png").is_file())
+            self.assertIn(Path(settings["output_dir"]) / "1当天派单.xlsx", region_outputs)
+            self.assertIn(Path(settings["output_dir"]) / "1当天派单.png", region_outputs)
+
+    def test_region_xlsx_is_exported_without_png_when_unchecked(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({"copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
+                             "output_dir": str(fake / "output"), "output_filename": "xlsx-only.xlsx",
+                             "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}],
+                             "export_region_pngs": False})
+            for idx, job in enumerate(settings["jobs"], 1):
+                job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
+                                   "copy_start_row": 2, "copy_end_row": 3}]
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _settings):
+                workbook = load_workbook(path, data_only=False)
+                workbook.save(path); workbook.close()
+            with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
+                 mock.patch.object(main, "_read_wps_display_text", return_value={}):
                 result = main.process_workbooks(settings, lambda _msg: None)
             self.assertTrue(result.is_file())
-            self.assertEqual([result], list(Path(settings["output_dir"]).iterdir()))
+            self.assertTrue((Path(settings["output_dir"]) / "1当天派单.xlsx").is_file())
+            self.assertFalse((Path(settings["output_dir"]) / "1当天派单.png").exists())
 
-    def test_legacy_region_export_configuration_is_removed_on_migration(self):
+    def test_region_export_configuration_is_preserved_and_old_auto_open_removed(self):
         old = deepcopy(main.DEFAULT_SETTINGS)
         old["config_version"] = 8
         old["open_region_exports"] = True
@@ -885,10 +938,11 @@ class StaticConfigurationTests(unittest.TestCase):
         old["workflow"].append("image_output")
         normalized = main.normalize_settings(old)
         self.assertEqual(main.CONFIG_VERSION, normalized["config_version"])
-        for key in ("open_region_exports", "export_region_pngs", "image_outputs"):
-            self.assertNotIn(key, normalized)
-        self.assertNotIn("image_output", normalized["workflow"])
-        self.assertTrue(any("区域 XLSX/PNG 输出功能已移除" in note
+        self.assertNotIn("open_region_exports", normalized)
+        self.assertTrue(normalized["export_region_pngs"])
+        self.assertEqual(old["image_outputs"], normalized["image_outputs"])
+        self.assertIn("image_output", normalized["workflow"])
+        self.assertTrue(any("自动打开区域 XLSX" in note
                             for note in main.configuration_migration_notes(old)))
 
     def test_region_xlsx_png_export_uses_wps_and_never_overwrites_existing_png(self):
@@ -1227,9 +1281,11 @@ class StaticConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(main.ProcessingError, "文本预览/复制上限"):
             main.validate_static_settings(settings)
         settings = deepcopy(main.DEFAULT_SETTINGS)
-        settings["RegionFilter"] = {"enabled": True, "rules": [{"sheet": "工作表", "range": "A1", "filter_column": "A", "operator": "blank"}]}
+        settings["RegionFilter"] = {"enabled": True, "rules": [{"sheet": "工作表", "range": "A1:XFD1000", "filter_column": "A", "operator": "blank"}]}
         with self.assertRaisesRegex(main.ProcessingError, "处理上限"):
             main.validate_static_settings(settings)
+        settings["RegionFilter"]["rules"][0]["range"] = "A1"
+        main.validate_static_settings(settings)
 
     def test_text_split_refuses_to_overwrite_nonempty_destination(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1261,7 +1317,7 @@ class StaticConfigurationTests(unittest.TestCase):
         root.clipboard_clear.assert_called_once()
         root.clipboard_append.assert_called_once_with(text)
 
-    def test_mapping_can_overwrite_copied_column_after_formula_calculation(self):
+    def test_formula_results_are_not_mapped_over_copied_columns(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             fake = create_fake_data(root / "fake")
@@ -1300,15 +1356,13 @@ class StaticConfigurationTests(unittest.TestCase):
 
             final = load_workbook(staging, data_only=False)
             try:
-                self.assertEqual("CALCULATED-1", final["1当天派单"]["DG3"].value)
-                self.assertEqual("CALCULATED-2", final["1当天派单"]["DG4"].value)
+                self.assertEqual("COPIED-1", final["1当天派单"]["DG3"].value)
+                self.assertEqual("COPIED-2", final["1当天派单"]["DG4"].value)
             finally:
                 final.close()
-            calculate_index = events.index("calculate")
-            result_read_index = events.index(("read", "EJ3:EJ4"))
-            target_write_index = events.index(("write", "DG3:DG4"))
-            self.assertLess(calculate_index, result_read_index)
-            self.assertLess(result_read_index, target_write_index)
+            self.assertIn("calculate", events)
+            self.assertFalse(any(isinstance(event, tuple) and event[0] in ("read", "write") and "EJ" in event[1]
+                                 for event in events))
 
     def test_wps_order_is_recalc_post_mapping_three_independent_functions_recalc_save(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1329,7 +1383,7 @@ class StaticConfigurationTests(unittest.TestCase):
                 "sheet": "1当天派单", "range": "H3:H5", "mode": "text"}]}
             post_mappings = [{"source_sheet": "2当天归档", "source_range": "A1:B1",
                               "target_sheet": "3装移全业务在途", "target_range": "D1:E1"}]
-            formula_jobs = [("1当天派单", 3, 5, [{"result_col": "EJ", "target_col": "DG", "write_as": "value"}])]
+            formula_jobs = [("1当天派单", 3, 5, [])]
             events = []
             fake_app = FakeWpsApplication(events, {3: "CALC-3", 4: "CALC-4", 5: "CALC-5"})
             fake_pythoncom = FakePythonCom(events)
@@ -1347,14 +1401,12 @@ class StaticConfigurationTests(unittest.TestCase):
                 output.close()
 
             first_recalc = events.index("calculate")
-            result_read = events.index(("read", "EJ3:EJ5"))
             post_write = events.index(("write", "D1:E1"))
             split_write = events.index(("write", "H3:I5"))
             convert_write = events.index(("write", "H3:H5"))
             second_recalc = events.index("calculate", first_recalc + 1)
             save = events.index("save")
-            self.assertLess(first_recalc, result_read)
-            self.assertLess(result_read, post_write)
+            self.assertLess(first_recalc, post_write)
             self.assertLess(post_write, split_write)
             self.assertLess(split_write, convert_write)
             self.assertLess(convert_write, second_recalc)
@@ -1398,14 +1450,13 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertIn("已执行文本分列", action_logs[2])
             fake_workbook.workbook.close()
 
-    def test_text_output_runs_after_saved_workbook_and_no_legacy_sidecar_is_created(self):
+    def test_text_output_runs_after_saved_workbook(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             fake = create_fake_data(root / "fake")
             settings = deepcopy(main.DEFAULT_SETTINGS)
             settings.update({"copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
                              "output_dir": str(fake / "output"), "output_filename": "terminal-outputs.xlsx",
-                             "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}],
                              "text_outputs": [{"sheet": "2当天归档", "range": "A1:B2"}]})
             for idx, job in enumerate(settings["jobs"], 1):
                 job["sources"] = [{"path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
@@ -1420,7 +1471,6 @@ class StaticConfigurationTests(unittest.TestCase):
                 return [{"sheet": "2当天归档", "range": "A1:B2", "text": "preview"}]
             previews = []
             with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate), \
-                 mock.patch.object(main, "_export_table_areas", side_effect=AssertionError("removed export called")), \
                  mock.patch.object(main, "_read_text_output_areas", side_effect=fake_text):
                 result = main.process_workbooks(settings, lambda _msg: None, previews.extend)
             self.assertTrue(result.is_file())
@@ -1485,6 +1535,131 @@ class StaticConfigurationTests(unittest.TestCase):
             self.assertEqual(b"EXISTING-USER-FILE", final_path.read_bytes())
             self.assertEqual(b"NEW-WORKBOOK", staging.read_bytes())
 
+    def test_template_only_staging_preserves_existing_cells_without_sources(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            template_path = root / "template.xlsx"
+            make_test_workbook(template_path, [("模板", {1: {1: "标题"}, 5: {1: "已有模板数据"}})])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["jobs"] = [deepcopy(settings["jobs"][0])]
+            settings["jobs"][0].update({"template_sheet": "模板", "sources": [], "header_rows": 0,
+                                         "start_row": 3, "formula_range": "EB:EN"})
+            settings["copy_start_col"] = ""
+            settings["copy_end_col"] = ""
+            main.validate_static_settings(settings)
+            staging = root / "template-only.xlsx"
+            formula_jobs = main._create_staging_workbook(template_path, settings, [[]], staging, lambda _msg: None)
+            self.assertEqual([], formula_jobs)
+            output = load_workbook(staging, data_only=False)
+            try:
+                self.assertEqual("标题", output["模板"]["A1"].value)
+                self.assertEqual("已有模板数据", output["模板"]["A5"].value)
+            finally:
+                output.close()
+
+            settings.update({"template_path": str(template_path), "output_dir": str(root),
+                             "output_filename": "template-only-final.xlsx", "copy_end_col": ""})
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _region_processing):
+                workbook = load_workbook(path, data_only=False)
+                workbook.save(path)
+                workbook.close()
+            with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate):
+                final_path = main.process_workbooks(settings, lambda _msg: None)
+            self.assertTrue(final_path.is_file())
+            final = load_workbook(final_path, data_only=False)
+            try:
+                self.assertEqual("已有模板数据", final["模板"]["A5"].value)
+            finally:
+                final.close()
+
+    def test_source_rules_run_on_wps_copy_and_optional_retained_copy_preserves_original(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "source.xlsx"
+            make_test_workbook(source_path, [("Data", {1: {1: "001"}, 2: {1: "2"}})])
+            original_bytes = source_path.read_bytes()
+            output_dir = root / "output"
+            output_dir.mkdir()
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["workflow"] = ["FormatConvert"]
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "Data", "range": "A1", "mode": "number"
+            }]}
+            events = []
+            fake_app = FakeWpsApplication(events, {})
+            fake_pythoncom = FakePythonCom(events)
+            retained_paths = []
+            used_rules = set()
+            with mock.patch.object(main, "_connect_wps", return_value=(fake_app, fake_pythoncom, "fake.WPS")):
+                records = main._read_source_records_with_rules(
+                    source_path, "Data", 1, 1, 1, lambda _msg: None, 2, settings,
+                    used_rules, True, output_dir, output_dir / "result.xlsx", retained_paths.append
+                )
+            self.assertEqual([[1], [2]], records)
+            self.assertEqual({("FormatConvert", 0)}, used_rules)
+            self.assertEqual(original_bytes, source_path.read_bytes())
+            self.assertEqual(1, len(retained_paths))
+            retained = load_workbook(retained_paths[0], data_only=True)
+            try:
+                self.assertEqual(1, retained["Data"]["A1"].value)
+                self.assertEqual(2, retained["Data"]["A2"].value)
+            finally:
+                retained.close()
+            self.assertIn("save", events)
+
+    def test_processes_source_copy_before_editing_template(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "source.xlsx"
+            make_test_workbook(source_path, [("Data", {1: {1: "001"}, 2: {1: "2"}})])
+            original_bytes = source_path.read_bytes()
+            template_path = root / "template.xlsx"
+            template = Workbook()
+            template.active.title = "Target"
+            template.active["EB1"] = "=ROW()"
+            template.save(template_path)
+            template.close()
+            output_dir = root / "output"
+            output_dir.mkdir()
+
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({"template_path": str(template_path), "output_dir": str(output_dir),
+                             "output_filename": "source-first.xlsx", "copy_start_col": "A",
+                             "copy_end_col": "A"})
+            settings["jobs"] = [{
+                "template_sheet": "Target", "header_rows": 0, "start_row": 2,
+                "formula_range": "EB:EB", "sources": [{
+                    "path": str(source_path), "source_sheet": "Data",
+                    "copy_start_row": 1, "copy_end_row": 2,
+                }],
+            }]
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "scope": "source", "sheet": "Data", "range": "A1", "mode": "number",
+            }]}
+
+            events = []
+            fake_app = FakeWpsApplication(events, {})
+            fake_pythoncom = FakePythonCom(events)
+
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _settings):
+                events.append("template-processing")
+                workbook = load_workbook(path, data_only=False)
+                workbook.save(path)
+                workbook.close()
+
+            with mock.patch.object(main, "_connect_wps", return_value=(fake_app, fake_pythoncom, "fake.WPS")), \
+                    mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate):
+                final_path = main.process_workbooks(settings, lambda _msg: None)
+
+            self.assertLess(events.index("save"), events.index("template-processing"))
+            self.assertEqual(original_bytes, source_path.read_bytes())
+            result = load_workbook(final_path, data_only=False)
+            try:
+                self.assertEqual(1, result["Target"]["A2"].value)
+                self.assertEqual(2, result["Target"]["A3"].value)
+            finally:
+                result.close()
+
     def test_formula_templates_use_previous_row_and_fill_only_pasted_rows(self):
         for start_row in (3, 4):
             with self.subTest(start_row=start_row), tempfile.TemporaryDirectory() as td:
@@ -1509,15 +1684,13 @@ class StaticConfigurationTests(unittest.TestCase):
                 settings["jobs"][0].update({
                     "template_sheet": "模板", "header_rows": 0, "start_row": start_row,
                     "formula_range": "EB:EC",
-                    "mappings": [{"result_col": "EB", "target_col": "DG", "write_as": "value"}],
                 })
                 records = [[f"DATA-{start_row}-1"], [f"DATA-{start_row}-2"], [f"DATA-{start_row}-3"]]
                 staging_path = root / "staging.xlsx"
                 formula_jobs = main._create_staging_workbook(
                     template_path, settings, [records], staging_path, lambda _msg: None
                 )
-                self.assertEqual([("模板", start_row, start_row + len(records) - 1,
-                                   [{"result_col": "EB", "target_col": "DG", "write_as": "value"}])], formula_jobs)
+                self.assertEqual([("模板", start_row, start_row + len(records) - 1, [])], formula_jobs)
 
                 result = load_workbook(staging_path, data_only=False)
                 try:
@@ -2208,6 +2381,64 @@ class RegionFilterRangeShorthandTests(unittest.TestCase):
             "filter_column": "A", "operator": "equals", "criteria": "保留",
         }]}
         main.validate_static_settings(settings)
+
+    def test_sheet_row_and_column_selectors_resolve_to_used_range(self):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet["B2"] = "used-start"
+        worksheet["D4"] = "used-end"
+        fake_sheet = FakeComWorksheet(worksheet, [])
+        self.assertEqual((2, 2, 4, 4), main._resolve_com_selection_bounds(
+            fake_sheet, (1, 1, 16_384, 1_048_576), "sheet", "整表测试"))
+        self.assertEqual((2, 3, 4, 3), main._resolve_com_selection_bounds(
+            fake_sheet, (1, 3, 16_384, 3), "row", "整行测试"))
+        self.assertEqual((3, 1, 3, 4), main._resolve_com_selection_bounds(
+            fake_sheet, (3, 1, 3, 1_048_576), "column", "整列测试"))
+        workbook.close()
+
+    def test_whole_sheet_region_filter_runs_only_on_used_range(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "whole-sheet-filter.xlsx"
+            make_test_workbook(path, [("数据", {
+                2: {2: "名称", 3: "状态"},
+                3: {2: "保留-1", 3: "保留"},
+                4: {2: "删除", 3: "丢弃"},
+            })])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["RegionFilter"] = {"enabled": True, "rules": [{
+                "scope": "target", "sheet": "数据", "range": "A1", "has_header": True,
+                "filter_column": "C", "operator": "equals", "criteria": "保留",
+            }]}
+            main.validate_static_settings(settings)
+            settings["jobs"] = []
+            events = []
+            fake_workbook = FakeComWorkbook(path, events)
+            self.assertTrue(main._apply_region_processing(fake_workbook, settings, [], lambda _msg: None))
+            self.assertIn(("read", "B2:C4"), events)
+            sheet = fake_workbook.workbook["数据"]
+            self.assertEqual(["名称", "保留-1", None], [sheet.cell(row=row, column=2).value for row in range(2, 5)])
+            self.assertEqual(["状态", "保留", None], [sheet.cell(row=row, column=3).value for row in range(2, 5)])
+            fake_workbook.workbook.close()
+
+    def test_whole_sheet_format_conversion_runs_only_on_used_range(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "whole-sheet-format.xlsx"
+            make_test_workbook(path, [("数据", {2: {2: "12", 3: "13.5"}, 4: {4: "9"}})])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["FormatConvert"] = {"enabled": True, "rules": [{
+                "scope": "target", "sheet": "数据", "range": "A1", "mode": "number",
+            }]}
+            main.validate_static_settings(settings)
+            settings["jobs"] = []
+            events = []
+            fake_workbook = FakeComWorkbook(path, events)
+            self.assertTrue(main._apply_region_processing(fake_workbook, settings, [], lambda _msg: None))
+            self.assertIn(("read", "B2:D4"), events)
+            sheet = fake_workbook.workbook["数据"]
+            self.assertEqual(12, sheet["B2"].value)
+            self.assertEqual(13.5, sheet["C2"].value)
+            self.assertEqual(9, sheet["D4"].value)
+            fake_workbook.workbook.close()
 
     def test_target_region_filter_single_column_uses_used_rows_only(self):
         with tempfile.TemporaryDirectory() as td:

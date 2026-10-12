@@ -50,7 +50,7 @@ def _window_size_path() -> Path:
 
 
 WINDOW_SIZE_PATH = _window_size_path()
-CONFIG_VERSION = 9
+CONFIG_VERSION = 11
 LEGACY_FORMULA_ROW_KEYS = ("formula_seed_row", "formula_template_row", "formula_row", "seed_row")
 MAX_PROCESSING_CELLS = 500_000
 MAX_REGION_XLSX_CELLS = 100_000
@@ -71,10 +71,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "output_dir": "",
     "output_filename": "处理结果.xlsx",
     "output_filename_custom": None,
+    "export_region_pngs": False,
+    "retain_edited_sources": False,
     "copy_start_col": "A",
     "copy_end_col": "",
     "pre_mappings": [],
     "post_mappings": [],
+    "image_outputs": [],
     "text_outputs": [],
     "TextToColumns": {"enabled": False, "rules": []},
     "Deduplicate": {"enabled": False, "rules": []},
@@ -84,14 +87,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "source_start_row": 2,
     "jobs": [
         {"template_sheet": "1当天派单", "header_rows": 2, "start_row": 3, "formula_range": "EB:EN",
-         "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None}],
-         "mappings": [{"result_col": "EJ", "target_col": "DG", "write_as": "value"}]},
+         "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None, "_optional_placeholder": True}]},
         {"template_sheet": "2当天归档", "header_rows": 2, "start_row": 3, "formula_range": "EB:EU",
-         "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None}],
-         "mappings": [{"result_col": "EQ", "target_col": "DG", "write_as": "value"}]},
+         "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None, "_optional_placeholder": True}]},
         {"template_sheet": "3装移全业务在途", "header_rows": 3, "start_row": 4, "formula_range": "EB:FV",
-         "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None}],
-         "mappings": [{"result_col": "FQ", "target_col": "DG", "write_as": "value"}]},
+         "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None, "_optional_placeholder": True}]},
     ],
 }
 
@@ -235,8 +235,18 @@ def configuration_migration_notes(raw: Any) -> list[str]:
             f"旧配置版本 v{version} 已按 v7 规则迁移：每个目标表的 start_row 保持为粘贴起始行，"
             "公式模板行自动取 start_row - 1；旧版本中将起始行当作公式种子行的含义不再沿用。"
         )
-    if any(key in raw for key in ("image_outputs", "export_region_pngs", "open_region_exports")):
-        notes.append("旧配置中的独立区域 XLSX/PNG 输出功能已移除；相关配置会被忽略，文本预览/复制功能不受影响。")
+    if version < 11:
+        notes.append("配置已升级到 v11：源文件规则先在临时副本中由 WPS 执行；目标表可不关联源文件并直接保留模板内容处理。可选保留的源副本会写入输出目录，原件不变。")
+    if "open_region_exports" in raw:
+        notes.append("旧版自动打开区域 XLSX 的选项已停用；区域 XLSX 将输出到所选目录，不再自动打开。")
+    legacy_workflow = raw.get("workflow", [])
+    if not isinstance(legacy_workflow, list):
+        legacy_workflow = []
+    if "result_mapping" in legacy_workflow or any(
+        isinstance(job, dict) and any(key in job for key in ("mappings", "result_col", "target_col"))
+        for job in jobs
+    ):
+        notes.append("公式结果列映射已取消；旧配置中的结果列映射规则会被移除。前映射和后映射保留。")
     for index, job in enumerate(jobs, 1):
         if not isinstance(job, dict):
             continue
@@ -356,6 +366,31 @@ def _last_used_row_from_com(worksheet, label: str) -> int:
         raise ProcessingError(f"无法读取{label}的已用行范围；整列筛选已停止。原因：{exc}") from exc
 
 
+def _used_range_bounds_from_com(worksheet, label: str) -> tuple[int, int, int, int]:
+    """Read the bounded used rectangle of a WPS worksheet for whole-sheet selectors."""
+    try:
+        used_range = worksheet.UsedRange
+        min_row = max(1, int(used_range.Row))
+        min_col = max(1, int(used_range.Column))
+        row_count = max(1, int(used_range.Rows.Count))
+        col_count = max(1, int(used_range.Columns.Count))
+        return (min_col, min_row, min_col + col_count - 1, min_row + row_count - 1)
+    except Exception as exc:
+        raise ProcessingError(f"无法读取{label}的 WPS UsedRange；整表/整行/整列处理已停止。原因：{exc}") from exc
+
+
+def _resolve_com_selection_bounds(worksheet, bounds: tuple[int, int, int, int],
+                                  selection_kind: str, label: str) -> tuple[int, int, int, int]:
+    if selection_kind not in ("sheet", "row", "column"):
+        return bounds
+    used_min_col, used_min_row, used_max_col, used_max_row = _used_range_bounds_from_com(worksheet, label)
+    if selection_kind == "sheet":
+        return used_min_col, used_min_row, used_max_col, used_max_row
+    if selection_kind == "row":
+        return used_min_col, bounds[1], used_max_col, bounds[1]
+    return bounds[0], 1, bounds[0], used_max_row
+
+
 def _area_cell_count(bounds: tuple[int, int, int, int]) -> int:
     return (bounds[2] - bounds[0] + 1) * (bounds[3] - bounds[1] + 1)
 
@@ -452,9 +487,9 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
             src_path = old_sources[idx] if idx < len(old_sources) else ""
             job["sources"] = [{"path": src_path, "source_sheet": job.pop("source_sheet", ""),
                                "copy_start_row": global_start, "copy_end_row": None}]
-            result_col = job.pop("result_col", "")
-            target_col = job.pop("target_col", "")
-            job["mappings"] = [{"result_col": result_col, "target_col": target_col, "write_as": "value"}]
+            job.pop("result_col", None)
+            job.pop("target_col", None)
+            job.pop("mappings", None)
             migrated.append(job)
         raw_jobs = migrated
     normalized_jobs = []
@@ -465,32 +500,35 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
         job = deepcopy(original)
         for legacy_key in LEGACY_FORMULA_ROW_KEYS:
             job.pop(legacy_key, None)
-        if "mappings" not in job:
-            result_col = job.pop("result_col", "")
-            target_col = job.pop("target_col", "")
-            job["mappings"] = [{"result_col": result_col, "target_col": target_col, "write_as": "value"}]
+        for removed_key in ("mappings", "result_col", "target_col"):
+            job.pop(removed_key, None)
         source_items = job.get("sources", [])
         if isinstance(source_items, list):
             converted = []
             for source in source_items:
                 if isinstance(source, str):
+                    if not source.strip():
+                        continue
                     converted.append({"path": source, "source_sheet": "", "copy_start_row": raw.get("source_start_row", 2), "copy_end_row": None})
                 elif isinstance(source, dict):
                     item = {"path": "", "source_sheet": "", "copy_start_row": raw.get("source_start_row", 2), "copy_end_row": None}
                     item.update(source)
+                    if not str(item.get("path") or "").strip():
+                        continue
+                    item.pop("_optional_placeholder", None)
                     converted.append(item)
                 else:
                     converted.append(source)
             job["sources"] = converted
         normalized_jobs.append(job)
     settings["jobs"] = normalized_jobs
-    # Region XLSX/PNG output was removed. Ignore those legacy keys rather than
-    # carrying them into saved configurations or the execution pipeline.
-    for removed_key in ("open_region_exports", "export_region_pngs", "image_outputs"):
-        settings.pop(removed_key, None)
-    for key in ("pre_mappings", "post_mappings", "text_outputs"):
+    # The old auto-open switch is not supported; configured XLSX outputs remain.
+    settings.pop("open_region_exports", None)
+    for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs"):
         if settings.get(key) is None:
             settings[key] = []
+    settings["export_region_pngs"] = bool(settings.get("export_region_pngs", False))
+    settings["retain_edited_sources"] = bool(settings.get("retain_edited_sources", False))
     for key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
         operation = settings.get(key)
         if operation is None:
@@ -502,7 +540,11 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
         settings["workflow"] = list(DEFAULT_WORKFLOW)
     if not isinstance(settings.get("workflow"), list):
         raise ProcessingError("配置中的 workflow 必须是模块 ID 数组。")
-    settings["workflow"] = [module_id for module_id in settings["workflow"] if module_id != "image_output"]
+    settings["workflow"] = [module_id for module_id in settings["workflow"] if module_id != "result_mapping"]
+    if "source_preprocess" not in settings["workflow"]:
+        settings["workflow"].insert(0, "source_preprocess")
+    if settings["image_outputs"] and "image_output" not in settings["workflow"]:
+        settings["workflow"].append("image_output")
     try:
         prefix_length = int(settings.get("template_prefix_length", 5))
     except (TypeError, ValueError) as exc:
@@ -532,10 +574,11 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
     jobs = settings.get("jobs")
     if not isinstance(jobs, list) or not jobs:
         raise ProcessingError("至少需要配置一个目标工作表。")
-    copy_start = column_number(settings.get("copy_start_col", "A"))
+    has_sources = any(isinstance(job, dict) and job.get("sources") for job in jobs)
+    copy_start = column_number(str(settings.get("copy_start_col", "A")).strip() or "A") if has_sources else 1
     copy_end_value = str(settings.get("copy_end_col", "")).strip()
     copy_range = None
-    if copy_end_value:
+    if has_sources and copy_end_value:
         copy_end = column_number(copy_end_value)
         if copy_start > copy_end:
             raise ProcessingError("数据复制列范围的起始列不能在末列之后。")
@@ -544,7 +587,7 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
     for idx, job in enumerate(jobs, start=1):
         if not isinstance(job, dict):
             raise ProcessingError(f"第 {idx} 个目标工作表配置必须是对象。")
-        for key in ("template_sheet", "header_rows", "start_row", "formula_range", "sources", "mappings"):
+        for key in ("template_sheet", "header_rows", "start_row", "formula_range", "sources"):
             if key not in job:
                 raise ProcessingError(f"第 {idx} 个目标工作表配置缺少“{key}”。")
         sheet_name = str(job["template_sheet"]).strip()
@@ -560,9 +603,11 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
         if start_row <= header_rows:
             raise ProcessingError(f"第 {idx} 项目标起始行必须大于保留标题行数。")
         formula_range = parse_column_range(job["formula_range"])
+        if copy_range is not None and ranges_overlap(copy_range, formula_range):
+            raise ProcessingError(f"第 {idx} 项数据复制列范围与公式区域 {job['formula_range']} 重叠。")
         sources = job["sources"]
-        if not isinstance(sources, list) or not sources:
-            raise ProcessingError(f"第 {idx} 个目标表至少需要关联一份源文件。")
+        if not isinstance(sources, list):
+            raise ProcessingError(f"第 {idx} 个目标表的源文件配置必须是列表；可留空以单独编辑模板。")
         for source_idx, source in enumerate(sources, 1):
             if not isinstance(source, dict):
                 raise ProcessingError(f"第 {idx} 个目标表的第 {source_idx} 份源文件配置无效。")
@@ -574,31 +619,6 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
                 src_end = _positive_row(src_end, f"第 {idx} 个目标表第 {source_idx} 份源文件的复制结束行")
                 if src_end < src_start:
                     raise ProcessingError(f"第 {idx} 个目标表第 {source_idx} 份源文件结束行不得早于起始行。")
-        mappings = job["mappings"]
-        if not isinstance(mappings, list) or not mappings:
-            raise ProcessingError(f"第 {idx} 个目标表至少需要一条结果列映射。")
-        targets: dict[int, int] = {}
-        for map_idx, mapping in enumerate(mappings, 1):
-            if not isinstance(mapping, dict):
-                raise ProcessingError(f"第 {idx} 个目标表的第 {map_idx} 条映射无效。")
-            try:
-                result_col = column_number(mapping.get("result_col", ""))
-                target_col = column_number(mapping.get("target_col", ""))
-            except ProcessingError as exc:
-                raise ProcessingError(f"第 {idx} 个目标表第 {map_idx} 条映射：{exc}") from exc
-            if not (formula_range[0] <= result_col <= formula_range[1]):
-                raise ProcessingError(f"第 {idx} 项结果列 {mapping['result_col']} 不在公式范围 {job['formula_range']} 内。")
-            if formula_range[0] <= target_col <= formula_range[1]:
-                raise ProcessingError(f"第 {idx} 个目标表第 {map_idx} 条映射的目标列 {mapping['target_col']} 位于公式范围 {job['formula_range']} 内；写回会覆盖必须保留的公式列，请改用公式范围外的目标列。")
-            if target_col in targets:
-                raise ProcessingError(f"第 {idx} 个目标表第 {targets[target_col]} 条和第 {map_idx} 条映射都写入目标列 {mapping['target_col']}，会互相覆盖；请为每条映射指定不同目标列。")
-            targets[target_col] = map_idx
-            mode = str(mapping.get("write_as", "value")).strip().lower()
-            if mode not in ("value", "text"):
-                raise ProcessingError(f"第 {idx} 项映射写入类型只能是 value（值）或 text（文本）。")
-            if copy_range is not None:
-                if ranges_overlap(copy_range, formula_range):
-                    raise ProcessingError(f"第 {idx} 项数据复制列范围与公式区域 {job['formula_range']} 重叠。")
     if len(set(names)) != len(names):
         raise ProcessingError("目标工作表名称必须互不相同。")
 
@@ -626,6 +646,18 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
                     raise ProcessingError(f"第 {previous_idx} 条和第 {rule_idx} 条{label}规则的目标区域重叠：{target_sheet}!{_area_address(previous)} 与 {_area_address(target_bounds)}。")
             destinations[target_sheet].append((rule_idx, target_bounds))
 
+    outputs = settings.get("image_outputs", [])
+    if not isinstance(outputs, list):
+        raise ProcessingError("配置中的 image_outputs 必须是数组。")
+    for output_idx, output in enumerate(outputs, 1):
+        if not isinstance(output, dict):
+            raise ProcessingError(f"第 {output_idx} 项区域 XLSX 输出配置必须是对象。")
+        if "sheet" not in output or "range" not in output:
+            raise ProcessingError(f"第 {output_idx} 项区域 XLSX 输出配置需要 sheet 和 range。")
+        _validate_sheet_name(output["sheet"], f"第 {output_idx} 项区域 XLSX 输出")
+        bounds, selection_kind = _parse_selection_details(output["range"], f"第 {output_idx} 项区域 XLSX 输出")
+        if selection_kind not in ("sheet", "row", "column"):
+            _check_region_xlsx_area_size(bounds, f"第 {output_idx} 项区域 XLSX 输出")
     outputs = settings.get("text_outputs", [])
     if not isinstance(outputs, list):
         raise ProcessingError("配置中的 text_outputs 必须是数组。")
@@ -659,7 +691,7 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
                 bounds, selection_kind = _parse_region_filter_area(rule.get("range"), f"第 {idx} 条{label}")
             else:
                 bounds, selection_kind = _parse_selection_details(rule.get("range"), f"第 {idx} 条{label}")
-            if selection_kind != "column":
+            if selection_kind not in ("column", "row", "sheet"):
                 _check_processing_area_size(bounds, f"第 {idx} 条{label}")
             if key == "TextToColumns":
                 if bounds[0] != bounds[2]:
@@ -1232,7 +1264,7 @@ def _first_missing_source_location(settings: dict[str, Any]) -> tuple[int, int] 
     """Return the zero-based job/source position of the first blank source path."""
     for job_idx, job in enumerate(settings.get("jobs", [])):
         for source_idx, source in enumerate(job.get("sources", [])):
-            if not str(source.get("path") or "").strip():
+            if not str(source.get("path") or "").strip() and not source.get("_optional_placeholder", False):
                 return job_idx, source_idx
     return None
 
@@ -1506,8 +1538,6 @@ def _validate_inputs(raw_settings: dict[str, Any]) -> tuple[Path, Path]:
     _check_xlsx_file(template_path, "模板工作簿")
     all_inputs = {template_path}
     for job_idx, job in enumerate(settings["jobs"], 1):
-        if not job["sources"]:
-            raise ProcessingError(f"目标表“{job['template_sheet']}”至少需要一份源文件。")
         for source_idx, source in enumerate(job["sources"], 1):
             path = _normalize_path(source.get("path", ""), f"目标表“{job['template_sheet']}”第 {source_idx} 份源工作簿")
             # Blank source_sheet is intentionally resolved by the reader to the first sheet.
@@ -1538,10 +1568,12 @@ def _validate_inputs(raw_settings: dict[str, Any]) -> tuple[Path, Path]:
         raise ProcessingError(f"输出文件已存在，为防止覆盖任何文件已停止：\n{final_path}\n请更改输出文件名或选择其他输出目录。")
     if final_path in all_inputs:
         raise ProcessingError("输出路径不能与模板或任何源工作簿相同。")
-    if not str(settings.get("copy_end_col", "")).strip():
-        raise ProcessingError("请填写数据复制末列；程序不会猜测需要复制的源列范围。")
-    column_number(settings["copy_start_col"])
-    column_number(settings["copy_end_col"])
+    if any(job.get("sources") for job in settings["jobs"]):
+        column_number(str(settings.get("copy_start_col", "A")).strip() or "A")
+        if str(settings.get("copy_end_col", "")).strip():
+            column_number(settings["copy_end_col"])
+        else:
+            raise ProcessingError("请填写数据复制末列；程序不会猜测需要复制的源列范围。仅模板编辑时无需设置复制列范围。")
     return template_path, final_path
 
 
@@ -1552,6 +1584,10 @@ def _validate_template_area_sheets(workbook, settings: dict[str, Any]) -> None:
                 sheet_name = str(rule[field]).strip()
                 if sheet_name not in workbook.sheetnames:
                     raise ProcessingError(f"第 {idx} 条{label}规则引用了模板中不存在的工作表“{sheet_name}”。")
+    for idx, output in enumerate(settings.get("image_outputs", []), 1):
+        sheet_name = str(output["sheet"]).strip()
+        if sheet_name not in workbook.sheetnames:
+            raise ProcessingError(f"第 {idx} 项区域 XLSX 输出引用了模板中不存在的工作表“{sheet_name}”。")
     for idx, output in enumerate(settings.get("text_outputs", []), 1):
         sheet_name = str(output["sheet"]).strip()
         if sheet_name not in workbook.sheetnames:
@@ -1605,23 +1641,20 @@ def _apply_pre_mapping_values(workbook, captured, log: Callable[[str], None]) ->
 
 def _validate_pre_mapping_conflicts(settings: dict[str, Any], source_records: list[list[list[Any]]]) -> None:
     """Reject pre-map targets that overlap any main-data/formula/post-map write area."""
-    copy_start = column_number(settings["copy_start_col"])
-    copy_end = column_number(settings["copy_end_col"])
+    copy_start = column_number(str(settings.get("copy_start_col", "A")).strip() or "A")
+    copy_end_value = str(settings.get("copy_end_col", "")).strip()
+    copy_end = column_number(copy_end_value) if copy_end_value else copy_start
     protected: dict[str, list[tuple[str, tuple[int, int, int, int]]]] = {}
     for job, records in zip(settings["jobs"], source_records):
-        start_row = int(job["start_row"])
-        end_row = start_row + len(records) - 1
         sheet = str(job["template_sheet"]).strip()
-        if end_row < start_row:
-            continue
-        protected.setdefault(sheet, []).append(("主数据复制", (copy_start, start_row, copy_end, end_row)))
-        formula_start, formula_end = parse_column_range(job["formula_range"])
-        protected[sheet].append(("公式填充", (formula_start, start_row, formula_end, end_row)))
         template_row = _formula_template_row(job)
-        protected[sheet].append(("公式模板", (1, template_row, 16_384, template_row)))
-        for mapping in job["mappings"]:
-            col = column_number(mapping["target_col"])
-            protected[sheet].append(("结果映射", (col, start_row, col, end_row)))
+        protected.setdefault(sheet, []).append(("公式模板", (1, template_row, 16_384, template_row)))
+        if records:
+            start_row = int(job["start_row"])
+            end_row = start_row + len(records) - 1
+            protected[sheet].append(("主数据复制", (copy_start, start_row, copy_end, end_row)))
+            formula_start, formula_end = parse_column_range(job["formula_range"])
+            protected[sheet].append(("公式填充", (formula_start, start_row, formula_end, end_row)))
     for rule in settings.get("post_mappings", []):
         bounds = _parse_area(rule["target_range"], "后映射目标")
         protected.setdefault(str(rule["target_sheet"]).strip(), []).append(("后映射", bounds))
@@ -1655,18 +1688,21 @@ def _create_staging_workbook_from_copy(template_path: Path, load_path: _Temporar
             for cell in ws._cells.values():
                 if isinstance(cell.value, str) and cell.value.startswith("=") and _find_external_formula(cell.value):
                     raise ProcessingError(f"模板“{ws.title}”单元格 {cell.coordinate} 含外部引用或外部访问函数；为避免外部访问已停止。")
-        copy_start = column_number(settings["copy_start_col"])
-        prepared = []
-        for idx, job in enumerate(settings["jobs"], 1):
-            start_row = int(job["start_row"])
-            c1, c2, formulas = _get_formula_templates(wb, job, idx, start_row)
-            prepared.append((job, wb[str(job["template_sheet"]).strip()], start_row, int(job["header_rows"]), c1, c2, formulas))
-        if len(source_records) != len(prepared):
+        copy_start = column_number(str(settings.get("copy_start_col", "A")).strip() or "A")
+        if len(source_records) != len(settings["jobs"]):
             raise ProcessingError("内部数据与目标工作表数量不一致。")
         job_ranges = []
-        for idx, ((job, ws, start_row, header_rows, _c1, _c2, formulas), records) in enumerate(zip(prepared, source_records), 1):
+        for idx, (job, records) in enumerate(zip(settings["jobs"], source_records), 1):
+            sheet_name = str(job["template_sheet"]).strip()
+            if sheet_name not in wb.sheetnames:
+                raise ProcessingError(f"模板中找不到第 {idx} 个目标工作表“{sheet_name}”。")
+            ws = wb[sheet_name]
+            start_row = int(job["start_row"])
+            header_rows = int(job["header_rows"])
             if not records:
-                raise ProcessingError(f"目标表“{job['template_sheet']}”没有可写入的数据。")
+                log(f"目标表“{sheet_name}”未关联源文件；保留模板现有内容，仅执行配置的模板规则。")
+                continue
+            _c1, _c2, formulas = _get_formula_templates(wb, job, idx, start_row)
             end_row = start_row + len(records) - 1
             if end_row > 1_048_576:
                 raise ProcessingError(f"第 {idx} 个工作表目标末行超出 Excel 最大行数。")
@@ -1704,10 +1740,7 @@ def _create_staging_workbook_from_copy(template_path: Path, load_path: _Temporar
                         ws[target] = Translator(formula, origin=origin).translate_formula(target)
                     except Exception as exc:
                         raise ProcessingError(f"无法将模板公式 {job['template_sheet']}!{origin} 填充到 {target}：{exc}") from exc
-            mappings = [{"result_col": str(m["result_col"]).strip().upper(),
-                         "target_col": str(m["target_col"]).strip().upper(),
-                         "write_as": str(m.get("write_as", "value")).strip().lower()} for m in job["mappings"]]
-            formula_jobs.append((str(job["template_sheet"]).strip(), start_row, end_row, mappings))
+            formula_jobs.append((str(job["template_sheet"]).strip(), start_row, end_row, []))
             log(f"已准备“{job['template_sheet']}”：按配置顺序追加 {len(records)} 行，填充第 {start_row} 至 {end_row} 行公式。")
         wb.save(staging_path)
         return formula_jobs
@@ -1715,18 +1748,6 @@ def _create_staging_workbook_from_copy(template_path: Path, load_path: _Temporar
         raise
     except Exception as exc:
         raise ProcessingError(f"创建中间工作簿失败：{exc}") from exc
-
-
-def _write_mapped_values(destination, values: list[Any], write_as: str) -> None:
-    """Write one column to a COM-like range; text mode forces string values and text format."""
-    mode = str(write_as).strip().lower()
-    if mode == "text":
-        values = [None if value is None else str(value) for value in values]
-        try:
-            destination.NumberFormat = "@"
-        except Exception:
-            pass
-    destination.Value2 = tuple((value,) for value in values)
 
 
 def _com_value_matrix(value, rows: int, cols: int) -> list[list[Any]]:
@@ -1810,11 +1831,16 @@ def _excel_number_format(mode: str) -> str:
 
 def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, log: Callable[[str], None]) -> bool:
     formula_areas: dict[str, list[tuple[int, int, int, int]]] = {}
-    for job, formula_job in zip(settings.get("jobs", []), formula_jobs):
-        sheet_name, start_row, end_row, _mappings = formula_job
-        col_start, col_end = parse_column_range(job["formula_range"])
-        formula_areas.setdefault(sheet_name, []).append((col_start, start_row, col_end, end_row))
-        formula_areas[sheet_name].append((1, _formula_template_row(job), 16_384, _formula_template_row(job)))
+    formula_jobs_by_sheet = {item[0]: item[1:3] for item in formula_jobs}
+    for job in settings.get("jobs", []):
+        sheet_name = str(job["template_sheet"]).strip()
+        if sheet_name in formula_jobs_by_sheet:
+            start_row, end_row = formula_jobs_by_sheet[sheet_name]
+            if end_row >= start_row:
+                col_start, col_end = parse_column_range(job["formula_range"])
+                formula_areas.setdefault(sheet_name, []).append((col_start, start_row, col_end, end_row))
+        template_row = _formula_template_row(job)
+        formula_areas.setdefault(sheet_name, []).append((1, template_row, 16_384, template_row))
     applied_any = False
     operation_labels = {"TextToColumns": "文本分列", "RegionFilter": "区域筛选",
                         "Deduplicate": "去重", "FormatConvert": "格式转换"}
@@ -1833,9 +1859,7 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
             else:
                 bounds, selection_kind = _parse_selection_details(rule["range"], f"第 {rule_idx} 条{label}")
             worksheet = workbook.Worksheets(sheet_name)
-            if operation_key == "RegionFilter" and selection_kind == "column":
-                used_last_row = _last_used_row_from_com(worksheet, f"第 {rule_idx} 条{label}")
-                bounds = (bounds[0], 1, bounds[2], used_last_row)
+            bounds = _resolve_com_selection_bounds(worksheet, bounds, selection_kind, f"第 {rule_idx} 条{label}")
             _check_processing_area_size(bounds, f"第 {rule_idx} 条{label}")
             if any(_areas_overlap(bounds, protected) for protected in formula_areas.get(sheet_name, [])):
                 raise ProcessingError(f"第 {rule_idx} 条{label}规则区域 {sheet_name}!{_area_address(bounds)} 与本次填充的公式区域重叠；为避免删除保留公式，已停止。")
@@ -1862,11 +1886,14 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
                     worksheet.Range(f"{col_letter}{bounds[1]}:{col_letter}{bounds[3]}").NumberFormat = _excel_number_format(formats[col_offset])
                 log(f"已执行文本分列规则 {rule_idx}：{sheet_name}!{_area_address(bounds)} → {sheet_name}!{_area_address(target_bounds)}，分隔符={rule['delimiter']!r}。")
             elif operation_key == "RegionFilter":
+                filter_col = column_number(rule["filter_column"])
+                if not bounds[0] <= filter_col <= bounds[2]:
+                    raise ProcessingError(f"第 {rule_idx} 条区域筛选规则的条件列 {get_column_letter(filter_col)} 不在实际已用范围 {sheet_name}!{_area_address(bounds)} 内。")
                 _assert_no_formulas(source_range, f"第 {rule_idx} 条区域筛选规则区域")
                 matrix = _read_com_area(source_range, bounds)
                 filtered, removed, _keep_indexes = filter_matrix(
                     matrix, bool(rule.get("has_header", False)),
-                    column_number(rule["filter_column"]) - bounds[0],
+                    filter_col - bounds[0],
                     str(rule.get("operator", "equals")), str(rule.get("criteria", "")))
                 _write_com_area(source_range, filtered)
                 log(f"已执行区域筛选规则 {rule_idx}：{sheet_name}!{_area_address(bounds)}，移除不匹配记录 {removed} 行；仅压缩所选区域。")
@@ -1875,6 +1902,8 @@ def _apply_region_processing(workbook, settings: dict[str, Any], formula_jobs, l
                 matrix = _read_com_area(source_range, bounds)
                 key_mode = str(rule.get("key_mode", "row")).lower()
                 key_indexes = None if key_mode == "row" else [column_number(value) - bounds[0] for value in rule["key_columns"]]
+                if key_indexes is not None and any(index < 0 or index >= bounds[2] - bounds[0] + 1 for index in key_indexes):
+                    raise ProcessingError(f"第 {rule_idx} 条去重规则的关键列不在实际已用范围 {sheet_name}!{_area_address(bounds)} 内。")
                 result, removed = deduplicate_matrix(matrix, bool(rule.get("has_header", False)), key_mode, key_indexes)
                 _write_com_area(source_range, result)
                 log(f"已执行去重规则 {rule_idx}：{sheet_name}!{_area_address(bounds)}，按{'整行' if key_mode == 'row' else '关键列 ' + ','.join(rule['key_columns'])}判重，移除 {removed} 行，保留首次出现。")
@@ -1951,20 +1980,7 @@ def _calculate_in_wps(staging_path: Path, formula_jobs: list[tuple[str, int, int
             raise ProcessingError(f"已连接 WPS（{progid}），但无法在禁用外部链接更新模式下打开中间工作簿：{exc}") from exc
         log("已在 WPS 中打开中间工作簿，开始完整重算公式。")
         _recalculate_and_wait(app, log, "映射前")
-        log("映射前公式重算完成；现在写入结果列映射及配置的后映射区域。")
-        for sheet_name, start_row, end_row, mappings in formula_jobs:
-            ws = workbook.Worksheets(sheet_name)
-            count = end_row - start_row + 1
-            for mapping in mappings:
-                result_col, target_col = mapping["result_col"], mapping["target_col"]
-                src = ws.Range(f"{result_col}{start_row}:{result_col}{end_row}").Value2
-                if count == 1:
-                    values = [src[0][0] if isinstance(src, (tuple, list)) else src]
-                else:
-                    values = [row[0] for row in src]
-                destination = ws.Range(f"{target_col}{start_row}:{target_col}{end_row}")
-                _write_mapped_values(destination, values, mapping.get("write_as", "value"))
-                log(f"已将 {sheet_name}!{result_col}{start_row}:{result_col}{end_row} 按{'文本' if mapping.get('write_as') == 'text' else '值'}写入 {target_col} 列。")
+        log("首次完整重算完成；将直接保留公式结果，并应用配置的后映射区域。")
         for idx, rule in enumerate(post_mappings or [], 1):
             source_bounds = _parse_area(rule["source_range"], f"第 {idx} 条后映射源")
             target_bounds = _parse_area(rule["target_range"], f"第 {idx} 条后映射目标")
@@ -2015,18 +2031,15 @@ def _calculate_in_wps(staging_path: Path, formula_jobs: list[tuple[str, int, int
 
 def _validate_post_mapping_conflicts(settings: dict[str, Any], source_records: list[list[list[Any]]]) -> None:
     formula_areas: dict[str, list[tuple[int, int, int, int]]] = {}
-    column_map_areas: dict[str, list[tuple[int, int, int, int]]] = {}
     for job, records in zip(settings["jobs"], source_records):
         sheet = str(job["template_sheet"]).strip()
         start_row = int(job["start_row"])
-        end_row = start_row + len(records) - 1
-        c1, c2 = parse_column_range(job["formula_range"])
-        formula_areas.setdefault(sheet, []).append((c1, start_row, c2, end_row))
         template_row = _formula_template_row(job)
-        formula_areas[sheet].append((1, template_row, 16_384, template_row))
-        for mapping in job["mappings"]:
-            col = column_number(mapping["target_col"])
-            column_map_areas.setdefault(sheet, []).append((col, start_row, col, end_row))
+        formula_areas.setdefault(sheet, []).append((1, template_row, 16_384, template_row))
+        if records:
+            end_row = start_row + len(records) - 1
+            c1, c2 = parse_column_range(job["formula_range"])
+            formula_areas[sheet].append((c1, start_row, c2, end_row))
 
     for idx, rule in enumerate(settings.get("post_mappings", []), 1):
         sheet = str(rule["target_sheet"]).strip()
@@ -2034,9 +2047,6 @@ def _validate_post_mapping_conflicts(settings: dict[str, Any], source_records: l
         for protected in formula_areas.get(sheet, []):
             if _areas_overlap(target, protected):
                 raise ProcessingError(f"第 {idx} 条后映射目标 {sheet}!{_area_address(target)} 会覆盖保留公式区域 {_area_address(protected)}；已停止处理。")
-        for protected in column_map_areas.get(sheet, []):
-            if _areas_overlap(target, protected):
-                raise ProcessingError(f"第 {idx} 条后映射目标 {sheet}!{_area_address(target)} 与结果映射目标 {_area_address(protected)} 重复；已停止处理。")
 
 
 def _sanitize_filename_fragment(value: str) -> str:
@@ -2063,6 +2073,126 @@ def _copy_file_exclusive(source: Path, destination: Path) -> None:
     except Exception:
         destination.unlink(missing_ok=True)
         raise
+
+
+def _publish_processed_source_copy(source_copy: Path, original_path: Path, output_dir: Path,
+                                   reserved_paths: set[Path] | None = None) -> Path:
+    """Publish an edited source workbook beside the main output, never replacing files."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reserved = {Path(path).resolve() for path in (reserved_paths or set())}
+    base = _sanitize_filename_fragment(f"{original_path.stem}_已编辑")
+    collision = 1
+    while True:
+        suffix = "" if collision == 1 else f"_{collision}"
+        destination = output_dir / f"{base}{suffix}.xlsx"
+        if destination.resolve() in reserved:
+            collision += 1
+            continue
+        try:
+            _copy_file_exclusive(source_copy, destination)
+            return destination
+        except FileExistsError:
+            collision += 1
+
+
+def _source_rules_for_sheets(settings: dict[str, Any], sheet_names: set[str]):
+    source_settings = deepcopy(settings)
+    source_settings["jobs"] = []
+    used_rules: set[tuple[str, int]] = set()
+    any_rules = False
+    for operation_key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
+        operation = settings.get(operation_key, {})
+        selected = []
+        if operation.get("enabled", False):
+            for index, rule in enumerate(operation.get("rules", [])):
+                if str(rule.get("scope", "target")).strip().lower() == "source" and str(rule.get("sheet", "")).strip() in sheet_names:
+                    selected_rule = deepcopy(rule)
+                    selected_rule["scope"] = "target"
+                    selected.append(selected_rule)
+                    used_rules.add((operation_key, index))
+        source_settings[operation_key] = {"enabled": bool(selected), "rules": selected}
+        any_rules = any_rules or bool(selected)
+    return source_settings, used_rules, any_rules
+
+
+def _read_source_records_with_rules(path: Path, sheet_name: str, start_row: int,
+                                    col_start: int, col_end: int, log: Callable[[str], None],
+                                    end_row: int | None, settings: dict[str, Any],
+                                    source_rules_used: set[tuple[str, int]],
+                                    retain_edited_sources: bool, output_dir: Path,
+                                    final_path: Path,
+                                    on_source_output: Callable[[Path], None] | None = None) -> list[list[Any]]:
+    """Run source-scoped rules on a temporary WPS-edited copy before reading rows for the template."""
+    any_source_rules = any(
+        operation.get("enabled", False) and any(
+            str(rule.get("scope", "target")).strip().lower() == "source"
+            for rule in operation.get("rules", []))
+        for operation in (settings.get(key, {}) for key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"))
+    )
+    if not any_source_rules:
+        return _read_source_records(path, sheet_name, start_row, col_start, col_end, log,
+                                   end_row, None, source_rules_used)
+
+    with _temporary_workbook_copy(path, "源工作簿", log) as safe_copy:
+        preview = safe_copy.load_workbook(read_only=True, data_only=False, keep_links=False)
+        try:
+            sheet_names = set(preview.sheetnames)
+        finally:
+            preview.close()
+        source_settings, used_rules, has_matching_rules = _source_rules_for_sheets(settings, sheet_names)
+        source_rules_used.update(used_rules)
+        if not has_matching_rules:
+            return _read_source_records(path, sheet_name, start_row, col_start, col_end, log,
+                                        end_row, None, source_rules_used)
+
+        app = workbook = pythoncom = None
+        com_initialized = False
+        try:
+            app, pythoncom, progid = _connect_wps(log)
+            com_initialized = True
+            for prop, value in (("Visible", False), ("DisplayAlerts", False), ("AskToUpdateLinks", False),
+                                ("EnableEvents", False), ("AutomationSecurity", 3)):
+                try:
+                    setattr(app, prop, value)
+                except Exception:
+                    pass
+            try:
+                workbook = app.Workbooks.Open(str(safe_copy.path), UpdateLinks=0, ReadOnly=False, AddToMru=False)
+            except Exception as exc:
+                raise ProcessingError(f"已连接 WPS（{progid}），但无法打开源工作簿处理副本“{path.name}”：{exc}") from exc
+            log(f"先在 WPS 临时副本中按规则处理源工作簿 {path.name}；原文件不修改。")
+            _apply_region_processing(workbook, source_settings, [], log)
+            workbook.Save()
+        except ProcessingError:
+            raise
+        except Exception as exc:
+            raise ProcessingError(f"WPS 处理源工作簿“{path.name}”失败：{type(exc).__name__}: {exc}") from exc
+        finally:
+            if workbook is not None:
+                try:
+                    workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
+            if app is not None:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+            if com_initialized and pythoncom is not None:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+        if retain_edited_sources:
+            retained_path = _publish_processed_source_copy(
+                safe_copy.path, path, output_dir, reserved_paths={final_path}
+            )
+            log(f"已保留源文件处理副本（原件未修改）：{retained_path}")
+            if on_source_output is not None:
+                on_source_output(retained_path)
+        return _read_source_records(safe_copy.path, sheet_name, start_row, col_start, col_end,
+                                    log, end_row, None, source_rules_used)
 
 
 def _publish_staging_workbook(staging_path: Path, final_path: Path) -> None:
@@ -2998,13 +3128,21 @@ def _read_text_output_areas_loaded(workbook, text_outputs: list[dict[str, Any]])
 
 def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] = print,
                       on_text_previews: Callable[[list[dict[str, str]]], None] | None = None,
-                      on_region_outputs: Callable[[list[Path]], None] | None = None) -> Path:
-    """Process the configured source data and publish only the final workbook and optional text previews."""
+                      on_region_outputs: Callable[[list[Path]], None] | None = None,
+                      on_source_outputs: Callable[[list[Path]], None] | None = None) -> Path:
+    """Process configured source copies first, then edit the template and publish configured outputs."""
     settings = normalize_settings(raw_settings)
     template_path, final_path = _validate_inputs(settings)
-    copy_start, copy_end = column_number(settings["copy_start_col"]), column_number(settings["copy_end_col"])
+    if any(job.get("sources") for job in settings["jobs"]):
+        copy_start, copy_end = column_number(settings["copy_start_col"]), column_number(settings["copy_end_col"])
+    else:
+        copy_start = copy_end = 1
     all_records: list[list[list[Any]]] = []
     source_rules_used: set[tuple[str, int]] = set()
+    if any(job.get("sources") for job in settings["jobs"]):
+        log("源文件处理规则先在 WPS 临时副本中执行，再读取处理结果用于模板；原件不修改。")
+    else:
+        log("未配置源文件；将直接在模板临时副本上执行模板范围规则，并保留现有模板数据。")
     for job_idx, job in enumerate(settings["jobs"], 1):
         job_records: list[list[Any]] = []
         for source_idx, source in enumerate(job["sources"], 1):
@@ -3015,8 +3153,12 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
             display_sheet = str(source.get("source_sheet") or "").strip() or "首个工作表（默认）"
             end_label = str(end_row) if end_row is not None else "自动空白边界/末行"
             log(f"读取目标表 {job_idx}/{len(settings['jobs'])} 的源文件 {source_idx}/{len(job['sources'])}：{path.name}（{display_sheet}，第 {start_row} 行起，结束：{end_label}）")
-            records = _read_source_records(path, str(source["source_sheet"]).strip(), start_row,
-                                           copy_start, copy_end, log, end_row, settings, source_rules_used)
+            records = _read_source_records_with_rules(
+                path, str(source["source_sheet"]).strip(), start_row, copy_start, copy_end,
+                log, end_row, settings, source_rules_used,
+                bool(settings.get("retain_edited_sources", False)), final_path.parent, final_path,
+                lambda source_output: on_source_outputs([source_output]) if on_source_outputs is not None else None,
+            )
             job_records.extend(records)
         all_records.append(job_records)
     for operation_key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
@@ -3031,7 +3173,10 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
     fd, temp_name = tempfile.mkstemp(prefix=f".{final_path.stem}_", suffix=".staging.xlsx", dir=str(final_path.parent))
     os.close(fd)
     staging_path = Path(temp_name)
+    generated_region_files: list[Path] = []
     published_final = False
+    preserve_final_after_region_failure = False
+    preserve_region_files_after_image_failure = False
     try:
         log("校验模板公式和目标子表后，在输出目录创建临时副本。")
         formula_jobs = _create_staging_workbook(template_path, settings, all_records, staging_path, log)
@@ -3040,8 +3185,48 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
             raise ProcessingError("WPS 处理结束但临时工作簿不存在或为空；没有发布输出文件。")
         if final_path.exists():
             raise ProcessingError(f"输出文件在处理过程中被创建；为避免覆盖已停止：\n{final_path}")
-        log("工作簿已保存；开始读取已配置的文本预览区域（如有），随后发布主工作簿。")
-        text_previews = _read_text_output_areas(staging_path, settings.get("text_outputs", []), log)
+        log("工作簿已保存；开始区域 XLSX/可选 PNG 导出和文本区域读取（如有）。")
+        region_xlsx_files: list[Path] = []
+        region_png_files: list[Path] = []
+        text_previews = []
+        for module_id in settings.get("workflow", DEFAULT_WORKFLOW):
+            if module_id == "image_output":
+                try:
+                    region_xlsx_files = _export_table_areas(
+                        staging_path, settings.get("image_outputs", []), final_path.parent, log,
+                        reserved_paths={final_path},
+                    )
+                    generated_region_files.extend(region_xlsx_files)
+                    if settings.get("export_region_pngs"):
+                        try:
+                            region_png_files = _export_region_xlsx_as_pngs(region_xlsx_files, log)
+                        except Exception:
+                            preserve_region_files_after_image_failure = True
+                            raise
+                        generated_region_files.extend(region_png_files)
+                except Exception as image_exc:
+                    try:
+                        _publish_staging_workbook(staging_path, final_path)
+                    except Exception as publish_exc:
+                        raise ProcessingError(
+                            f"区域输出失败：{image_exc}\nWPS 已完成计算并成功保存工作簿，但无法安全发布到目标路径：\n"
+                            f"{final_path}\n发布原因：{publish_exc}"
+                        ) from image_exc
+                    published_final = True
+                    preserve_final_after_region_failure = True
+                    if on_region_outputs is not None and region_xlsx_files:
+                        on_region_outputs(list(region_xlsx_files))
+                    output_kind = "区域 PNG 图片导出" if settings.get("export_region_pngs") else "区域 XLSX 输出"
+                    fallback_note = ""
+                    if preserve_region_files_after_image_failure and region_xlsx_files:
+                        fallback_paths = "\n".join(str(path) for path in region_xlsx_files)
+                        fallback_note = f"\n图片导出未完成；区域 XLSX 已保留：\n{fallback_paths}"
+                    raise ProcessingError(
+                        f"{output_kind}失败：{image_exc}{fallback_note}\n"
+                        f"WPS 已完成计算并成功保存 XLSX；该文件已保留：\n{final_path}"
+                    ) from image_exc
+            elif module_id == "text_output":
+                text_previews = _read_text_output_areas(staging_path, settings.get("text_outputs", []), log)
         for preview in text_previews:
             log(f"已读取文本区域 {preview['sheet']}!{preview['range']}，内容将在处理完成后显示并可复制。")
         _publish_staging_workbook(staging_path, final_path)
@@ -3050,11 +3235,16 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
         log(f"处理成功，已另存为：{final_path}")
         if on_text_previews is not None:
             on_text_previews(text_previews)
+        if on_region_outputs is not None:
+            on_region_outputs(list(region_xlsx_files) + list(region_png_files))
         return final_path
     except Exception:
         try:
             staging_path.unlink(missing_ok=True)
-            if published_final:
+            if not preserve_region_files_after_image_failure:
+                for region_path in generated_region_files:
+                    region_path.unlink(missing_ok=True)
+            if published_final and not preserve_final_after_region_failure:
                 final_path.unlink(missing_ok=True)
         except Exception as cleanup_exc:
             raise ProcessingError(f"处理失败，同时无法清理临时工作簿：{staging_path}\n清理错误：{cleanup_exc}")
@@ -3174,6 +3364,9 @@ class App:
         self.vars: dict[str, Any] = {}
         self.job_vars: dict[str, Any] = {}
         self.operation_enabled: dict[str, Any] = {}
+        self._region_output_files: list[Path] = []
+        self._source_output_files: list[Path] = []
+        self._export_pngs_for_run = False
         self.active_job_index: int | None = None
         self.active_profile_name = str(self.settings.get("config_name") or "")
         self._build()
@@ -3270,7 +3463,7 @@ class App:
         self._entry(files, 1, "输出目录", "output_dir", browse=self._browse_output_dir)
         self._entry(files, 2, "输出文件名", "output_filename", width=35)
         row = 3
-        for key, label in (("copy_start_col", "源数据复制起始列"), ("copy_end_col", "源数据复制末列（必填）")):
+        for key, label in (("copy_start_col", "源数据复制起始列（无源文件可留空）"), ("copy_end_col", "源数据复制末列（有源文件时必填）")):
             ttk.Label(files, text=label).grid(row=row, column=0, sticky="w", padx=(8, 8), pady=3)
             var = self.tk.StringVar(value=str(self.settings.get(key, "")))
             self.vars[key] = var
@@ -3290,8 +3483,8 @@ class App:
         actions.grid(row=0, column=0, sticky="ew")
         ttk.Button(actions, text="添加目标表", command=self._add_job).pack(side="left", padx=3)
         ttk.Button(actions, text="删除目标表", command=self._delete_job).pack(side="left", padx=3)
-        self.job_tree = ttk.Treeview(target_box, columns=("sheet", "start", "formula", "sources", "maps"), show="headings", height=4, selectmode="browse")
-        for col, title, width in (("sheet", "模板子表", 230), ("start", "粘贴起始行", 90), ("formula", "公式列范围", 120), ("sources", "源文件数（按顺序）", 140), ("maps", "结果映射（类型）", 290)):
+        self.job_tree = ttk.Treeview(target_box, columns=("sheet", "start", "formula", "sources"), show="headings", height=4, selectmode="browse")
+        for col, title, width in (("sheet", "模板子表", 230), ("start", "粘贴起始行", 90), ("formula", "公式列范围", 120), ("sources", "源文件数（按顺序）", 140)):
             self.job_tree.heading(col, text=title)
             self.job_tree.column(col, width=width, anchor="w")
         self.job_tree.grid(row=1, column=0, sticky="nsew", padx=3, pady=4)
@@ -3317,22 +3510,13 @@ class App:
         for col, title, width in (("path", "源文件路径", 390), ("sheet", "源工作表（空=首表）", 165), ("from", "复制起始行", 90), ("to", "复制结束行（空=空行边界）", 170)):
             self.source_tree.heading(col, text=title)
             self.source_tree.column(col, width=width, anchor="w")
-        self.source_tree.grid(row=1, column=0, sticky="nsew", padx=3, pady=5)
+        self.source_tree.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=3, pady=5)
         source_buttons = ttk.Frame(editor)
-        source_buttons.grid(row=2, column=0, sticky="w", padx=3)
+        source_buttons.grid(row=2, column=0, columnspan=2, sticky="w", padx=3)
         for label, command in (("添加源文件…", self._add_source), ("编辑…", self._edit_source), ("删除", self._delete_source), ("上移", lambda: self._move_source(-1)), ("下移", lambda: self._move_source(1))):
             ttk.Button(source_buttons, text=label, command=command).pack(side="left", padx=2)
-        self.mapping_tree = ttk.Treeview(editor, columns=("result", "target", "type"), show="headings", height=5)
-        for col, title, width in (("result", "结果列", 90), ("target", "目标列", 90), ("type", "写入类型", 110)):
-            self.mapping_tree.heading(col, text=title)
-            self.mapping_tree.column(col, width=width, anchor="w")
-        self.mapping_tree.grid(row=1, column=1, sticky="nsew", padx=3, pady=5)
-        map_buttons = ttk.Frame(editor)
-        map_buttons.grid(row=2, column=1, sticky="w", padx=3)
-        for label, command in (("添加映射", self._add_mapping), ("编辑映射", self._edit_mapping), ("删除映射", self._delete_mapping)):
-            ttk.Button(map_buttons, text=label, command=command).pack(side="left", padx=2)
         editor.rowconfigure(1, weight=1)
-        note = "执行顺序：模板清理/前映射 → 多源追加 → 填公式与完整重算 → 后映射 → 文本分列/区域筛选/去重/格式转换 → 再完整重算并保存 → 文本预览/复制。四类区域处理规则都可选择源文件或目标工作簿；源文件处理只作用于本次读取数据，不修改源文件。"
+        note = "可只处理模板，无需添加源文件；无源目标子表会保留模板原内容。若配置源文件，先在 WPS 临时副本中执行源范围规则并读取处理结果，再填充或编辑模板。勾选“保留源文件处理结果”会将处理副本另存到输出目录，原件不修改。"
         ttk.Label(editor, text=note, foreground="#4b5563", wraplength=1180, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 0))
 
         area_box = ttk.LabelFrame(outer, text="模板内部前/后映射、区域处理及文本输出", padding=5)
@@ -3343,6 +3527,8 @@ class App:
         area_tabs.grid(row=0, column=0, sticky="nsew")
         self.pre_mapping_tree = self._create_area_tab(area_tabs, "前映射", "pre_mappings",
             (("source_sheet", "源工作表", 180), ("source_range", "源范围", 110), ("target_sheet", "目标工作表", 180), ("target_range", "目标范围", 110)))
+        self.image_tree = self._create_area_tab(area_tabs, "区域 XLSX 输出", "image_outputs",
+            (("sheet", "模板工作表", 220), ("range", "单元格范围", 180)))
         self.text_tree = self._create_area_tab(area_tabs, "文本预览/复制", "text_outputs",
             (("sheet", "模板工作表", 220), ("range", "单元格范围", 180)))
         self.post_mapping_tree = self._create_area_tab(area_tabs, "后映射", "post_mappings",
@@ -3357,10 +3543,16 @@ class App:
         self.format_convert_tree = self._create_operation_tab(area_tabs, "格式转换", "FormatConvert",
             rule_columns + (("mode", "目标类型", 100),))
         self.workflow_tree = self._create_workflow_tab(area_tabs)
-        selector_help = ("范围选择：B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形。区域筛选可单填 A 表示 A 列，或小写 a1 表示 A1 单元格；也可填写 A1:F100。Excel 上限 XFD / 1048576 行。"
+        selector_help = ("范围选择：A1=整张工作表，按 WPS UsedRange 裁剪；D1=整列，A5=整行，B3,B3=单格；两个端点如 D8,B3=自动规范化的矩形。区域筛选另支持单填 A 表示 A 列、或小写 a1 表示 A1 单元格；也可填写 A1:F100。超过处理上限时会安全停止。"
                          f"每条处理规则最多 {MAX_PROCESSING_CELLS:,} 格。筛选会在选定区域内保留匹配行并压缩该区域，表头可选择保留；源文件规则仅改变本次读取数据，不回写源文件。")
         ttk.Label(area_box, text=selector_help, foreground="#4b5563", wraplength=1180,
                   justify="left").grid(row=1, column=0, sticky="w", padx=4, pady=(4, 1))
+        self.export_region_pngs_var = self.tk.BooleanVar(value=bool(self.settings.get("export_region_pngs", False)))
+        ttk.Checkbutton(area_box, text="勾选则额外输出区域 PNG；无论是否勾选，都保留区域 XLSX。",
+                        variable=self.export_region_pngs_var).grid(row=2, column=0, sticky="w", padx=4, pady=(3, 1))
+        self.retain_edited_sources_var = self.tk.BooleanVar(value=bool(self.settings.get("retain_edited_sources", False)))
+        ttk.Checkbutton(area_box, text="保留源文件处理结果：将 WPS 处理后的副本另存到输出目录（原文件不修改，不覆盖已有文件）。",
+                        variable=self.retain_edited_sources_var).grid(row=3, column=0, sticky="w", padx=4, pady=(1, 4))
 
         controls = ttk.Frame(outer)
         controls.grid(row=4, column=0, sticky="ew", pady=7)
@@ -3426,18 +3618,19 @@ class App:
             self.workflow_tree.delete(item)
         workflow = self.settings.get("workflow", DEFAULT_WORKFLOW)
         descriptions = {
+            "source_preprocess": "先由 WPS 在源文件临时副本中执行源范围规则",
             "template_cleanup": "保留模板格式/公式种子，清理旧数据",
             "pre_mapping": "读取模板原值并在源数据前写入",
             "source_copy": "按目标表及源文件列表追加数据",
             "formula_fill": "按复制数据行数填充公式",
-            "formula_recalc": "首次完整重算供结果映射读取",
-            "result_mapping": "把公式结果写到配置目标列",
-            "post_mapping": "公式结果映射后执行模板内部写入",
+            "formula_recalc": "首次完整重算并保留公式结果",
+            "post_mapping": "首次重算后执行模板内部写入",
             "TextToColumns": "区域处理阶段；规则可指定源文件或目标工作簿",
             "RegionFilter": "按条件筛选指定区域并压缩匹配记录",
             "Deduplicate": "稳定去重并保留首次记录",
             "FormatConvert": "将指定范围转换为文本、数字或日期",
             "final_recalc_save": "所有工作簿写入后最终完整重算并保存",
+            "image_output": "输出模板区域为格式化 XLSX；可选额外导出 PNG，XLSX 保留",
             "text_output": "只读末端文本预览/复制，必须在最终保存后",
         }
         for index, module_id in enumerate(workflow):
@@ -3540,7 +3733,7 @@ class App:
 
     def _render_area_configs(self):
         for key, tree in (("pre_mappings", self.pre_mapping_tree), ("post_mappings", self.post_mapping_tree),
-                          ("text_outputs", self.text_tree)):
+                          ("image_outputs", self.image_tree), ("text_outputs", self.text_tree)):
             for item in tree.get_children():
                 tree.delete(item)
             columns = tree["columns"]
@@ -3590,7 +3783,7 @@ class App:
         existing = entries[index] if index is not None else {}
         is_mapping = key in ("pre_mappings", "post_mappings")
         title = {"pre_mappings": "前映射规则", "post_mappings": "后映射规则",
-                 "text_outputs": "文本预览区域"}[key]
+                 "image_outputs": "区域 XLSX 输出", "text_outputs": "文本预览区域"}[key]
         fields = (("source_sheet", "源工作表"), ("source_range", "源区域"),
                   ("target_sheet", "目标工作表"), ("target_range", "目标区域")) if is_mapping else (("sheet", "模板工作表"), ("range", "单元格区域"))
         dialog = self.tk.Toplevel(self.root)
@@ -3623,6 +3816,8 @@ class App:
                     bounds, selection_kind = _parse_selection_details(value["range"], "输出")
                     if key == "text_outputs" and selection_kind not in ("sheet", "row", "column"):
                         _check_text_area_size(bounds, "文本输出")
+                    elif key == "image_outputs" and selection_kind not in ("sheet", "row", "column"):
+                        _check_region_xlsx_area_size(bounds, "区域 XLSX 输出")
             except ProcessingError as exc:
                 self.messagebox.showerror(APP_NAME, str(exc), parent=dialog)
                 return
@@ -3773,8 +3968,8 @@ class App:
         for item in self.job_tree.get_children():
             self.job_tree.delete(item)
         for idx, job in enumerate(self.settings.get("jobs", [])):
-            map_summary = ", ".join(f"{m.get('result_col')}→{m.get('target_col')}({m.get('write_as', 'value')})" for m in job.get("mappings", []))
-            self.job_tree.insert("", "end", iid=str(idx), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), len(job.get("sources", [])), map_summary))
+            source_count = sum(bool(str(source.get("path") or "").strip()) for source in job.get("sources", []))
+            self.job_tree.insert("", "end", iid=str(idx), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), source_count))
         if self.settings.get("jobs"):
             index = 0 if select_index is None else max(0, min(select_index, len(self.settings["jobs"]) - 1))
             self.job_tree.selection_set(str(index))
@@ -3825,14 +4020,13 @@ class App:
         for key in ("template_sheet", "header_rows", "start_row", "formula_range"):
             self.job_vars[key].set(str(job.get(key, "")))
         self._update_formula_template_row_display()
-        for tree in (self.source_tree, self.mapping_tree):
-            for item in tree.get_children():
-                tree.delete(item)
+        for item in self.source_tree.get_children():
+            self.source_tree.delete(item)
         for src_idx, source in enumerate(job.get("sources", [])):
+            if source.get("_optional_placeholder") and not str(source.get("path") or "").strip():
+                continue
             sheet_display = str(source.get("source_sheet") or "").strip() or "（首个工作表）"
             self.source_tree.insert("", "end", iid=str(src_idx), values=(source.get("path", ""), sheet_display, source.get("copy_start_row", ""), source.get("copy_end_row") or ""))
-        for map_idx, mapping in enumerate(job.get("mappings", [])):
-            self.mapping_tree.insert("", "end", iid=str(map_idx), values=(mapping.get("result_col", ""), mapping.get("target_col", ""), mapping.get("write_as", "value")))
 
     def _on_job_select(self, _event=None):
         if not self._commit_job_editor(show_errors=False):
@@ -3864,15 +4058,14 @@ class App:
         if not (0 <= index < len(self.settings["jobs"])):
             return
         job = self.settings["jobs"][index]
-        maps = ", ".join(f"{m.get('result_col')}→{m.get('target_col')}({m.get('write_as', 'value')})" for m in job.get("mappings", []))
-        self.job_tree.item(str(index), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), len(job.get("sources", [])), maps))
+        source_count = sum(bool(str(source.get("path") or "").strip()) for source in job.get("sources", []))
+        self.job_tree.item(str(index), values=(job.get("template_sheet", ""), job.get("start_row", ""), job.get("formula_range", ""), source_count))
 
     def _add_job(self):
         if not self._commit_job_editor():
             return
         self.settings["jobs"].append({"template_sheet": "新目标表", "header_rows": 0, "start_row": 2, "formula_range": "A:A",
-                                      "sources": [{"path": "", "source_sheet": "", "copy_start_row": 2, "copy_end_row": None}],
-                                      "mappings": [{"result_col": "A", "target_col": "B", "write_as": "value"}]})
+                                      "sources": []})
         self._render_jobs(len(self.settings["jobs"]) - 1)
 
     def _delete_job(self):
@@ -3972,69 +4165,6 @@ class App:
             self._show_job(self._current_index())
             self.source_tree.selection_set(str(dest))
 
-    def _mapping_dialog(self, existing=None):
-        tk, ttk = self.tk, self.ttk
-        dialog = tk.Toplevel(self.root)
-        dialog.title("结果列映射")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        vals = {"result_col": tk.StringVar(value=(existing or {}).get("result_col", "")),
-                "target_col": tk.StringVar(value=(existing or {}).get("target_col", "")),
-                "write_as": tk.StringVar(value=(existing or {}).get("write_as", "value"))}
-        for row, key, label in ((0, "result_col", "公式结果列"), (1, "target_col", "写入目标列")):
-            ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=5)
-            ttk.Entry(dialog, textvariable=vals[key], width=15).grid(row=row, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(dialog, text="目标列写入为").grid(row=2, column=0, sticky="w", padx=8, pady=5)
-        ttk.Combobox(dialog, textvariable=vals["write_as"], values=("value", "text"), state="readonly", width=12).grid(row=2, column=1, sticky="w", padx=5, pady=5)
-        result = {"value": None}
-        def accept():
-            mapping = {key: vals[key].get().strip() for key in vals}
-            try:
-                column_number(mapping["result_col"])
-                column_number(mapping["target_col"])
-            except ProcessingError as exc:
-                self.messagebox.showerror(APP_NAME, str(exc), parent=dialog)
-                return
-            result["value"] = mapping
-            dialog.destroy()
-        buttons = ttk.Frame(dialog)
-        buttons.grid(row=3, column=0, columnspan=2, pady=8)
-        ttk.Button(buttons, text="确定", command=accept).pack(side="left", padx=5)
-        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="left", padx=5)
-        dialog.wait_window()
-        return result["value"]
-
-    def _add_mapping(self):
-        job = self._selected_job()
-        if job is None:
-            return
-        mapping = self._mapping_dialog()
-        if mapping:
-            job["mappings"].append(mapping)
-            self._show_job(self._current_index())
-            self._refresh_job_row(self._current_index())
-
-    def _edit_mapping(self):
-        job = self._selected_job()
-        selected = self.mapping_tree.selection()
-        if job is None or not selected:
-            return
-        idx = int(selected[0])
-        mapping = self._mapping_dialog(job["mappings"][idx])
-        if mapping:
-            job["mappings"][idx] = mapping
-            self._show_job(self._current_index())
-            self.mapping_tree.selection_set(str(idx))
-            self._refresh_job_row(self._current_index())
-
-    def _delete_mapping(self):
-        job = self._selected_job()
-        selected = self.mapping_tree.selection()
-        if job is not None and selected:
-            del job["mappings"][int(selected[0])]
-            self._show_job(self._current_index())
-            self._refresh_job_row(self._current_index())
-
     def _browse_template(self):
         path = self.filedialog.askopenfilename(filetypes=[("Excel 工作簿（无宏）", "*.xlsx")])
         if path:
@@ -4076,7 +4206,9 @@ class App:
         settings["config_name"] = self.active_profile_name
         settings["jobs"] = deepcopy(self.settings["jobs"])
         settings["workflow"] = deepcopy(self.settings.get("workflow", DEFAULT_WORKFLOW))
-        for key in ("pre_mappings", "post_mappings", "text_outputs"):
+        settings["export_region_pngs"] = bool(self.export_region_pngs_var.get())
+        settings["retain_edited_sources"] = bool(self.retain_edited_sources_var.get())
+        for key in ("pre_mappings", "post_mappings", "image_outputs", "text_outputs"):
             settings[key] = deepcopy(self.settings.get(key, []))
         for key in ("TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert"):
             operation = deepcopy(self.settings.get(key, {"enabled": False, "rules": []}))
@@ -4128,6 +4260,8 @@ class App:
         self.settings = normalized
         self.active_profile_name = str(active_name if active_name is not None else normalized.get("config_name", ""))
         self.output_filename_custom = bool(normalized.get("output_filename_custom", False))
+        self.export_region_pngs_var.set(bool(normalized.get("export_region_pngs", False)))
+        self.retain_edited_sources_var.set(bool(normalized.get("retain_edited_sources", False)))
         self._suppress_output_filename_trace = True
         try:
             for key, var in self.vars.items():
@@ -4286,11 +4420,16 @@ class App:
         self.run_button.configure(state="disabled")
         self.progress.start(10)
         self._render_text_previews([])
+        self._export_pngs_for_run = bool(settings.get("export_region_pngs", False))
+        self._region_output_files = []
+        self._source_output_files = []
         self._log("开始处理……")
         def work():
             try:
                 path = process_workbooks(settings, lambda text: self.events.put(("log", text)),
-                                         lambda previews: self.events.put(("text_previews", previews)))
+                                         lambda previews: self.events.put(("text_previews", previews)),
+                                         lambda paths: self.events.put(("region_outputs", paths)),
+                                         lambda paths: self.events.put(("source_outputs", paths)))
                 self.events.put(("success", str(path)))
             except Exception as exc:
                 self.events.put(("error", f"{exc}\n\n详细诊断：\n{traceback.format_exc()}"))
@@ -4304,12 +4443,21 @@ class App:
                     self._log(str(payload))
                 elif event == "text_previews":
                     self._render_text_previews(payload)
+                elif event == "region_outputs":
+                    self._region_output_files = [Path(path) for path in payload]
+                elif event == "source_outputs":
+                    self._source_output_files.extend(Path(path) for path in payload)
                 elif event in ("success", "error"):
                     self.progress.stop()
                     self.run_button.configure(state="normal")
                     if event == "success":
                         self._log(f"完成：{payload}")
-                        self.messagebox.showinfo(APP_NAME, f"处理成功，已保存新文件：\n{payload}")
+                        xlsx_count = sum(path.suffix.lower() == ".xlsx" for path in self._region_output_files)
+                        png_count = sum(path.suffix.lower() == ".png" for path in self._region_output_files)
+                        output_note = f"\n区域 XLSX：{xlsx_count} 个；PNG：{png_count} 张。" if self._region_output_files else ""
+                        if self._source_output_files:
+                            output_note += f"\n保留的源文件处理副本：{len(self._source_output_files)} 个。"
+                        self.messagebox.showinfo(APP_NAME, f"处理成功，已保存新文件：\n{payload}{output_note}")
                     else:
                         self._log("处理未全部完成；请查看详细诊断中的已保存文件路径及清理信息。")
                         self.messagebox.showerror(APP_NAME, str(payload))
