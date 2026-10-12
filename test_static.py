@@ -3296,3 +3296,40 @@ class StandaloneMergeTests(unittest.TestCase):
         self.assertFalse(migrated["delete_processed_sources_after_success"])
         self.assertTrue(all(job["merged_source_filename"] == "" for job in migrated["jobs"]))
         self.assertIn("独立源文件合并", " ".join(main.configuration_migration_notes(legacy)))
+
+
+class UiPreferencesAndBrandingTests(unittest.TestCase):
+    def test_version_notice_preference_is_saved_and_loaded_separately(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "nested" / "ui_preferences.json"
+            self.assertFalse(main.load_ui_preferences(path)["dont_show_version_notice"])
+            main.save_ui_preferences(True, path)
+            self.assertTrue(main.load_ui_preferences(path)["dont_show_version_notice"])
+            self.assertFalse(path.with_name(path.name + ".tmp").exists())
+
+    def test_malformed_ui_preferences_default_to_showing_notice(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ui_preferences.json"
+            path.write_text("{not-json", encoding="utf-8")
+            self.assertFalse(main.load_ui_preferences(path)["dont_show_version_notice"])
+            path.write_text('{"dont_show_version_notice":"false"}', encoding="utf-8")
+            self.assertFalse(main.load_ui_preferences(path)["dont_show_version_notice"])
+
+    def test_lino_branding_assets_and_about_links_are_available(self):
+        for relative_path in (
+            "assets/linote-logo.png",
+            "assets/linote-icon.png",
+            "assets/linote-logo.ico",
+        ):
+            self.assertTrue(main.app_resource_path(relative_path).is_file(), relative_path)
+        self.assertEqual("v24", main.APP_VERSION)
+        self.assertEqual("https://www.linote.top/", main.LINO_HOME_URL)
+        self.assertEqual("https://github.com/linote99", main.GITHUB_PROFILE_URL)
+        self.assertEqual("https://github.com/linote99/wps-sheet-automation", main.PROJECT_REPOSITORY_URL)
+        source = Path(main.__file__).read_text(encoding="utf-8")
+        installer = (Path(main.__file__).resolve().parent / "install_and_build.bat").read_text(
+            encoding="utf-8").lower()
+        self.assertIn('text="不再提示"', source)
+        self.assertIn("root.after(300, app._show_version_notice)", source)
+        self.assertIn('--icon="assets\\linote-logo.ico"', installer)
+        self.assertIn('--add-data "assets\\linote-logo.png;assets"', installer)

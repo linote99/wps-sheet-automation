@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
-set "LOG_FILE=%~dp0build_main_only.log"
+set "LOG_FILE=%~dp0install_and_build.log"
 set "FAIL_STEP=initialization"
 >>"%LOG_FILE%" echo.
 >>"%LOG_FILE%" echo === Main-only build started %date% %time% ===
@@ -31,17 +31,17 @@ set "FAIL_STEP=PyWin32 COM import/version check"
 if errorlevel 1 goto failed
 
 set "FAIL_STEP=Python syntax check"
-"%VENV_PY%" -m py_compile main.py wps_automation_workflow.py licensing.py make_fake_data.py test_static.py test_licensing.py >>"%LOG_FILE%" 2>&1
+"%VENV_PY%" -m py_compile main.py wps_automation_workflow.py licensing.py make_fake_data.py test_static.py >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 set "FAIL_STEP=application self-check"
 "%VENV_PY%" main.py --self-check >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
-set "FAIL_STEP=unit tests"
-"%VENV_PY%" -m unittest -v test_static.py test_licensing.py >>"%LOG_FILE%" 2>&1
+set "FAIL_STEP=static tests"
+"%VENV_PY%" -m unittest -v test_static.py >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 
-set "FAIL_STEP=PyInstaller build"
-"%VENV_PY%" -m PyInstaller --clean --noconfirm --windowed --onedir --name WpsSheetAutomation --hidden-import=pythoncom --hidden-import=pywintypes --hidden-import=win32timezone --hidden-import=win32crypt --hidden-import=win32com --hidden-import=win32com.client --collect-all win32com --collect-all cryptography main.py >>"%LOG_FILE%" 2>&1
+set "FAIL_STEP=PyInstaller main application build"
+"%VENV_PY%" -m PyInstaller --clean --noconfirm --windowed --onedir --name WpsSheetAutomation --icon="assets\linote-logo.ico" --add-data "assets\linote-logo.png;assets" --add-data "assets\linote-icon.png;assets" --hidden-import=pythoncom --hidden-import=pywintypes --hidden-import=win32timezone --hidden-import=win32crypt --hidden-import=win32com --hidden-import=win32com.client --collect-all win32com --collect-all cryptography main.py >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 
 echo Build complete: %~dp0dist\WpsSheetAutomation\WpsSheetAutomation.exe

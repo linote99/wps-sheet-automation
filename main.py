@@ -34,8 +34,63 @@ from wps_automation_workflow import (DEFAULT_WORKFLOW, MODULE_LABELS, add_workfl
                                     remove_workflow_module, save_profile, validate_workflow)
 
 APP_NAME = "WPS 表格多源汇总处理器"
+APP_VERSION = "v24"
+LINO_HOME_URL = "https://www.linote.top/"
+GITHUB_PROFILE_URL = "https://github.com/linote99"
+PROJECT_REPOSITORY_URL = "https://github.com/linote99/wps-sheet-automation"
 CONFIG_PATH = Path.home() / ".wps_sheet_automation.json"
 PROFILE_DIR = Path.home() / ".wps_sheet_automation_profiles"
+
+def app_resource_path(relative_path: str) -> Path:
+    """Resolve bundled resources in source and PyInstaller builds."""
+    bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_dir / relative_path
+
+
+def _ui_preferences_path() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return base / "WpsSheetAutomation" / "ui_preferences.json"
+    xdg_config = os.environ.get("XDG_CONFIG_HOME", "")
+    base = Path(xdg_config) if xdg_config and Path(xdg_config).is_absolute() else Path.home() / ".config"
+    return base / "wps_sheet_automation" / "ui_preferences.json"
+
+
+UI_PREFERENCES_PATH = _ui_preferences_path()
+
+
+def load_ui_preferences(path: Path | str | None = None) -> dict[str, bool]:
+    target = Path(path) if path is not None else UI_PREFERENCES_PATH
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {"dont_show_version_notice": raw.get("dont_show_version_notice", False) is True}
+
+
+def save_ui_preferences(dont_show_version_notice: bool,
+                        path: Path | str | None = None) -> None:
+    target = Path(path) if path is not None else UI_PREFERENCES_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(json.dumps({
+        "dont_show_version_notice": bool(dont_show_version_notice),
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
+
+
+def set_application_icon(window, tk_module) -> Any | None:
+    icon_path = app_resource_path("assets/linote-icon.png")
+    if not icon_path.is_file():
+        return None
+    image = tk_module.PhotoImage(file=str(icon_path))
+    window.iconphoto(True, image)
+    window._wps_application_icon = image
+    return image
+
+
 DEFAULT_WINDOW_WIDTH = 1500
 DEFAULT_WINDOW_HEIGHT = 960
 MIN_WINDOW_WIDTH = 1024
@@ -5541,12 +5596,53 @@ class App:
         license_page = self.ttk.Frame(notebook, padding=12)
         help_page = self.ttk.Frame(notebook, padding=8)
         config_page = self.ttk.Frame(notebook, padding=12)
+        about_page = self.ttk.Frame(notebook, padding=12)
         notebook.add(license_page, text="秘钥管理")
         notebook.add(help_page, text="使用说明")
         notebook.add(config_page, text="配置管理")
+        notebook.add(about_page, text="关于")
         self._build_license_settings_tab(license_page)
         self._build_usage_help_tab(help_page)
         self._build_profile_management_tab(config_page)
+        self._build_about_tab(about_page)
+
+    def _show_version_notice(self):
+        if load_ui_preferences().get("dont_show_version_notice", False):
+            return
+        dialog = self.tk.Toplevel(self.root)
+        dialog.title("版本提醒")
+        dialog.geometry("560x360")
+        dialog.minsize(500, 330)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        frame = self.ttk.Frame(dialog, padding=18)
+        frame.pack(fill="both", expand=True)
+        self.ttk.Label(frame, text=f"{APP_NAME} {APP_VERSION}",
+                       font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w", pady=(0, 12))
+        notice = (
+            "本次更新：\n"
+            "• 主程序窗口改用 Lino 笔记图标；\n"
+            "• 设置中新增“关于”页，说明运行方式与适用范围，并提供 Lino 笔记和 GitHub 链接。\n\n"
+            "可在“设置 → 关于”查看工具介绍和相关链接。"
+        )
+        self.ttk.Label(frame, text=notice, wraplength=510, justify="left").pack(
+            anchor="w", fill="x", pady=(0, 16))
+        dont_show = self.tk.BooleanVar(value=False)
+        self.ttk.Checkbutton(frame, text="不再提示", variable=dont_show).pack(anchor="w", pady=(0, 16))
+
+        def close_notice():
+            if dont_show.get():
+                try:
+                    save_ui_preferences(True)
+                except OSError as exc:
+                    self.messagebox.showwarning("版本提醒", f"无法保存“不再提示”设置：{exc}",
+                                                parent=dialog)
+            dialog.destroy()
+
+        self.ttk.Button(frame, text="知道了", command=close_notice).pack(anchor="e")
+        dialog.protocol("WM_DELETE_WINDOW", close_notice)
+        dialog.grab_set()
+        dialog.focus_set()
 
     def _build_license_settings_tab(self, parent):
         from datetime import date
@@ -5677,6 +5773,51 @@ class App:
 """
         text.insert("1.0", guide)
         text.configure(state="disabled")
+
+    def _build_about_tab(self, parent):
+        import webbrowser
+
+        ttk = self.ttk
+        parent.columnconfigure(0, weight=1)
+        brand = ttk.Frame(parent)
+        brand.grid(row=0, column=0, sticky="w", pady=(0, 14))
+        logo_path = app_resource_path("assets/linote-logo.png")
+        try:
+            logo = self.tk.PhotoImage(file=str(logo_path))
+            factor = max(1, (logo.width() + 119) // 120)
+            if factor > 1:
+                logo = logo.subsample(factor, factor)
+            self._about_logo_image = logo
+            ttk.Label(brand, image=logo).pack(side="left", padx=(0, 14))
+        except Exception:
+            pass
+        ttk.Label(brand, text=f"{APP_NAME} {APP_VERSION}",
+                  font=("Microsoft YaHei UI", 15, "bold")).pack(side="left", anchor="center")
+        description = (
+            "运行方式\n"
+            "Windows 桌面程序，可通过 run_app.bat 从源码启动，或运行打包后的 WpsSheetAutomation.exe。"
+            "模板处理、公式重算和最终保存由本机 WPS 表格的 COM 自动化完成。\n\n"
+            "适用范围\n"
+            "适用于 Windows 11 + WPS 表格 + 无宏 XLSX 工作簿，可按模板汇总多份源表并执行映射、"
+            "公式填充、区域处理及 XLSX/文本输出；也可独立合并首份 CSV 或 XLSX 与后续 XLSX，生成新 XLSX。"
+            "原始源文件和模板不会被覆盖。独立合并不需要 WPS；完整模板工作流需要 Windows 版 WPS，"
+            "不适用于宏工作簿、网页端或云端处理。"
+        )
+        ttk.Label(parent, text=description, wraplength=730, justify="left",
+                  font=("Microsoft YaHei UI", 10)).grid(row=1, column=0, sticky="nw")
+        ttk.Separator(parent).grid(row=2, column=0, sticky="ew", pady=16)
+        ttk.Label(parent, text="更多信息", font=("Microsoft YaHei UI", 10, "bold")).grid(
+            row=3, column=0, sticky="w", pady=(0, 6))
+        links = ttk.Frame(parent)
+        links.grid(row=4, column=0, sticky="w")
+        for label, url in (
+            ("↗ Lino 笔记", LINO_HOME_URL),
+            ("↗ GitHub 主页", GITHUB_PROFILE_URL),
+            ("↗ WPS 工具源码", PROJECT_REPOSITORY_URL),
+        ):
+            ttk.Button(links, text=label,
+                       command=lambda target=url: webbrowser.open_new_tab(target)).pack(
+                           side="left", padx=(0, 8))
 
     def _build_profile_management_tab(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -5924,6 +6065,10 @@ def main() -> int:
         import tkinter as tk
         stage = "创建 Tk 主窗口"
         root = tk.Tk()
+        try:
+            set_application_icon(root, tk)
+        except Exception:
+            pass
         root.withdraw()
         _write_startup_log("主窗口已创建，开始授权检查")
         stage = "显示授权窗口"
@@ -5934,8 +6079,9 @@ def main() -> int:
             return 0
         _write_startup_log("授权通过，开始构建主界面")
         stage = "构建主界面"
-        App(root)
+        app = App(root)
         root.deiconify()
+        root.after(300, app._show_version_notice)
         _write_startup_log("主界面已显示")
         stage = "运行主界面消息循环"
         root.mainloop()
