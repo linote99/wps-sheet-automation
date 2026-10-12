@@ -1850,12 +1850,11 @@ def _sanitize_filename_fragment(value: str) -> str:
 
 
 def _region_xlsx_filename(output: dict[str, Any], index: int, collision: int = 1,
-                          bounds: tuple[int, int, int, int] | None = None) -> str:
+                          multiple_exports: bool = False) -> str:
     sheet = _sanitize_filename_fragment(str(output["sheet"]))
-    bounds = bounds or _parse_selected_area(output["range"], "区域 XLSX 输出")
-    area = _sanitize_filename_fragment(_area_address(bounds).replace(":", "-"))
-    suffix = "" if collision == 1 else f"_{collision}"
-    return f"{sheet}_{area}_{index:03d}{suffix}.xlsx"
+    export_suffix = str(index) if multiple_exports else ""
+    collision_suffix = "" if collision == 1 else f"_{collision}"
+    return f"{sheet}{export_suffix}{collision_suffix}.xlsx"
 
 
 def _copy_file_exclusive(source: Path, destination: Path) -> None:
@@ -1947,15 +1946,31 @@ def _copy_dimension_properties(source_dimension, target_dimension, names: tuple[
 
 
 def _export_table_areas(workbook_path: Path, area_outputs: list[dict[str, Any]], output_dir: Path,
-                        log: Callable[[str], None]) -> list[Path]:
-    """Create one styled, text-valued XLSX workbook for each configured source area."""
+                        log: Callable[[str], None], reserved_paths: set[Path] | None = None) -> list[Path]:
+    """Export areas from a sanitized read-only copy, never directly from WPS's saved file."""
     if not area_outputs:
         return []
-    generated: list[Path] = []
     output_dir.mkdir(parents=True, exist_ok=True)
-    source_workbook = None
     try:
-        source_workbook = load_workbook(workbook_path, data_only=True, keep_links=False)
+        with _temporary_workbook_copy(workbook_path, "已保存工作簿", log) as safe_copy:
+            source_workbook = safe_copy.load_workbook(data_only=True, keep_links=False)
+            reserved = {Path(path).resolve() for path in (reserved_paths or set())}
+            return _export_table_areas_loaded(
+                source_workbook, area_outputs, output_dir, log,
+                multiple_exports=len(area_outputs) > 1, reserved_paths=reserved,
+            )
+    except ProcessingError:
+        raise
+    except Exception as exc:
+        raise ProcessingError(f"独立区域 XLSX 导出失败：{type(exc).__name__}: {exc}") from exc
+
+
+def _export_table_areas_loaded(source_workbook, area_outputs: list[dict[str, Any]], output_dir: Path,
+                               log: Callable[[str], None], multiple_exports: bool,
+                               reserved_paths: set[Path]) -> list[Path]:
+    """Create one styled, text-valued XLSX workbook for each configured source area."""
+    generated: list[Path] = []
+    try:
         for index, output in enumerate(area_outputs, 1):
             sheet_name = str(output["sheet"]).strip()
             if sheet_name not in source_workbook.sheetnames:
@@ -2058,7 +2073,10 @@ def _export_table_areas(workbook_path: Path, area_outputs: list[dict[str, Any]],
                         raise ProcessingError(f"第 {index} 项区域 XLSX 输出未生成有效文件。")
                     collision = 1
                     while True:
-                        target = output_dir / _region_xlsx_filename(output, index, collision, bounds)
+                        target = output_dir / _region_xlsx_filename(output, index, collision, multiple_exports)
+                        if target.resolve() in reserved_paths:
+                            collision += 1
+                            continue
                         try:
                             os.link(temp_path, target)
                             break
@@ -2092,9 +2110,6 @@ def _export_table_areas(workbook_path: Path, area_outputs: list[dict[str, Any]],
         if isinstance(exc, ProcessingError):
             raise
         raise ProcessingError(f"独立区域 XLSX 导出失败：{type(exc).__name__}: {exc}") from exc
-    finally:
-        if source_workbook is not None:
-            source_workbook.close()
 
 def _format_text_matrix(matrix: list[list[Any]]) -> str:
     return "\n".join("\t".join("" if value is None else str(value) for value in row) for row in matrix)
@@ -2211,12 +2226,22 @@ def deduplicate_matrix(matrix: list[list[Any]], has_header: bool = False, key_mo
     return result, removed
 
 
-def _read_text_output_areas(workbook_path: Path, text_outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _read_text_output_areas(workbook_path: Path, text_outputs: list[dict[str, Any]],
+                            log: Callable[[str], None] = lambda _message: None) -> list[dict[str, Any]]:
     if not text_outputs:
         return []
-    workbook = None
     try:
-        workbook = load_workbook(workbook_path, data_only=True, keep_links=False, read_only=True)
+        with _temporary_workbook_copy(workbook_path, "已保存工作簿", log) as safe_copy:
+            workbook = safe_copy.load_workbook(data_only=True, keep_links=False, read_only=True)
+            return _read_text_output_areas_loaded(workbook, text_outputs)
+    except ProcessingError:
+        raise
+    except Exception as exc:
+        raise ProcessingError(f"读取文本输出区域失败：{exc}") from exc
+
+
+def _read_text_output_areas_loaded(workbook, text_outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    try:
         previews = []
         for index, output in enumerate(text_outputs, 1):
             sheet_name = str(output["sheet"]).strip()
@@ -2261,9 +2286,6 @@ def _read_text_output_areas(workbook_path: Path, text_outputs: list[dict[str, An
         raise
     except Exception as exc:
         raise ProcessingError(f"读取文本输出区域失败：{exc}") from exc
-    finally:
-        if workbook is not None:
-            workbook.close()
 
 
 def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] = print,
@@ -2311,7 +2333,8 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
             if module_id == "image_output":
                 try:
                     generated_region_files = _export_table_areas(
-                        staging_path, settings.get("image_outputs", []), final_path.parent, log
+                        staging_path, settings.get("image_outputs", []), final_path.parent, log,
+                        reserved_paths={final_path},
                     )
                 except Exception as image_exc:
                     try:
@@ -2329,7 +2352,7 @@ def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] =
                         f"WPS 已完成计算并成功保存 XLSX；该文件已保留：\n{final_path}"
                     ) from image_exc
             elif module_id == "text_output":
-                text_previews = _read_text_output_areas(staging_path, settings.get("text_outputs", []))
+                text_previews = _read_text_output_areas(staging_path, settings.get("text_outputs", []), log)
         for preview in text_previews:
             log(f"已读取文本区域 {preview['sheet']}!{preview['range']}，内容将在处理完成后显示并可复制。")
 

@@ -706,7 +706,7 @@ class StaticConfigurationTests(unittest.TestCase):
             workbook.save(source_path)
             workbook.close()
 
-            existing = output_dir / "工单表_A1-B2_001.xlsx"
+            existing = output_dir / "工单表1.xlsx"
             output_dir.mkdir()
             existing.write_bytes(b"USER-FILE")
             paths = main._export_table_areas(
@@ -715,7 +715,7 @@ class StaticConfigurationTests(unittest.TestCase):
                 output_dir, lambda _msg: None,
             )
             self.assertEqual(
-                ["工单表_A1-B2_001_2.xlsx", "工单表_D3-E4_002.xlsx"],
+                ["工单表1_2.xlsx", "工单表2.xlsx"],
                 [path.name for path in paths],
             )
             self.assertEqual(b"USER-FILE", existing.read_bytes())
@@ -731,6 +731,112 @@ class StaticConfigurationTests(unittest.TestCase):
             finally:
                 first.close()
                 second.close()
+
+    def test_region_export_sanitizes_invalid_autofilter_on_copy_without_touching_saved_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "2026.10.6_fake.staging.xlsx"
+            output_dir = root / "exports"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "已保存结果"
+            worksheet.append(["名称", "数量"])
+            worksheet.append(["FAKE-ROW", 42])
+            worksheet.auto_filter.ref = "A1:B2"
+            workbook.save(source_path)
+            workbook.close()
+            corrupt_autofilter_ref(source_path, "xl/worksheets/sheet1.xml", "A1:B2", "A1:BAD")
+            saved_bytes = source_path.read_bytes()
+            saved_mtime_ns = source_path.stat().st_mtime_ns
+            logs = []
+            load_paths = []
+            real_load = main.load_workbook
+
+            def tracked_load(path, *args, **kwargs):
+                load_paths.append(Path(path))
+                return real_load(path, *args, **kwargs)
+
+            with mock.patch.object(main, "load_workbook", side_effect=tracked_load):
+                paths = main._export_table_areas(
+                    source_path, [{"sheet": "已保存结果", "range": "A1:B2"}], output_dir, logs.append
+                )
+                previews = main._read_text_output_areas(
+                    source_path, [{"sheet": "已保存结果", "range": "A1:B2"}], logs.append
+                )
+
+            self.assertEqual(1, len(paths))
+            self.assertEqual("已保存结果.xlsx", paths[0].name)
+            self.assertEqual(2, len(load_paths))
+            self.assertTrue(all(path.name.startswith("wps_sheet_autofilter_") for path in load_paths))
+            self.assertNotIn(source_path, load_paths)
+            self.assertEqual(saved_bytes, source_path.read_bytes())
+            self.assertEqual(saved_mtime_ns, source_path.stat().st_mtime_ns)
+            self.assertTrue(any("自动筛选区域 'A1:BAD' 无效" in message for message in logs))
+            self.assertEqual("名称\t数量\nFAKE-ROW\t42", previews[0]["text"])
+            exported = load_workbook(paths[0], data_only=False)
+            try:
+                self.assertEqual("FAKE-ROW", exported["已保存结果"]["A2"].value)
+                self.assertEqual("42", exported["已保存结果"]["B2"].value)
+                self.assertEqual("s", exported["已保存结果"]["B2"].data_type)
+            finally:
+                exported.close()
+
+    def test_single_region_export_uses_template_sheet_name_and_reserves_main_workbook_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "saved.xlsx"
+            output_dir = root / "exports"
+            make_test_workbook(source_path, [("工资表", {1: {1: "员工"}, 2: {1: "FAKE-EMPLOYEE"}})])
+            reserved_main_path = output_dir / "工资表.xlsx"
+            paths = main._export_table_areas(
+                source_path, [{"sheet": "工资表", "range": "A1:A2"}], output_dir,
+                lambda _msg: None, reserved_paths={reserved_main_path},
+            )
+            self.assertEqual("工资表_2.xlsx", paths[0].name)
+            self.assertFalse(reserved_main_path.exists())
+            self.assertTrue(paths[0].is_file())
+
+    def test_region_export_structural_xml_failure_is_explicit_and_keeps_saved_main_workbook(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = create_fake_data(root / "fake")
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings.update({
+                "copy_end_col": "C", "template_path": str(fake / "template.xlsx"),
+                "output_dir": str(fake / "output"), "output_filename": "bad-region-read.xlsx",
+                "image_outputs": [{"sheet": "1当天派单", "range": "A1:B2"}],
+            })
+            for idx, job in enumerate(settings["jobs"], 1):
+                job["sources"] = [{
+                    "path": str(fake / f"{idx}.xlsx"), "source_sheet": "示例源表",
+                    "copy_start_row": 2, "copy_end_row": 3,
+                }]
+            final_path = Path(settings["output_dir"]) / settings["output_filename"]
+            saved_bytes = []
+
+            def fake_calculate(path, _formula_jobs, _log, _post_mappings, _region_processing):
+                workbook = load_workbook(path, data_only=False)
+                workbook["1当天派单"]["A3"] = "SAVED-BEFORE-REGION-ERROR"
+                workbook.save(path)
+                workbook.close()
+                rewrite_xlsx_member(
+                    path, "xl/workbook.xml",
+                    lambda data: data.replace(b"</workbook>", b"<broken></workbook>"),
+                )
+                saved_bytes.append(Path(path).read_bytes())
+
+            with mock.patch.object(main, "_calculate_in_wps", side_effect=fake_calculate):
+                with self.assertRaises(main.ProcessingError) as caught:
+                    main.process_workbooks(settings, lambda _msg: None)
+
+            message = str(caught.exception)
+            self.assertIn("区域 XLSX 输出失败", message)
+            self.assertIn("无法安全检查或准备已保存工作簿", message)
+            self.assertIn("mismatched tag", message)
+            self.assertIn(str(final_path), message)
+            self.assertTrue(final_path.is_file())
+            self.assertEqual(saved_bytes[0], final_path.read_bytes())
+            self.assertEqual([final_path], list(Path(settings["output_dir"]).iterdir()))
 
     def test_open_region_exports_setting_defaults_off_and_round_trips(self):
         legacy = deepcopy(main.DEFAULT_SETTINGS)
@@ -829,7 +935,7 @@ class StaticConfigurationTests(unittest.TestCase):
             paths = main._export_table_areas(
                 source_path, [{"sheet": "统计", "range": "AH1:BO44"}], output_dir, lambda _msg: None
             )
-            self.assertEqual("统计_AH1-CL44_001.xlsx", paths[0].name)
+            self.assertEqual("统计.xlsx", paths[0].name)
             exported = load_workbook(paths[0], data_only=False)
             try:
                 result = exported["统计"]
@@ -1119,7 +1225,7 @@ class StaticConfigurationTests(unittest.TestCase):
                 workbook.save(path)
                 workbook.close()
 
-            def fake_export(path, _outputs, output_dir, _log):
+            def fake_export(path, _outputs, output_dir, _log, **_kwargs):
                 self.assertTrue(path.is_file())
                 events.append("region-xlsx-export")
                 region_path = output_dir / "simulated.xlsx"
@@ -1129,7 +1235,7 @@ class StaticConfigurationTests(unittest.TestCase):
                 region_workbook.close()
                 return [region_path]
 
-            def fake_text(path, _outputs):
+            def fake_text(path, _outputs, _log=None):
                 self.assertTrue(path.is_file())
                 events.append("text-read")
                 return [{"sheet": "2当天归档", "range": "A1:B2", "text": "preview"}]
@@ -1736,7 +1842,13 @@ class StaticConfigurationTests(unittest.TestCase):
             )
             assert_close_precedes_unlink(
                 lambda: main._create_staging_workbook(
-                    template_path, settings, [[["FAKE-ROW", "x", 1]]], root / "staging.xlsx", lambda _msg: None
+                    template_path, settings, [[ ["FAKE-ROW", "x", 1] ]], root / "staging.xlsx", lambda _msg: None
+                ),
+                1,
+            )
+            assert_close_precedes_unlink(
+                lambda: main._export_table_areas(
+                    source_path, [{"sheet": "数据", "range": "A1:A2"}], root / "region-exports", lambda _msg: None
                 ),
                 1,
             )
@@ -1796,6 +1908,40 @@ class StaticConfigurationTests(unittest.TestCase):
                     else:
                         self.assertIn("读取/处理本身已失败", warning)
                     real_unlink(locked_paths[-1])
+
+    def test_locked_region_read_copy_retries_and_warns_without_failing_export(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_path = root / "saved-staging.xlsx"
+            make_test_workbook(source_path, [("数据", {1: {1: "标题"}, 2: {1: "FAKE-1"}})])
+            output_dir = root / "exports"
+            messages = []
+            attempts = []
+            locked_paths = []
+            real_unlink = Path.unlink
+
+            def locked_unlink(path, *args, **kwargs):
+                if path.name.startswith("wps_sheet_autofilter_"):
+                    attempts.append(path)
+                    locked_paths.append(path)
+                    raise PermissionError(13, "simulated sharing violation", str(path))
+                return real_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "unlink", new=locked_unlink), \
+                 mock.patch.object(main.time, "sleep"):
+                paths = main._export_table_areas(
+                    source_path, [{"sheet": "数据", "range": "A1:A2"}], output_dir, messages.append
+                )
+
+            self.assertEqual(1, len(paths))
+            self.assertTrue(paths[0].is_file())
+            self.assertEqual(len(main._TEMP_COPY_CLEANUP_RETRY_DELAYS) + 1, len(attempts))
+            self.assertTrue(locked_paths[-1].exists())
+            warning = next(message for message in messages if "临时读取副本" in message and "无法清理" in message)
+            self.assertIn("读取/处理已成功", warning)
+            self.assertIn(str(locked_paths[-1]), warning)
+            self.assertNotIn("Traceback", warning)
+            real_unlink(locked_paths[-1])
 
     def test_temporary_copy_names_remain_unique(self):
         with tempfile.TemporaryDirectory() as td:
