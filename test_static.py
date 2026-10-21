@@ -3338,7 +3338,7 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
 
     def test_version_and_configuration_notices_share_one_message(self):
         message = main.format_startup_notice(True, ["配置已升级到 v18：迁移提醒测试。"])
-        self.assertIn("v25", message)
+        self.assertIn("v26", message)
         self.assertIn("本次更新", message)
         self.assertIn("配置迁移说明", message)
         self.assertIn("迁移提醒测试", message)
@@ -3354,7 +3354,7 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
             "assets/linote-logo.ico",
         ):
             self.assertTrue(main.app_resource_path(relative_path).is_file(), relative_path)
-        self.assertEqual("v25", main.APP_VERSION)
+        self.assertEqual("v26", main.APP_VERSION)
         self.assertEqual("https://www.linote.top/", main.LINO_HOME_URL)
         self.assertEqual("https://github.com/linote99", main.GITHUB_PROFILE_URL)
         self.assertEqual("https://github.com/linote99/wps-sheet-automation", main.PROJECT_REPOSITORY_URL)
@@ -3375,8 +3375,8 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
         self.assertIn('--add-data "assets\\linote-logo.png;assets"', installer)
         self.assertIn("iscc.exe", installer)
         self.assertIn("wpssheetautomation.iss", installer)
-        self.assertIn("wpssheetautomation_setup_v25.exe", installer)
-        self.assertIn("outputbasefilename=wpssheetautomation_setup_v25", installer_definition)
+        self.assertIn("wpssheetautomation_setup_v26.exe", installer)
+        self.assertIn("outputbasefilename=wpssheetautomation_setup_v26", installer_definition)
         self.assertIn('source: "dist\\wpssheetautomation\\*"', installer_definition)
         self.assertNotIn("issuer_private_key.pem", installer)
         self.assertNotIn("WpsSheetAutomation_KeyGen", installer)

@@ -7,6 +7,7 @@ import os
 import posixpath
 import queue
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -33,8 +34,10 @@ from wps_automation_workflow import (DEFAULT_WORKFLOW, MODULE_LABELS, add_workfl
                                     load_profile, matching_profiles, move_workflow_module,
                                     remove_workflow_module, save_profile, validate_workflow)
 
+from wps_source_selection import OPERATIONS as SOURCE_OPERATIONS, plan_selected_source_groups, validate_source_selection
+
 APP_NAME = "WPS 表格多源汇总处理器"
-APP_VERSION = "v25"
+APP_VERSION = "v26"
 LINO_HOME_URL = "https://www.linote.top/"
 GITHUB_PROFILE_URL = "https://github.com/linote99"
 PROJECT_REPOSITORY_URL = "https://github.com/linote99/wps-sheet-automation"
@@ -94,8 +97,9 @@ def format_startup_notice(include_version_notice: bool, migration_notices: list[
     if include_version_notice:
         sections.append(
             f"{APP_NAME} {APP_VERSION}\n\n本次更新：\n"
-            "• 版本提醒与配置迁移说明合并到同一个窗口；\n"
-            "• 保留“不再提示”选项，偏好仍单独保存在本机。\n\n"
+            "• 五类源端规则支持单选／多选文件，多选先合并再处理；\n"
+            "• 处理结果在首份源文件同目录另存，文件名可自定义；\n"
+            "• 版本与配置提醒保留独立的“不再提醒”设置。\n\n"
             "可在“设置 → 关于”查看工具介绍和相关链接。"
         )
     if migration_notices:
@@ -129,7 +133,7 @@ def _window_size_path() -> Path:
 
 
 WINDOW_SIZE_PATH = _window_size_path()
-CONFIG_VERSION = 18
+CONFIG_VERSION = 19
 LEGACY_FORMULA_ROW_KEYS = ("formula_seed_row", "formula_template_row", "formula_row", "seed_row")
 MAX_PROCESSING_CELLS = 500_000
 MAX_REGION_XLSX_CELLS = 100_000
@@ -152,6 +156,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "output_filename": "处理结果.xlsx",
     "output_filename_custom": None,
     "merge_only": False,
+    "source_processing_only": False,
     "merge_output_filename": "合并结果.xlsx",
     "merge_sources": [],
     "retain_merged_sources": False,
@@ -337,6 +342,8 @@ def configuration_migration_notes(raw: Any) -> list[str]:
         notes.append("配置已升级到 v17：区域规则的工作表名可留空以使用第一张表，名称匹配不区分大小写；区域筛选范围可留空以筛选整张工作表。源文件规则先处理合并后的源副本，再将处理结果用于模板。")
     if version < 18:
         notes.append("配置已升级到 v18：新增“模板处理全部成功后删除已另存的源副本”选项；默认关闭并保留副本，启用后仅在模板处理成功时删除，失败时保留供排查。")
+    if version < 19:
+        notes.append("配置已升级到 v19：五类源端规则可单选／多选文件，多选先合并；独立源处理模式无需模板，结果在首份源文件同目录另存，文件名可自定义。旧模板流程保持不变。")
     if "open_region_exports" in raw:
         notes.append("旧版自动打开区域 XLSX 的选项已停用；区域 XLSX 将输出到所选目录，不再自动打开。")
     legacy_workflow = raw.get("workflow", [])
@@ -813,6 +820,11 @@ def _validate_merge_only_static_settings(settings: dict[str, Any]) -> None:
 
 def validate_static_settings(raw_settings: dict[str, Any]) -> None:
     settings = normalize_settings(raw_settings)
+    if not isinstance(settings.get("source_processing_only", False), bool):
+        raise ProcessingError("source_processing_only 必须是布尔值。")
+    if settings.get("source_processing_only"):
+        _validate_selected_source_static_settings(settings)
+        return
     if settings.get("merge_only"):
         _validate_merge_only_static_settings(settings)
         return
@@ -959,6 +971,10 @@ def validate_static_settings(raw_settings: dict[str, Any]) -> None:
             scope = str(rule.get("scope", "target")).strip().lower()
             if scope not in ("target", "source"):
                 raise ProcessingError(f"第 {idx} 条{label}规则的 scope 只能是 target（目标工作簿）或 source（源文件）。")
+            try:
+                validate_source_selection(rule, f"第 {idx} 条{label}规则")
+            except ValueError as exc:
+                raise ProcessingError(str(exc)) from exc
             if key == "RegionFilter":
                 bounds, selection_kind = _parse_region_filter_area(rule.get("range"), f"第 {idx} 条{label}")
             else:
@@ -1048,6 +1064,13 @@ def _validate_region_module_dependencies(settings: dict[str, Any]) -> None:
                     continue
                 if str(rule.get("scope", "target")) != str(split_rule.get("scope", "target")):
                     continue
+                if rule.get("source_paths") or split_rule.get("source_paths"):
+                    groups = plan_selected_source_groups({
+                        "TextToColumns": {"enabled": True, "rules": [split_rule]},
+                        later_key: {"enabled": True, "rules": [rule]},
+                    })
+                    if len(groups) != 1:
+                        continue
                 if later_key == "RegionFilter":
                     other = _parse_region_filter_area(rule["range"], f"第 {rule_idx} 条{MODULE_LABELS[later_key]}")[0]
                 else:
@@ -2600,14 +2623,18 @@ def _copy_file_exclusive(source: Path, destination: Path) -> None:
 
 def _publish_processed_source_copy(source_copy: Path, original_path: Path, output_dir: Path,
                                    reserved_paths: set[Path] | None = None,
-                                   filename_stem: str | None = None) -> Path:
+                                   filename_stem: str | None = None,
+                                   exact_filename: bool = False) -> Path:
     """Publish a merged source workbook beside the main output without replacing files."""
     output_dir.mkdir(parents=True, exist_ok=True)
     reserved = {Path(path).resolve() for path in (reserved_paths or set())}
-    requested_name = str(filename_stem or "").strip()
+    requested_name = str(filename_stem or "")
+    if not exact_filename:
+        requested_name = requested_name.strip()
     if requested_name.lower().endswith(".xlsx"):
         requested_name = requested_name[:-5]
-    base = _sanitize_merged_source_filename_stem(requested_name or f"{original_path.stem}_已编辑")
+    base = requested_name if exact_filename else _sanitize_merged_source_filename_stem(
+        requested_name or f"{original_path.stem}_已编辑")
     collision = 1
     while True:
         suffix = "" if collision == 1 else f"_{collision}"
@@ -4133,14 +4160,257 @@ def process_merge_only(raw_settings: dict[str, Any], log: Callable[[str], None] 
         staging_path.unlink(missing_ok=True)
 
 
+def _selected_source_workflow(settings: dict[str, Any]) -> list[str]:
+    configured = settings.get("workflow", DEFAULT_WORKFLOW)
+    if len(set(configured)) != len(configured) or any(module not in MODULE_LABELS for module in configured):
+        raise ProcessingError("源文件处理工作流包含重复或未知模块。")
+    ordered = [module for module in configured if module in SOURCE_OPERATIONS]
+    workflow = [module for module in DEFAULT_WORKFLOW if module not in SOURCE_OPERATIONS]
+    insert_at = workflow.index("final_recalc_save")
+    workflow[insert_at:insert_at] = ordered
+    return workflow
+
+
+def _validate_selected_source_static_settings(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    if settings.get("merge_only"):
+        raise ProcessingError("仅处理选定源文件与独立合并模式不能同时启用。")
+    for key in SOURCE_OPERATIONS:
+        operation = settings.get(key, {})
+        if not isinstance(operation, dict) or not isinstance(operation.get("enabled", False), bool):
+            raise ProcessingError(f"{MODULE_LABELS[key]}必须包含布尔 enabled 开关和 rules 数组。")
+    try:
+        groups = plan_selected_source_groups(settings)
+    except ValueError as exc:
+        raise ProcessingError(str(exc)) from exc
+    for key in SOURCE_OPERATIONS:
+        operation = settings.get(key, {})
+        if operation.get("enabled", False):
+            for index, rule in enumerate(operation.get("rules", []), 1):
+                if str(rule.get("scope", "target")).strip().lower() == "source" and not rule.get("source_paths"):
+                    raise ProcessingError(f"第 {index} 条{MODULE_LABELS[key]}源规则尚未选择文件；请在规则中添加一个或多个源文件。")
+    if not groups:
+        raise ProcessingError("请至少启用一条已选定源文件的公式填充、文本分列、区域筛选、去重或格式转换规则。")
+    workflow = _selected_source_workflow(settings)
+    for group in groups:
+        trial = deepcopy(DEFAULT_SETTINGS)
+        trial["workflow"] = workflow
+        for key in SOURCE_OPERATIONS:
+            rules = deepcopy(group["rules"].get(key, []))
+            trial[key] = {"enabled": bool(rules), "rules": rules}
+        validate_static_settings(trial)
+    return groups
+
+
+def _prepare_selected_source_copy(group: dict[str, Any], log: Callable[[str], None]) -> Path:
+    """Preserve a single workbook; concatenate referenced sheets for multiple files."""
+    paths = [Path(path).expanduser().resolve() for path in group["source_paths"]]
+    if not paths:
+        raise ProcessingError("未选择源文件。")
+    for path in paths:
+        if path.suffix.lower() != ".xlsx" or not path.is_file():
+            raise ProcessingError(f"源处理输入文件不存在或不是 .xlsx：\n{path}")
+    descriptor, name = tempfile.mkstemp(prefix="wps_selected_source_", suffix=".xlsx")
+    os.close(descriptor)
+    temporary = Path(name)
+    output_book = None
+    try:
+        target_names: list[str] = []
+        seed_formulas: dict[tuple[str, str], str] = {}
+        next_rows: dict[str, int] = {}
+        with _temporary_workbook_copy(paths[0], "选定源工作簿", log) as safe:
+            first_book = safe.load_workbook(read_only=True, data_only=False, keep_links=False)
+            try:
+                for rules in group["rules"].values():
+                    for rule in rules:
+                        sheet = _resolve_sheet_name(first_book.sheetnames, str(rule.get("sheet") or "").strip(), "选定源文件")
+                        if sheet not in target_names:
+                            target_names.append(sheet)
+                target_names.sort(key=first_book.sheetnames.index)
+                if not target_names:
+                    raise ProcessingError("选定源文件组没有可执行规则。")
+                if len(paths) == 1:
+                    # The original zip structure, other sheets, formatting and formulas remain intact.
+                    for sheet in first_book:
+                        _check_processing_area_size((1, 1, max(1, sheet.max_column), max(1, sheet.max_row)), "源文件安全检查")
+                        for row in sheet.iter_rows():
+                            for cell in row:
+                                if isinstance(cell.value, str) and cell.value.startswith("=") and _find_external_formula(cell.value):
+                                    raise ProcessingError(f"源文件 {paths[0].name}!{sheet.title}!{cell.coordinate} 含外部引用或访问函数，已停止。")
+                    shutil.copyfile(safe.path, temporary)
+                    log(f"已为单个源文件创建完整安全副本：{paths[0].name}（保留其他工作表）。")
+                    return temporary
+                for rule in group["rules"].get("CustomFormula", []):
+                    if str(rule.get("formula_mode", "custom")).lower() == "cell":
+                        sheet = _resolve_sheet_name(first_book.sheetnames, str(rule.get("sheet") or "").strip(), "公式来源")
+                        address = str(rule.get("seed_cell") or "").strip().upper()
+                        formula = first_book[sheet][address].value
+                        if not isinstance(formula, str) or not formula.startswith("=") or _find_external_formula(formula):
+                            raise ProcessingError(f"首份源文件公式来源 {sheet}!{address} 无有效安全公式。")
+                        seed_formulas[(sheet, address)] = formula
+            finally:
+                first_book.close()
+        output_book = Workbook()
+        output_book.remove(output_book.active)
+        for sheet_name in target_names:
+            output_book.create_sheet(sheet_name)
+            next_rows[sheet_name] = 1
+        for path in paths:
+            with _temporary_workbook_copy(path, "选定源工作簿", log) as safe:
+                raw_book = safe.load_workbook(read_only=True, data_only=False, keep_links=False)
+                value_book = safe.load_workbook(read_only=True, data_only=True, keep_links=False)
+                try:
+                    for target_name in target_names:
+                        sheet_name = _resolve_sheet_name(raw_book.sheetnames, target_name, f"源文件 {path.name}")
+                        raw_sheet, value_sheet = raw_book[sheet_name], value_book[sheet_name]
+                        last_row, max_col = _last_nonempty_source_row(raw_sheet)
+                        if not last_row:
+                            continue
+                        destination_sheet = output_book[target_name]
+                        end_row = next_rows[target_name] + last_row - 1
+                        _check_processing_area_size((1, 1, max(max_col, destination_sheet.max_column), end_row), "选定源文件合并")
+                        for offset, (raw_cells, value_cells) in enumerate(zip(
+                            raw_sheet.iter_rows(max_row=last_row, max_col=max_col),
+                            value_sheet.iter_rows(max_row=last_row, max_col=max_col),
+                        )):
+                            for column, (raw_cell, value_cell) in enumerate(zip(raw_cells, value_cells), 1):
+                                cell = destination_sheet.cell(row=next_rows[target_name] + offset, column=column)
+                                cell.value = value_cell.value
+                                if isinstance(cell.value, str) and cell.value.startswith("="):
+                                    cell.data_type = "s"
+                                cell.number_format = raw_cell.number_format
+                        log(f"已合并 {path.name}!{sheet_name} 的第 1–{last_row} 行至 {target_name} 第 {next_rows[target_name]}–{end_row} 行（保留首行）。")
+                        next_rows[target_name] = end_row + 1
+                finally:
+                    raw_book.close()
+                    value_book.close()
+        if all(row == 1 for row in next_rows.values()):
+            raise ProcessingError("选定源文件合并后没有数据。")
+        for (sheet, address), formula in seed_formulas.items():
+            output_book[sheet][address] = formula
+        output_book.save(temporary)
+        log("多选源文件已全部合并，后续规则针对合并后的整体范围执行；普通源公式使用已保存的计算缓存。")
+        return temporary
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        if output_book is not None:
+            output_book.close()
+
+
+def process_selected_source_files(raw_settings: dict[str, Any], log: Callable[[str], None] = print,
+                                  on_source_outputs: Callable[[list[Path]], None] | None = None) -> list[Path]:
+    settings = normalize_settings(raw_settings)
+    if not settings.get("source_processing_only"):
+        # Template mode executes explicitly selected tasks first, leaving legacy source rules for later.
+        for key in SOURCE_OPERATIONS:
+            settings[key]["rules"] = [rule for rule in settings[key].get("rules", [])
+                                      if str(rule.get("scope", "target")).strip().lower() == "source" and rule.get("source_paths")]
+            settings[key]["enabled"] = bool(settings[key]["enabled"] and settings[key]["rules"])
+    settings["source_processing_only"] = True
+    groups = _validate_selected_source_static_settings(settings)
+    source_inputs = {Path(path).resolve() for group in groups for path in group["source_paths"]}
+    protected = set(source_inputs)
+    if settings.get("template_path"):
+        protected.add(Path(settings["template_path"]).expanduser().resolve())
+    # Every processing input is checked before WPS starts. Template inputs are checked later.
+    for path in source_inputs:
+        if not path.is_file() or path.suffix.lower() != ".xlsx":
+            raise ProcessingError(f"源处理输入文件不存在或不是 .xlsx：\n{path}")
+    prepared: list[Path] = []
+    outputs: list[Path] = []
+    try:
+        for group in groups:
+            prepared.append(_prepare_selected_source_copy(group, log))
+        for group, temporary in zip(groups, prepared):
+            app = workbook = pythoncom = None
+            try:
+                processing = deepcopy(DEFAULT_SETTINGS)
+                processing["jobs"] = []
+                processing["workflow"] = _selected_source_workflow(settings)
+                for key in SOURCE_OPERATIONS:
+                    rules = deepcopy(group["rules"].get(key, []))
+                    for rule in rules:
+                        rule["scope"] = "target"
+                        rule.pop("source_paths", None)
+                        rule.pop("source_output_filename", None)
+                    processing[key] = {"enabled": bool(rules), "rules": rules}
+                app, pythoncom, _progid = _connect_wps(log)
+                for prop, value in (("Visible", False), ("DisplayAlerts", False), ("AskToUpdateLinks", False),
+                                    ("EnableEvents", False), ("AutomationSecurity", 3)):
+                    try:
+                        setattr(app, prop, value)
+                    except Exception:
+                        pass
+                workbook = app.Workbooks.Open(str(temporary), UpdateLinks=0, ReadOnly=False, AddToMru=False)
+                _apply_region_processing(workbook, processing, [], log, application=app)
+                _recalculate_and_wait(app, log, "源文件处理完成")
+                workbook.Save()
+            except ProcessingError:
+                raise
+            except Exception as exc:
+                raise ProcessingError(f"选定源文件处理失败：{type(exc).__name__}: {exc}") from exc
+            finally:
+                if workbook is not None:
+                    try:
+                        workbook.Close(SaveChanges=False)
+                    except Exception:
+                        pass
+                if app is not None:
+                    try:
+                        app.Quit()
+                    except Exception:
+                        pass
+                if pythoncom is not None:
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+            first_source = Path(group["source_paths"][0])
+            output = _publish_processed_source_copy(temporary, first_source, first_source.parent,
+                                                     reserved_paths=protected | set(outputs),
+                                                     filename_stem=group["output_filename"], exact_filename=True)
+            outputs.append(output)
+            log(f"源文件处理完成，已同目录另存（原件未修改）：{output}")
+        if on_source_outputs:
+            on_source_outputs(outputs)
+        return outputs
+    finally:
+        for temporary in prepared:
+            temporary.unlink(missing_ok=True)
+
+
 def process_workbooks(raw_settings: dict[str, Any], log: Callable[[str], None] = print,
                       on_text_previews: Callable[[list[dict[str, str]]], None] | None = None,
                       on_region_outputs: Callable[[list[Path]], None] | None = None,
                       on_source_outputs: Callable[[list[Path]], None] | None = None) -> Path:
     """Merge each target's sources first, process that merged copy, then edit the template."""
     settings = normalize_settings(raw_settings)
+    if settings.get("source_processing_only"):
+        paths = process_selected_source_files(settings, log, on_source_outputs)
+        return paths[0]
     if settings.get("merge_only"):
         return process_merge_only(settings, log)
+    try:
+        selected_groups = plan_selected_source_groups(settings)
+    except ValueError as exc:
+        raise ProcessingError(str(exc)) from exc
+    if selected_groups:
+        log("检测到选定源文件处理流程：先完成源处理并保存，再检查模板输入源文件是否存在。")
+        selected_outputs = process_selected_source_files(settings, log, on_source_outputs)
+        replacements = {(Path(group["source_paths"][0]).parent / group["output_filename"]).resolve(): output
+                        for group, output in zip(selected_groups, selected_outputs)}
+        for job in settings["jobs"]:
+            for source in job.get("sources", []):
+                configured_path = Path(source["path"]).expanduser().resolve()
+                if configured_path in replacements:
+                    source["path"] = str(replacements[configured_path])
+                    log("模板源引用已更新为本次生成结果：" + source["path"])
+        for key in SOURCE_OPERATIONS:
+            operation = settings[key]
+            operation["rules"] = [rule for rule in operation.get("rules", [])
+                                  if not (str(rule.get("scope", "target")).lower() == "source" and rule.get("source_paths"))]
+            operation["enabled"] = bool(operation["enabled"] and operation["rules"])
     merged_temp_paths: list[Path] = []
     try:
         return _process_template_workbooks(
@@ -4373,8 +4643,17 @@ class App:
                 self._set_output_filename(default_name, custom=False)
 
     def _on_merge_mode_changed(self):
+        if self.merge_only_var.get() and hasattr(self, "source_processing_only_var"):
+            self.source_processing_only_var.set(False)
         if hasattr(self, "run_button"):
-            self.run_button.configure(text="合并并保存" if self.merge_only_var.get() else "开始处理")
+            source_only = hasattr(self, "source_processing_only_var") and self.source_processing_only_var.get()
+            self.run_button.configure(text="处理选定源文件并另存" if source_only else
+                                      ("合并并保存" if self.merge_only_var.get() else "开始处理"))
+
+    def _on_source_processing_mode_changed(self):
+        if self.source_processing_only_var.get():
+            self.merge_only_var.set(False)
+        self._on_merge_mode_changed()
 
     def _render_merge_sources(self):
         if not hasattr(self, "merge_source_tree"):
@@ -4523,7 +4802,7 @@ class App:
         note = "可只处理模板，无需添加源文件；无源目标子表会保留模板原内容。多份源文件会先按列表顺序纵向合并，再对合并副本执行源规则并用于编辑模板；首份始终保留复制范围首行，后续文件可分别选择是否保留（默认保留，避免误删数据）。合并副本名可按目标表自定义，留空默认用模板子表名；结果映射与后映射均可独立留空。"
         ttk.Label(editor, text=note, foreground="#4b5563", wraplength=1180, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 0))
 
-        area_box = ttk.LabelFrame(outer, text="模板内部前/后映射、区域处理及文本输出", padding=5)
+        area_box = ttk.LabelFrame(outer, text="前/后映射、源文件及目标区域处理、输出", padding=5)
         area_box.grid(row=4, column=0, sticky="nsew", pady=(7, 0))
         area_box.columnconfigure(0, weight=1)
         area_box.rowconfigure(0, weight=1)
@@ -4537,7 +4816,9 @@ class App:
             (("sheet", "模板工作表", 220), ("range", "单元格范围", 180)))
         self.post_mapping_tree = self._create_area_tab(area_tabs, "后映射", "post_mappings",
             (("source_sheet", "源工作表", 180), ("source_range", "源范围", 110), ("target_sheet", "目标工作表", 180), ("target_range", "目标范围", 110)))
-        rule_columns = (("scope", "处理对象", 110), ("sheet", "工作表（留空=首表）", 150), ("range", "处理范围", 120))
+        rule_columns = (("scope", "处理对象", 110), ("source_paths", "选定源文件（按顺序）", 240),
+                        ("source_output_filename", "同目录另存文件名", 190),
+                        ("sheet", "工作表（留空=首表）", 150), ("range", "处理范围", 120))
         self.custom_formula_tree = self._create_operation_tab(area_tabs, "公式填充", "CustomFormula",
             rule_columns + (("formula_mode", "公式来源", 120), ("formula", "自定义公式", 260), ("seed_cell", "来源单元格", 100)))
         self.text_to_columns_tree = self._create_operation_tab(area_tabs, "文本分列", "TextToColumns",
@@ -4562,6 +4843,12 @@ class App:
         ttk.Checkbutton(area_box, text="模板处理全部成功后删除已另存的源副本（默认保留；开启后仅在模板、区域输出和文本读取均成功后删除；处理中失败时保留副本供排查，不删除原始源文件或模板）。",
                         variable=self.delete_processed_sources_after_success_var).grid(row=3, column=0, sticky="w", padx=4, pady=(0, 4))
 
+        self.source_processing_only_var = self.tk.BooleanVar(value=bool(
+            self.settings.get("source_processing_only", False)))
+        ttk.Checkbutton(area_box, text="仅处理选定源文件（无需模板）：在五类规则中指定文件；多选先合并，再按工作流处理；同目录另存，不覆盖原件。",
+                        variable=self.source_processing_only_var,
+                        command=self._on_source_processing_mode_changed).grid(
+                            row=4, column=0, sticky="w", padx=4, pady=5)
         controls = ttk.Frame(outer)
         controls.grid(row=5, column=0, sticky="ew", pady=7)
         self.run_button = ttk.Button(controls, text="开始处理", command=self._run)
@@ -4766,8 +5053,13 @@ class App:
                 tree.delete(item)
             for idx, rule in enumerate(operation.get("rules", [])):
                 values = []
-                for column in columns:
+                for column in tree["columns"]:
                     value = rule.get(column, "")
+                    if column == "source_paths":
+                        value = ((" → ".join(_template_output_filename(path) for path in (value or [])) or "原模板源列表")
+                                 if rule.get("scope") == "source" else "—")
+                    elif column == "source_output_filename":
+                        value = (value or "首文件名_已处理.xlsx") if rule.get("source_paths") else "—"
                     if column == "scope":
                         value = "源文件" if value == "source" else "目标工作簿"
                     elif column == "formula_mode":
@@ -4920,6 +5212,69 @@ class App:
                 widget = self.ttk.Entry(dialog, textvariable=variable, width=34)
             widget.grid(row=row, column=1, sticky="ew", padx=5, pady=5)
             variables[field] = variable
+        source_box = self.ttk.LabelFrame(dialog, text="指定源文件（仅处理对象为源文件时生效）", padding=6)
+        source_box.grid(row=len(fields), column=0, columnspan=2, sticky="ew", padx=8, pady=5)
+        source_box.columnconfigure(0, weight=1)
+        self.ttk.Label(source_box, text="单选保留完整工作簿；多选先按列表顺序合并规则涉及的同名工作表，再整体处理。\n"
+                       "多选保留各文件首行；工作表留空按首文件首表确定，其他文件须有同名表。",
+                       wraplength=650, justify="left").grid(row=0, column=0, columnspan=2, sticky="w")
+        source_list = self.tk.Listbox(source_box, height=5, width=76, selectmode="extended", exportselection=False)
+        source_list.grid(row=1, column=0, columnspan=2, sticky="ew", pady=5)
+        for path in data.get("source_paths", []):
+            source_list.insert("end", path)
+        source_buttons = self.ttk.Frame(source_box)
+        source_buttons.grid(row=2, column=0, columnspan=2, sticky="w")
+
+        def add_files():
+            paths = self.filedialog.askopenfilenames(parent=dialog, title="选择一个或多个源文件（XLSX）",
+                                                    filetypes=[("Excel 工作簿（无宏）", "*.xlsx")])
+            current = {str(Path(path).expanduser().resolve()).casefold() for path in source_list.get(0, "end")}
+            for path in paths:
+                identity = str(Path(path).expanduser().resolve()).casefold()
+                if identity not in current:
+                    source_list.insert("end", path)
+                    current.add(identity)
+
+        def remove_files():
+            for index in reversed(source_list.curselection()):
+                source_list.delete(index)
+
+        def move_files(direction):
+            selected = list(source_list.curselection())
+            values = list(source_list.get(0, "end"))
+            if not selected or (direction < 0 and selected[0] == 0) or (direction > 0 and selected[-1] == len(values) - 1):
+                return
+            for index in (selected if direction < 0 else reversed(selected)):
+                values[index], values[index + direction] = values[index + direction], values[index]
+            source_list.delete(0, "end")
+            for value in values:
+                source_list.insert("end", value)
+            for index in selected:
+                source_list.selection_set(index + direction)
+
+        selection_buttons = []
+        for label, command in (("添加文件（可多选）…", add_files), ("移除选中", remove_files),
+                               ("上移", lambda: move_files(-1)), ("下移", lambda: move_files(1))):
+            button = self.ttk.Button(source_buttons, text=label, command=command)
+            button.pack(side="left", padx=2)
+            selection_buttons.append(button)
+        self.ttk.Label(source_box, text="同目录另存文件名（可不填 .xlsx）").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        source_filename = self.tk.StringVar(value=str(data.get("source_output_filename") or ""))
+        source_filename_entry = self.ttk.Entry(source_box, textvariable=source_filename, width=42)
+        source_filename_entry.grid(row=3, column=1, sticky="ew", pady=(6, 0))
+        self.ttk.Label(source_box, text="留空=首文件名_已处理.xlsx；保存到列表首文件目录。同文件列表、同文件名的规则连续处理为同一结果。\n"
+                       "模板模式会先运行这些选定源流程并保存，再检查模板输入；勾选“仅处理选定源文件”可不运行模板。",
+                       wraplength=650, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
+
+        def update_selection_state(*_args):
+            state = "normal" if variables["scope"].get() == "源文件" else "disabled"
+            source_list.configure(state=state)
+            source_filename_entry.configure(state=state)
+            for button in selection_buttons:
+                button.configure(state=state)
+
+        variables["scope"].trace_add("write", update_selection_state)
+        update_selection_state()
         result = {"value": None}
         def accept():
             rule = {}
@@ -4947,10 +5302,15 @@ class App:
                     rule[field] = value.replace(r"\t", "\t").replace(r"\n", "\n")
                 else:
                     rule[field] = value
+            if rule["scope"] == "source":
+                rule["source_paths"] = list(source_list.get(0, "end"))
+                rule["source_output_filename"] = source_filename.get()
             if key == "Deduplicate" and rule["key_mode"] == "row":
                 rule["key_columns"] = []
             try:
                 trial = normalize_settings(self.settings)
+                trial["source_processing_only"] = False
+                trial["merge_only"] = False
                 trial[key]["rules"] = [*trial[key].get("rules", []), rule]
                 validate_static_settings(trial)
             except ProcessingError as exc:
@@ -4959,7 +5319,7 @@ class App:
             result["value"] = rule
             dialog.destroy()
         buttons = self.ttk.Frame(dialog)
-        buttons.grid(row=len(fields), column=0, columnspan=2, pady=8)
+        buttons.grid(row=len(fields) + 1, column=0, columnspan=2, pady=8)
         self.ttk.Button(buttons, text="确定", command=accept).pack(side="left", padx=5)
         self.ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="left", padx=5)
         dialog.wait_window()
@@ -5523,10 +5883,12 @@ class App:
 
     def _collect(self):
         merge_only = bool(self.merge_only_var.get())
-        if not merge_only and not self._commit_job_editor(show_errors=False):
+        source_only = bool(self.source_processing_only_var.get())
+        if not merge_only and not source_only and not self._commit_job_editor(show_errors=False):
             raise ProcessingError("当前目标表的保留标题行数和粘贴起始行必须是整数。")
         settings = {key: var.get().strip() for key, var in self.vars.items()}
         settings["merge_only"] = merge_only
+        settings["source_processing_only"] = source_only
         settings["output_filename_custom"] = bool(self.output_filename_custom)
         settings["config_version"] = CONFIG_VERSION
         settings["config_name"] = self.active_profile_name
@@ -5588,6 +5950,7 @@ class App:
         self.settings = normalized
         self.active_profile_name = str(active_name if active_name is not None else normalized.get("config_name", ""))
         self.output_filename_custom = bool(normalized.get("output_filename_custom", False))
+        self.source_processing_only_var.set(bool(normalized.get("source_processing_only", False)))
         self.merge_only_var.set(bool(normalized.get("merge_only", False)))
         self._on_merge_mode_changed()
         self.retain_merged_sources_var.set(bool(normalized.get(
@@ -5815,6 +6178,8 @@ class App:
 “区域 XLSX 输出”添加模板表和范围；区域 XLSX 会独立导出并保留单元格样式。“文本预览/复制”添加工作表范围；处理并保存成功后显示预览，可复制完整区域或分块内容，列之间以 Tab 分隔。
 
 七、模块工作流
+选定源文件处理：五类规则的处理对象设为“源文件”后，可添加一个或多个 XLSX 文件并排序。单选保留完整工作簿，多选先合并规则涉及的同名表，再对合并结果整体处理；保留各文件首行。同文件列表、顺序和输出名的规则共享一个结果。结果在首文件同目录另存，名称可自定义；留空用“首文件名_已处理.xlsx”，同名自动编号。勾选“仅处理选定源文件”可无需模板；模板模式会先完成这些流程，再检查模板源文件是否存在，避让时改用本次实际结果。源处理自身的输入必须存在。
+
 “模块工作流”可调整处理模块顺序；添加/移除可选模块并用上移/下移排序。必需模块、结果映射、后映射、公式填充、区域操作和输出模块之间有依赖约束；非法顺序会在保存或运行时提示。默认顺序先合并源文件，再处理合并副本和模板，完成重算、映射、区域操作和保存，最后输出区域 XLSX 及文本预览。
 
 八、独立源文件合并
@@ -6005,7 +6370,8 @@ class App:
         try:
             settings = self._collect()
             validate_static_settings(settings)
-            missing_source = None if settings.get("merge_only") else _first_missing_source_location(settings)
+            has_selected_sources = bool(plan_selected_source_groups(settings))
+            missing_source = None if (settings.get("merge_only") or settings.get("source_processing_only") or has_selected_sources) else _first_missing_source_location(settings)
             if missing_source is not None:
                 self._focus_source_location(*missing_source)
                 raise ProcessingError(_missing_source_path_message(settings, missing_source))
@@ -6019,7 +6385,8 @@ class App:
         self._render_text_previews([])
         self._region_output_files = []
         self._source_output_files = []
-        self._log("开始独立合并……" if settings.get("merge_only") else "开始处理……")
+        self._log("开始处理选定源文件并同目录另存……" if settings.get("source_processing_only") else
+                  ("开始独立合并……" if settings.get("merge_only") else "开始处理……"))
         def work():
             try:
                 path = process_workbooks(settings, lambda text: self.events.put(("log", text)),
@@ -6052,7 +6419,7 @@ class App:
                         xlsx_count = sum(path.suffix.lower() == ".xlsx" for path in self._region_output_files)
                         output_note = f"\n区域 XLSX：{xlsx_count} 个。" if self._region_output_files else ""
                         if self._source_output_files:
-                            output_note += f"\n已保存合并源工作簿：{len(self._source_output_files)} 个。"
+                            output_note += f"\n已保存源文件处理结果：{len(self._source_output_files)} 个。"
                         if merge_only:
                             self.messagebox.showinfo(APP_NAME, f"独立合并成功，已保存 XLSX：\n{path_text}")
                         else:

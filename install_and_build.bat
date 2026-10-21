@@ -53,13 +53,13 @@ if errorlevel 1 goto failed
 
 echo [6/7] Running syntax, self, and static unit checks...
 set "FAIL_STEP=Python syntax check"
-"%VENV_PY%" -m py_compile main.py wps_automation_workflow.py licensing.py make_fake_data.py test_static.py >>"%LOG_FILE%" 2>&1
+"%VENV_PY%" -m py_compile main.py wps_automation_workflow.py licensing.py make_fake_data.py wps_source_selection.py test_static.py test_source_selection.py test_selected_processing.py >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 set "FAIL_STEP=application self-check"
 "%VENV_PY%" main.py --self-check >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 set "FAIL_STEP=static unit tests"
-"%VENV_PY%" -m unittest -v test_static.py >>"%LOG_FILE%" 2>&1
+"%VENV_PY%" -m unittest -v test_static.py test_source_selection.py test_selected_processing.py >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 
 echo [7/7] Building the Windows application and installer...
@@ -71,10 +71,10 @@ set "FAIL_STEP=Inno Setup installer compilation"
 "%ISCC_EXE%" "%~dp0WpsSheetAutomation.iss" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 set "FAIL_STEP=installer output validation"
-if not exist "%~dp0dist\WpsSheetAutomation_Setup_v25.exe" goto failed
+if not exist "%~dp0dist\WpsSheetAutomation_Setup_v26.exe" goto failed
 
 echo Main application: %~dp0dist\WpsSheetAutomation\WpsSheetAutomation.exe
-echo Windows installer: %~dp0dist\WpsSheetAutomation_Setup_v25.exe
+echo Windows installer: %~dp0dist\WpsSheetAutomation_Setup_v26.exe
 echo Main-only installer does not contain the license generator or signing private key.
 echo The installer is unsigned; Windows SmartScreen may show a publisher warning.
 >>"%LOG_FILE%" echo Installer build completed %date% %time%
