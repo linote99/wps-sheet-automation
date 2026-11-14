@@ -487,6 +487,29 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertLess(migrated_v12["workflow"].index("formula_recalc"), migrated_v12["workflow"].index("result_mapping"))
         self.assertLess(migrated_v12["workflow"].index("result_mapping"), migrated_v12["workflow"].index("post_mapping"))
 
+    def test_divergent_v19_configs_migrate_to_v20_without_losing_settings(self):
+        main_v19 = main.normalize_settings({
+            "config_version": 19,
+            "jobs": deepcopy(main.DEFAULT_SETTINGS["jobs"]),
+            "source_blank_rows_stop_count": 3,
+        })
+        self.assertEqual(20, main_v19["config_version"])
+        self.assertEqual(3, main_v19["source_blank_rows_stop_count"])
+        self.assertFalse(main_v19["source_processing_only"])
+
+        v26_v19 = main.normalize_settings({
+            "config_version": 19,
+            "jobs": deepcopy(main.DEFAULT_SETTINGS["jobs"]),
+            "source_processing_only": True,
+        })
+        self.assertEqual(20, v26_v19["config_version"])
+        self.assertEqual(1, v26_v19["source_blank_rows_stop_count"])
+        self.assertTrue(v26_v19["source_processing_only"])
+        migration_notes = " ".join(main.configuration_migration_notes({"config_version": 19}))
+        self.assertIn("v20", migration_notes)
+        self.assertIn("连续整行空白停止阈值", migration_notes)
+        self.assertIn("选定源文件处理", migration_notes)
+
     def test_v6_v7_formula_seed_fields_are_ignored_and_migration_is_explained(self):
         for version in (6, 7):
             with self.subTest(version=version):
@@ -3421,7 +3444,7 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
 
     def test_version_and_configuration_notices_share_one_message(self):
         message = main.format_startup_notice(True, ["配置已升级到 v18：迁移提醒测试。"])
-        self.assertIn("v25", message)
+        self.assertIn("v27", message)
         self.assertIn("本次更新", message)
         self.assertIn("配置迁移说明", message)
         self.assertIn("迁移提醒测试", message)
@@ -3437,7 +3460,7 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
             "assets/linote-logo.ico",
         ):
             self.assertTrue(main.app_resource_path(relative_path).is_file(), relative_path)
-        self.assertEqual("v25", main.APP_VERSION)
+        self.assertEqual("v27", main.APP_VERSION)
         self.assertEqual("https://www.linote.top/", main.LINO_HOME_URL)
         self.assertEqual("https://github.com/linote99", main.GITHUB_PROFILE_URL)
         self.assertEqual("https://github.com/linote99/wps-sheet-automation", main.PROJECT_REPOSITORY_URL)
@@ -3458,8 +3481,8 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
         self.assertIn('--add-data "assets\\linote-logo.png;assets"', installer)
         self.assertIn("iscc.exe", installer)
         self.assertIn("wpssheetautomation.iss", installer)
-        self.assertIn("wpssheetautomation_setup_v25.exe", installer)
-        self.assertIn("outputbasefilename=wpssheetautomation_setup_v25", installer_definition)
+        self.assertIn("wpssheetautomation_setup_v27.exe", installer)
+        self.assertIn("outputbasefilename=wpssheetautomation_setup_v27", installer_definition)
         self.assertIn('source: "dist\\wpssheetautomation\\*"', installer_definition)
         self.assertNotIn("issuer_private_key.pem", installer)
         self.assertNotIn("WpsSheetAutomation_KeyGen", installer)

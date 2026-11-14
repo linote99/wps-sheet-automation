@@ -90,8 +90,6 @@ def normalize_machine_code(value: str) -> str:
     return text
 
 
-def _b64url_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
 def _b64url_decode(text: str) -> bytes:
@@ -103,36 +101,8 @@ def _b64url_decode(text: str) -> bytes:
         raise LicensingError("许可证编码格式无效。") from exc
 
 
-def canonical_payload(machine: str, expires: date) -> bytes:
-    claims = {"app": APP_ID, "expires": expires.isoformat(), "machine": normalize_machine_code(machine)}
-    return json.dumps(claims, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def generate_license(machine: str, expires: date | str, private_key_pem: bytes | str) -> str:
-    """Sign a machine-bound expiry claim with a PKCS#8 P-256 private key."""
-    machine = normalize_machine_code(machine)
-    if isinstance(expires, str):
-        try:
-            expires = date.fromisoformat(expires.strip())
-        except ValueError as exc:
-            raise LicensingError("到期日期须为有效的 YYYY-MM-DD 日期。") from exc
-    if not isinstance(expires, date):
-        raise LicensingError("请选择有效的到期日期。")
-    if isinstance(private_key_pem, str):
-        private_key_pem = private_key_pem.encode("utf-8")
-    try:
-        key = serialization.load_pem_private_key(private_key_pem, password=None)
-    except (ValueError, TypeError) as exc:
-        raise LicensingError("无法读取私钥；请选用本程序配套的未加密 PKCS#8 PEM 私钥文件。") from exc
-    if not isinstance(key, ec.EllipticCurvePrivateKey) or not isinstance(key.curve, ec.SECP256R1):
-        raise LicensingError("签发私钥与本程序不匹配；需要 ECDSA P-256 私钥。")
-    payload = canonical_payload(machine, expires)
-    der_signature = key.sign(payload, ec.ECDSA(hashes.SHA256()))
-    # WebCrypto represents ECDSA signatures as fixed-width r || s (64 bytes).
-    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
-    r, s = decode_dss_signature(der_signature)
-    raw_signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
-    return _b64url_encode(payload) + "." + _b64url_encode(raw_signature)
 
 
 def inspect_license_expiry(token: str, machine: str, public_key_b64: str = PUBLIC_KEY_B64) -> date:

@@ -1,5 +1,5 @@
 {
-  "config_version": 19,
+  "config_version": 20,
   "config_name": "",
   "template_prefix_length": 5,
   "workflow": [
@@ -87,5 +87,6 @@
       "mappings": [],
       "sources": []
     }
-  ]
+  ],
+  "source_processing_only": false
 }
