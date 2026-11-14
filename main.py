@@ -129,7 +129,7 @@ def _window_size_path() -> Path:
 
 
 WINDOW_SIZE_PATH = _window_size_path()
-CONFIG_VERSION = 18
+CONFIG_VERSION = 19
 LEGACY_FORMULA_ROW_KEYS = ("formula_seed_row", "formula_template_row", "formula_row", "seed_row")
 MAX_PROCESSING_CELLS = 500_000
 MAX_REGION_XLSX_CELLS = 100_000
@@ -160,6 +160,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "retain_edited_sources": False,
     "copy_start_col": "A",
     "copy_end_col": "",
+    "source_blank_rows_stop_count": 1,
     "pre_mappings": [],
     "post_mappings": [],
     "region_xlsx_outputs": [],
@@ -337,6 +338,8 @@ def configuration_migration_notes(raw: Any) -> list[str]:
         notes.append("配置已升级到 v17：区域规则的工作表名可留空以使用第一张表，名称匹配不区分大小写；区域筛选范围可留空以筛选整张工作表。源文件规则先处理合并后的源副本，再将处理结果用于模板。")
     if version < 18:
         notes.append("配置已升级到 v18：新增“模板处理全部成功后删除已另存的源副本”选项；默认关闭并保留副本，启用后仅在模板处理成功时删除，失败时保留供排查。")
+    if version < 19:
+        notes.append("配置已升级到 v19：新增连续整行空白停止标记数，默认 1 行以保持旧行为；较短空行间隔可继续扫描。")
     if "open_region_exports" in raw:
         notes.append("旧版自动打开区域 XLSX 的选项已停用；区域 XLSX 将输出到所选目录，不再自动打开。")
     legacy_workflow = raw.get("workflow", [])
@@ -753,6 +756,14 @@ def normalize_settings(raw: dict[str, Any]) -> dict[str, Any]:
     if not 1 <= prefix_length <= 120:
         raise ProcessingError("模板匹配前缀长度 N 必须介于 1 和 120。")
     settings["template_prefix_length"] = prefix_length
+    blank_stop_count = settings.get("source_blank_rows_stop_count", 1)
+    if isinstance(blank_stop_count, bool) or (
+        isinstance(blank_stop_count, float) and not blank_stop_count.is_integer()
+    ):
+        raise ProcessingError("连续整行空白停止标记数必须是 1 到 1048576 之间的正整数。")
+    settings["source_blank_rows_stop_count"] = _positive_row(
+        blank_stop_count, "连续整行空白停止标记数"
+    )
     settings["config_name"] = str(settings.get("config_name") or "").strip()
     filename = str(settings.get("output_filename") or "").strip()
     is_custom_filename = _filename_is_custom(raw, filename)
@@ -1607,21 +1618,43 @@ def _last_nonempty_source_row(ws) -> tuple[int, int]:
     return last_nonempty, max_col
 
 
+def _source_end_before_blank_run(ws, start_row: int, actual_last_row: int,
+                                 used_max_col: int, blank_rows_stop_count: int) -> tuple[int, int | None]:
+    """Return the last row before the first configured-length run of blank rows."""
+    blank_run = 0
+    for row_number, cells in enumerate(
+        ws.iter_rows(min_row=start_row, max_row=actual_last_row,
+                     min_col=1, max_col=max(used_max_col, 1)),
+        start=start_row,
+    ):
+        if any(_cell_has_data(cell.value) for cell in cells):
+            blank_run = 0
+            continue
+        blank_run += 1
+        if blank_run >= blank_rows_stop_count:
+            boundary_row = row_number - blank_rows_stop_count + 1
+            return boundary_row - 1, boundary_row
+    return actual_last_row, None
+
+
 def _read_source_records(path: Path, sheet_name: str, start_row: int, col_start: int, col_end: int,
                          log: Callable[[str], None], end_row: int | None = None,
                          source_processing: dict[str, Any] | None = None,
-                         source_rules_used: set[tuple[str, int]] | None = None) -> list[list[Any]]:
+                         source_rules_used: set[tuple[str, int]] | None = None,
+                         source_blank_rows_stop_count: int = 1) -> list[list[Any]]:
     _check_xlsx_file(path, f"源工作簿“{path.name}”")
     with _temporary_workbook_copy(path, "源工作簿", log) as load_path:
         return _read_source_records_from_copy(load_path, path, sheet_name, start_row, col_start, col_end,
-                                              log, end_row, source_processing, source_rules_used)
+                                              log, end_row, source_processing, source_rules_used,
+                                              source_blank_rows_stop_count)
 
 
 def _read_source_records_from_copy(load_path: _TemporaryWorkbookCopy, path: Path, sheet_name: str, start_row: int,
                                    col_start: int, col_end: int, log: Callable[[str], None],
                                    end_row: int | None = None,
                                    source_processing: dict[str, Any] | None = None,
-                                   source_rules_used: set[tuple[str, int]] | None = None) -> list[list[Any]]:
+                                   source_rules_used: set[tuple[str, int]] | None = None,
+                                   source_blank_rows_stop_count: int = 1) -> list[list[Any]]:
     try:
         values_book = load_path.load_workbook(read_only=True, data_only=True, keep_links=False)
         formula_book = load_path.load_workbook(read_only=True, data_only=False, keep_links=False)
@@ -1643,18 +1676,18 @@ def _read_source_records_from_copy(load_path: _TemporaryWorkbookCopy, path: Path
             last_row = min(end_row, actual_last_row)
             log(f"{path.name} 使用显式复制结束行 {end_row}；本次读取上限为第 {last_row} 行。")
         else:
-            last_row = actual_last_row
-            boundary_row = None
-            for row_number, cells in enumerate(
-                raw_ws.iter_rows(min_row=start_row, max_row=actual_last_row, min_col=1, max_col=used_max_col),
-                start=start_row,
-            ):
-                if not any(_cell_has_data(cell.value) for cell in cells):
-                    boundary_row = row_number
-                    last_row = row_number - 1
-                    break
+            last_row, boundary_row = _source_end_before_blank_run(
+                raw_ws, start_row, actual_last_row, used_max_col, source_blank_rows_stop_count
+            )
             if boundary_row is not None:
-                log(f"{path.name} 在第 {boundary_row} 行遇到整行空白边界（检查全部 {used_max_col} 个已使用列）；采用第 {last_row} 行为末行，边界后的数据不纳入此源。")
+                boundary_end = boundary_row + source_blank_rows_stop_count - 1
+                if source_blank_rows_stop_count == 1:
+                    boundary_description = f"第 {boundary_row} 行遇到整行空白边界"
+                else:
+                    boundary_description = (
+                        f"第 {boundary_row} 至 {boundary_end} 行遇到连续 {source_blank_rows_stop_count} 行整行空白停止边界"
+                    )
+                log(f"{path.name} 在{boundary_description}（检查全部 {used_max_col} 个已使用列）；采用第 {last_row} 行为末行，边界后的数据不纳入此源。")
             else:
                 log(f"{path.name} 从第 {start_row} 行至最后非空行 {actual_last_row} 未遇到整行空白边界；采用最后非空行作为末行。")
         if last_row < start_row:
@@ -2721,14 +2754,13 @@ def _merge_source_workbooks(sources: list[dict[str, Any]], settings: dict[str, A
                     if end_row is not None:
                         last_row = min(end_row, actual_last)
                     else:
-                        last_row = actual_last
-                        for row_number, cells in enumerate(
-                            raw_ws.iter_rows(min_row=start_row, max_row=actual_last,
-                                             min_col=1, max_col=used_max_col), start=start_row
-                        ):
-                            if not any(_cell_has_data(cell.value) for cell in cells):
-                                last_row = row_number - 1
-                                break
+                        last_row, boundary_row = _source_end_before_blank_run(
+                            raw_ws, start_row, actual_last, used_max_col,
+                            settings.get("source_blank_rows_stop_count", 1),
+                        )
+                        if boundary_row is not None:
+                            stop_count = settings.get("source_blank_rows_stop_count", 1)
+                            log(f"{source_path.name} 从第 {boundary_row} 行起连续 {stop_count} 行整行空白，采用第 {last_row} 行为末行。")
                     if last_row < start_row:
                         raise ProcessingError(f"源工作簿“{source_path.name}”从第 {start_row} 行起遇到空白边界，没有可合并内容。")
                     included_start = start_row if keep_header else start_row + 1
@@ -2938,7 +2970,8 @@ def _process_merged_source_workbook(merged: dict[str, Any], settings: dict[str, 
             log(f"已保存合并源工作簿（原始源文件均未修改）：{retained_path}")
     source_input_path = retained_path or merged["path"]
     records = _read_source_records(source_input_path, merged["sheet"], 1, col_start, col_end,
-                                   log, merged["last_row"], None, merged["used_rules"])
+                                   log, merged["last_row"], None, merged["used_rules"],
+                                   settings.get("source_blank_rows_stop_count", 1))
     return records, retained_path
 
 
@@ -2958,7 +2991,8 @@ def _read_source_records_with_rules(path: Path, sheet_name: str, start_row: int,
     )
     if not any_source_rules:
         return _read_source_records(path, sheet_name, start_row, col_start, col_end, log,
-                                   end_row, None, source_rules_used)
+                                   end_row, None, source_rules_used,
+                                   settings.get("source_blank_rows_stop_count", 1))
 
     with _temporary_workbook_copy(path, "源工作簿", log) as safe_copy:
         preview = safe_copy.load_workbook(read_only=True, data_only=False, keep_links=False)
@@ -2970,7 +3004,8 @@ def _read_source_records_with_rules(path: Path, sheet_name: str, start_row: int,
         source_rules_used.update(used_rules)
         if not has_matching_rules:
             return _read_source_records(path, sheet_name, start_row, col_start, col_end, log,
-                                        end_row, None, source_rules_used)
+                                        end_row, None, source_rules_used,
+                                        settings.get("source_blank_rows_stop_count", 1))
 
         app = workbook = pythoncom = None
         com_initialized = False
@@ -3023,7 +3058,8 @@ def _read_source_records_with_rules(path: Path, sheet_name: str, start_row: int,
             if on_source_output is not None:
                 on_source_output(retained_path)
         return _read_source_records(safe_copy.path, sheet_name, start_row, col_start, col_end,
-                                    log, end_row, None, source_rules_used)
+                                    log, end_row, None, source_rules_used,
+                                    settings.get("source_blank_rows_stop_count", 1))
 
 
 def _publish_staging_workbook(staging_path: Path, final_path: Path) -> None:
@@ -3992,16 +4028,23 @@ def _detect_csv_dialect(path: Path, encoding: str):
 
 def _append_merge_source_rows(worksheet, rows, source_index: int, source_path: Path,
                               start_row: int, end_row: int | None, keep_first_row: bool,
-                              current_output_row: int, log: Callable[[str], None]) -> int:
+                              current_output_row: int, log: Callable[[str], None],
+                              blank_rows_stop_count: int = 1) -> int:
     appended = 0
+    blank_run = 0
     for source_row_number, source_row in rows:
         if source_row_number < start_row:
             continue
         if end_row is not None and source_row_number > end_row:
             break
         row = list(source_row)
-        if end_row is None and source_row_number >= start_row and not any(_cell_has_data(value) for value in row):
-            break
+        if end_row is None and source_row_number >= start_row:
+            if not any(_cell_has_data(value) for value in row):
+                blank_run += 1
+                if blank_run >= blank_rows_stop_count:
+                    break
+                continue
+            blank_run = 0
         if source_index > 0 and source_row_number == start_row and not keep_first_row:
             log(f"源文件 {source_path.name} 按设置跳过复制范围首行（第 {start_row} 行）。")
             continue
@@ -4082,6 +4125,7 @@ def process_merge_only(raw_settings: dict[str, Any], log: Callable[[str], None] 
                         count = _append_merge_source_rows(
                             worksheet, rows, source_index, source_path, start_row, end_row,
                             keep_first, output_rows + 1, log,
+                            settings.get("source_blank_rows_stop_count", 1),
                         )
                 except (csv.Error, UnicodeError, OSError) as exc:
                     raise ProcessingError(f"读取 CSV 源文件失败：\n{source_path}\n{exc}") from exc
@@ -4111,6 +4155,7 @@ def process_merge_only(raw_settings: dict[str, Any], log: Callable[[str], None] 
                         count = _append_merge_source_rows(
                             worksheet, rows, source_index, source_path, start_row, end_row,
                             keep_first, output_rows + 1, log,
+                            settings.get("source_blank_rows_stop_count", 1),
                         )
                     finally:
                         raw_book.close()
@@ -5689,16 +5734,38 @@ class App:
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
         license_page = self.ttk.Frame(notebook, padding=12)
         help_page = self.ttk.Frame(notebook, padding=8)
+        source_scan_page = self.ttk.Frame(notebook, padding=12)
         config_page = self.ttk.Frame(notebook, padding=12)
         about_page = self.ttk.Frame(notebook, padding=12)
         notebook.add(license_page, text="秘钥管理")
         notebook.add(help_page, text="使用说明")
+        notebook.add(source_scan_page, text="源数据扫描")
         notebook.add(config_page, text="配置管理")
         notebook.add(about_page, text="关于")
         self._build_license_settings_tab(license_page)
         self._build_usage_help_tab(help_page)
+        self._build_source_scan_settings_tab(source_scan_page)
         self._build_profile_management_tab(config_page)
         self._build_about_tab(about_page)
+
+    def _build_source_scan_settings_tab(self, parent):
+        ttk = self.ttk
+        parent.columnconfigure(1, weight=1)
+        key = "source_blank_rows_stop_count"
+        if key not in self.vars:
+            self.vars[key] = self.tk.StringVar(value=str(self.settings.get(key, 1)))
+        ttk.Label(parent, text="连续整行空白停止标记数").grid(
+            row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 8))
+        ttk.Entry(parent, textvariable=self.vars[key], width=12).grid(
+            row=0, column=1, sticky="w", pady=(0, 8))
+        ttk.Label(
+            parent,
+            text=("填写正整数 N。每个源文件从其复制起始行开始，只有连续 N 行在全部已使用列中均为空时才停止；"
+                  "停止边界之前的最后一行作为末行，较短空行间隔会跳过后继续扫描。默认 1 行，保持旧行为。\n"
+                  "若源文件设置了显式复制结束行，仍按该结束行作为读取上限，不受空行停止标记影响。"
+                  "此项随当前配置保存、导入和导出。"),
+            wraplength=650, justify="left", foreground="#4b5563",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
     def _build_license_settings_tab(self, parent):
         from datetime import date
@@ -5800,7 +5867,7 @@ class App:
 选择无宏 .xlsx 模板、输出目录和输出文件名。源数据复制起始列/末列用于定义从源表复制的列范围；有关联源文件时末列必填，无源文件仅编辑模板时可留空。模板前缀匹配长度用于选择模板时查找已保存的命名配置；只有唯一匹配或明确选择后才载入。
 
 二、目标子表与多源文件
-每个目标子表单独设置模板表名、标题行、粘贴起始行和公式列范围。多份源文件先按列表顺序合并为该目标表的工作簿，再对合并结果执行源规则；命中源规则时处理结果必须先另存为独立副本，模板从该副本读取。首份源文件保留复制范围首行，后续源文件可分别选择是否保留复制范围首行（默认保留）。合并源文件名可自定义，留空默认为对应模板子表名。无源侧规则时，“保存合并源工作簿”控制是否保留合并副本。可选勾选“模板处理全部成功后删除已另存的源副本”；默认保留，开启后只在模板、区域输出及文本读取均成功后删除，任何失败都保留副本供排查。源工作表名留空时取首个工作表，复制结束行留空时按首个整行空白边界判断。无源目标表保留模板原数据，仅运行配置的模板规则。
+每个目标子表单独设置模板表名、标题行、粘贴起始行和公式列范围。多份源文件先按列表顺序合并为该目标表的工作簿，再对合并结果执行源规则；命中源规则时处理结果必须先另存为独立副本，模板从该副本读取。首份源文件保留复制范围首行，后续源文件可分别选择是否保留复制范围首行（默认保留）。合并源文件名可自定义，留空默认为对应模板子表名。无源侧规则时，“保存合并源工作簿”控制是否保留合并副本。可选勾选“模板处理全部成功后删除已另存的源副本”；默认保留，开启后只在模板、区域输出及文本读取均成功后删除，任何失败都保留副本供排查。源工作表名留空时取首个工作表；“设置 → 源数据扫描”可配置连续整行空白停止标记数 N，默认 1，只有连续 N 行在全部已使用列均为空时才停止，较短空行间隔会继续扫描；显式复制结束行仍按其原有上限生效。无源目标表保留模板原数据，仅运行配置的模板规则。
 
 三、结果映射、前映射与后映射
 结果映射在每个目标表内配置：首次完整重算后，把指定公式结果列复制为值或文本到公式范围之外的目标列；结果列须在公式范围内。前映射在复制主数据前写入模板已有区域；后映射在首次重算和结果映射之后复制任意源/目标区域。结果映射和后映射彼此独立，均可不配置。
@@ -5818,7 +5885,7 @@ class App:
 “模块工作流”可调整处理模块顺序；添加/移除可选模块并用上移/下移排序。必需模块、结果映射、后映射、公式填充、区域操作和输出模块之间有依赖约束；非法顺序会在保存或运行时提示。默认顺序先合并源文件，再处理合并副本和模板，完成重算、映射、区域操作和保存，最后输出区域 XLSX 及文本预览。
 
 八、独立源文件合并
-勾选“启用独立合并模式”，仅使用本页独立源文件列表和“合并结果文件名”；模板、目标表、源规则、映射、区域操作及模块工作流均不会运行。首份源可为 .csv 或 .xlsx，后续源必须为 .xlsx；CSV 自动尝试 UTF-8/UTF-8 BOM、GB18030 与常见分隔符。XLSX 工作表名留空时使用首表。首份复制范围首行固定保留，后续可逐份选择保留或跳过；结果始终另存为 XLSX，不覆盖源文件或已有输出。
+勾选“启用独立合并模式”，仅使用本页独立源文件列表和“合并结果文件名”；模板、目标表、源规则、映射、区域操作及模块工作流均不会运行。首份源可为 .csv 或 .xlsx，后续源必须为 .xlsx；CSV 自动尝试 UTF-8/UTF-8 BOM、GB18030 与常见分隔符。XLSX 工作表名留空时使用首表。停止扫描也遵循“设置 → 源数据扫描”的连续整行空白阈值；显式复制结束行不受该阈值影响。首份复制范围首行固定保留，后续可逐份选择保留或跳过；结果始终另存为 XLSX，不覆盖源文件或已有输出。
 
 九、配置管理与秘钥管理
 “保存配置…”导出当前界面配置为 JSON，“加载配置…”导入 JSON；命名配置可新建、保存、载入，并在“设置 → 配置管理”导出当前配置或所选命名配置，也可删除明确选中的命名配置。删除命名配置不会删除当前正在编辑的设置或其他配置文件。

@@ -1,5 +1,5 @@
 {
-  "config_version": 18,
+  "config_version": 19,
   "config_name": "",
   "template_prefix_length": 5,
   "workflow": [
@@ -33,6 +33,7 @@
   "delete_processed_sources_after_success": false,
   "copy_start_col": "A",
   "copy_end_col": "",
+  "source_blank_rows_stop_count": 1,
   "pre_mappings": [],
   "post_mappings": [],
   "region_xlsx_outputs": [],

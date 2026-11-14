@@ -451,6 +451,18 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual(main.CONFIG_VERSION, migrated_v5["config_version"])
         self.assertEqual(main.DEFAULT_WORKFLOW, migrated_v5["workflow"])
         self.assertEqual(5, migrated_v5["template_prefix_length"])
+        self.assertEqual(1, migrated_v5["source_blank_rows_stop_count"])
+
+    def test_source_blank_row_stop_count_defaults_migrates_and_validates(self):
+        legacy = {"config_version": 18, "jobs": deepcopy(main.DEFAULT_SETTINGS["jobs"])}
+        self.assertEqual(1, main.normalize_settings(legacy)["source_blank_rows_stop_count"])
+        custom = main.normalize_settings({**legacy, "source_blank_rows_stop_count": "4"})
+        self.assertEqual(4, custom["source_blank_rows_stop_count"])
+        for invalid in (0, -1, 1.5, True, "many", None):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                main.ProcessingError, "连续整行空白停止标记数"
+            ):
+                main.normalize_settings({**legacy, "source_blank_rows_stop_count": invalid})
 
         legacy_v16 = deepcopy(main.DEFAULT_SETTINGS)
         legacy_v16["config_version"] = 16
@@ -707,6 +719,7 @@ class StaticConfigurationTests(unittest.TestCase):
         self.assertEqual(["EB:EN", "EB:EU", "EB:FV"], [job["formula_range"] for job in sample["jobs"]])
         self.assertEqual(main.DEFAULT_WORKFLOW, sample["workflow"])
         self.assertEqual(main.CONFIG_VERSION, sample["config_version"])
+        self.assertEqual(1, sample["source_blank_rows_stop_count"])
 
     def test_merged_source_filename_is_optional_but_validated(self):
         settings = deepcopy(main.DEFAULT_SETTINGS)
@@ -780,11 +793,12 @@ class StaticConfigurationTests(unittest.TestCase):
             settings["FormatConvert"] = {"enabled": True, "rules": [{"scope": "target", "sheet": "模板丙", "range": "D2:D8", "mode": "date"}]}
             settings["config_name"] = "月度汇总配置"
             settings["template_prefix_length"] = 7
+            settings["source_blank_rows_stop_count"] = 3
             main.save_settings(settings, path)
             loaded = main.load_settings(path)
             self.assertEqual(settings["jobs"][0], loaded["jobs"][0])
             self.assertEqual(main.CONFIG_VERSION, loaded["config_version"])
-            for key in ("pre_mappings", "post_mappings", "region_xlsx_outputs", "text_outputs", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert", "workflow", "config_name", "template_prefix_length", "retain_edited_sources"):
+            for key in ("pre_mappings", "post_mappings", "region_xlsx_outputs", "text_outputs", "TextToColumns", "RegionFilter", "Deduplicate", "FormatConvert", "workflow", "config_name", "template_prefix_length", "source_blank_rows_stop_count", "retain_edited_sources"):
                 self.assertEqual(settings[key], loaded[key])
             self.assertTrue(loaded["retain_merged_sources"])
         self.assertEqual([], loaded["jobs"][0]["mappings"])
@@ -2206,6 +2220,35 @@ class StaticConfigurationTests(unittest.TestCase):
             finally:
                 output.close()
 
+    def test_configured_blank_row_stop_marker_skips_short_gap_and_stops_on_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "blank_run.xlsx"
+            make_test_workbook(source_path, [("数据", {
+                2: {1: "FIRST"},
+                4: {1: "AFTER-SHORT-GAP"},
+                7: {1: "AFTER-STOP-MARKER"},
+            })])
+            messages = []
+            records = main._read_source_records(
+                source_path, "数据", 2, 1, 3, messages.append,
+                source_blank_rows_stop_count=2,
+            )
+            self.assertEqual(["FIRST", "AFTER-SHORT-GAP"], [row[0] for row in records])
+            self.assertTrue(any("第 5 至 6 行遇到连续 2 行整行空白停止边界" in message
+                                and "采用第 4 行为末行" in message for message in messages))
+
+            # A blank row before copy_start_row must not contribute to the run.
+            start_source = Path(td) / "start_row.xlsx"
+            make_test_workbook(start_source, [("数据", {
+                2: {1: "BEFORE-START"},
+                5: {1: "AT-START-RANGE"},
+            })])
+            start_records = main._read_source_records(
+                start_source, "数据", 4, 1, 1, lambda _msg: None,
+                source_blank_rows_stop_count=2,
+            )
+            self.assertEqual([["AT-START-RANGE"]], start_records)
+
     def test_empty_end_row_without_blank_boundary_uses_last_nonempty_row(self):
         with tempfile.TemporaryDirectory() as td:
             source_path = Path(td) / "no_boundary.xlsx"
@@ -2224,10 +2267,13 @@ class StaticConfigurationTests(unittest.TestCase):
             source_path = Path(td) / "explicit_end.xlsx"
             make_test_workbook(source_path, [("数据", {
                 2: {1: "IN-1"},
-                4: {1: "IN-2"},
+                5: {1: "IN-2"},
                 6: {1: "AFTER-EXPLICIT-END"},
             })])
-            records = main._read_source_records(source_path, "数据", 2, 1, 3, lambda _msg: None, end_row=4)
+            records = main._read_source_records(
+                source_path, "数据", 2, 1, 3, lambda _msg: None, end_row=5,
+                source_blank_rows_stop_count=2,
+            )
             self.assertEqual(["IN-1", "IN-2"], [row[0] for row in records])
 
     def test_all_blank_source_fails_without_creating_output(self):
@@ -3034,6 +3080,26 @@ class SourceMergeTests(unittest.TestCase):
         workbook.save(path)
         workbook.close()
 
+    def test_source_merge_uses_configured_blank_row_stop_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "gapped.xlsx"
+            self._make_source(source, "Data", [["FIRST"], [], ["AFTER-SHORT-GAP"], [], [], ["AFTER-STOP"]])
+            settings = deepcopy(main.DEFAULT_SETTINGS)
+            settings["source_blank_rows_stop_count"] = 2
+            merged = main._merge_source_workbooks([{
+                "path": str(source), "source_sheet": "Data", "copy_start_row": 1,
+                "copy_end_row": None, "keep_first_row": True,
+            }], settings, 1, 1, lambda _msg: None)
+            try:
+                records, _retained = main._process_merged_source_workbook(
+                    merged, settings, 1, 1, lambda _msg: None,
+                    False, root, root / "result.xlsx",
+                )
+                self.assertEqual([["FIRST"], ["AFTER-SHORT-GAP"]], records)
+            finally:
+                merged["path"].unlink(missing_ok=True)
+
     def test_merge_is_top_to_bottom_keeps_first_source_header_and_optionally_skips_later(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -3255,6 +3321,23 @@ class StandaloneMergeTests(unittest.TestCase):
             try:
                 self.assertEqual([("列名", "值"), ("甲", "1"), ("列名", "值"), ("乙", 2)],
                                  list(workbook.active.values))
+            finally:
+                workbook.close()
+
+    def test_csv_merge_uses_configured_consecutive_blank_row_stop_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output_dir = root / "out"
+            output_dir.mkdir()
+            csv_path = root / "gapped.csv"
+            csv_path.write_text("ID\nA\n\nB\n\n\nAFTER-STOP\n", encoding="utf-8")
+            result = main.process_merge_only(self._settings(root, [{
+                "path": str(csv_path), "source_sheet": "", "copy_start_row": 1,
+                "copy_end_row": None, "keep_first_row": True,
+            }], source_blank_rows_stop_count=2), lambda _message: None)
+            workbook = load_workbook(result, read_only=True, data_only=True)
+            try:
+                self.assertEqual([("ID",), ("A",), ("B",)], list(workbook.active.values))
             finally:
                 workbook.close()
 
