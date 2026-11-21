@@ -78,7 +78,7 @@ echo Windows installer: %~dp0dist\WpsSheetAutomation_Setup_v28.exe
 echo Main-only installer does not contain the license generator or signing private key.
 echo The installer is unsigned; Windows SmartScreen may show a publisher warning.
 >>"%LOG_FILE%" echo Installer build completed %date% %time%
-pause
+if not defined CI pause
 endlocal & exit /b 0
 
 :failed
@@ -87,5 +87,5 @@ echo Windows installer build failed at: %FAIL_STEP%
 echo Diagnostic log retained at: "%LOG_FILE%"
 >>"%LOG_FILE%" echo FAILED at: %FAIL_STEP% (%date% %time%)
 echo Check the diagnostic log. Do not launch main.py with system Python.
-pause
+if not defined CI pause
 endlocal & exit /b 1
