@@ -3411,6 +3411,34 @@ class StandaloneMergeTests(unittest.TestCase):
 
 
 class UiPreferencesAndBrandingTests(unittest.TestCase):
+    def test_custom_ui_scale_is_saved_and_loaded_as_a_local_preference(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ui_preferences.json"
+            main.save_ui_preferences(dont_show_version_notice=True, path=path, ui_scale_percent="135%")
+            preferences = main.load_ui_preferences(path)
+            self.assertEqual(135, preferences["ui_scale_percent"])
+            self.assertTrue(preferences["dont_show_version_notice"])
+            self.assertEqual({
+                "dont_show_version_notice": True,
+                "dont_show_configuration_notice": False,
+                "ui_scale_percent": 135,
+            }, json.loads(path.read_text(encoding="utf-8")))
+
+    def test_custom_ui_scale_validation_and_malformed_saved_value(self):
+        self.assertEqual(50, main.parse_ui_scale_percent("50%"))
+        self.assertEqual(125, main.parse_ui_scale_percent(" 125 "))
+        self.assertEqual(200, main.parse_ui_scale_percent(200))
+        for invalid in (True, 49, 201, 100.5, "auto", ""):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                main.parse_ui_scale_percent(invalid)
+        self.assertEqual(15, main._scaled_font_size(10, 150))
+        self.assertEqual(-7, main._scaled_font_size(-14, 50))
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ui_preferences.json"
+            path.write_text('{"ui_scale_percent": 500}', encoding="utf-8")
+            self.assertEqual(main.DEFAULT_UI_SCALE_PERCENT,
+                             main.load_ui_preferences(path)["ui_scale_percent"])
+
     def test_version_notice_preference_is_saved_and_loaded_separately(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "nested" / "ui_preferences.json"
@@ -3439,12 +3467,14 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
             path.write_text("{not-json", encoding="utf-8")
             self.assertFalse(main.load_ui_preferences(path)["dont_show_version_notice"])
             self.assertFalse(main.load_ui_preferences(path)["dont_show_configuration_notice"])
+            self.assertEqual(main.DEFAULT_UI_SCALE_PERCENT,
+                             main.load_ui_preferences(path)["ui_scale_percent"])
             path.write_text('{"dont_show_version_notice":"false"}', encoding="utf-8")
             self.assertFalse(main.load_ui_preferences(path)["dont_show_version_notice"])
 
     def test_version_and_configuration_notices_share_one_message(self):
         message = main.format_startup_notice(True, ["配置已升级到 v18：迁移提醒测试。"])
-        self.assertIn("v27", message)
+        self.assertIn("v28", message)
         self.assertIn("本次更新", message)
         self.assertIn("配置迁移说明", message)
         self.assertIn("迁移提醒测试", message)
@@ -3460,7 +3490,7 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
             "assets/linote-logo.ico",
         ):
             self.assertTrue(main.app_resource_path(relative_path).is_file(), relative_path)
-        self.assertEqual("v27", main.APP_VERSION)
+        self.assertEqual("v28", main.APP_VERSION)
         self.assertEqual("https://www.linote.top/", main.LINO_HOME_URL)
         self.assertEqual("https://github.com/linote99", main.GITHUB_PROFILE_URL)
         self.assertEqual("https://github.com/linote99/wps-sheet-automation", main.PROJECT_REPOSITORY_URL)
@@ -3481,8 +3511,8 @@ class UiPreferencesAndBrandingTests(unittest.TestCase):
         self.assertIn('--add-data "assets\\linote-logo.png;assets"', installer)
         self.assertIn("iscc.exe", installer)
         self.assertIn("wpssheetautomation.iss", installer)
-        self.assertIn("wpssheetautomation_setup_v27.exe", installer)
-        self.assertIn("outputbasefilename=wpssheetautomation_setup_v27", installer_definition)
+        self.assertIn("wpssheetautomation_setup_v28.exe", installer)
+        self.assertIn("outputbasefilename=wpssheetautomation_setup_v28", installer_definition)
         self.assertIn('source: "dist\\wpssheetautomation\\*"', installer_definition)
         self.assertNotIn("issuer_private_key.pem", installer)
         self.assertNotIn("WpsSheetAutomation_KeyGen", installer)

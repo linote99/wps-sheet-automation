@@ -1,5 +1,5 @@
 #define MyAppName "WPS 表格多源汇总处理器"
-#define MyAppVersion "27"
+#define MyAppVersion "28"
 #define MyAppPublisher "Lino"
 #define MyAppExeName "WpsSheetAutomation.exe"
 
@@ -14,7 +14,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=dist
-OutputBaseFilename=WpsSheetAutomation_Setup_v27
+OutputBaseFilename=WpsSheetAutomation_Setup_v28
 SetupIconFile=assets\linote-logo.ico
 UninstallDisplayName={#MyAppName} v{#MyAppVersion}
 UninstallDisplayIcon={app}\WpsSheetAutomation.exe

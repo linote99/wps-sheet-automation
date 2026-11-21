@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import traceback
+import weakref
 import zipfile
 from contextlib import contextmanager
 from copy import copy, deepcopy
@@ -37,12 +38,15 @@ from wps_automation_workflow import (DEFAULT_WORKFLOW, MODULE_LABELS, add_workfl
 from wps_source_selection import OPERATIONS as SOURCE_OPERATIONS, plan_selected_source_groups, validate_source_selection
 
 APP_NAME = "WPS 表格多源汇总处理器"
-APP_VERSION = "v27"
+APP_VERSION = "v28"
 LINO_HOME_URL = "https://www.linote.top/"
 GITHUB_PROFILE_URL = "https://github.com/linote99"
 PROJECT_REPOSITORY_URL = "https://github.com/linote99/wps-sheet-automation"
 CONFIG_PATH = Path.home() / ".wps_sheet_automation.json"
 PROFILE_DIR = Path.home() / ".wps_sheet_automation_profiles"
+DEFAULT_UI_SCALE_PERCENT = 100
+MIN_UI_SCALE_PERCENT = 50
+MAX_UI_SCALE_PERCENT = 200
 
 def app_resource_path(relative_path: str) -> Path:
     """Resolve bundled resources in source and PyInstaller builds."""
@@ -62,7 +66,86 @@ def _ui_preferences_path() -> Path:
 UI_PREFERENCES_PATH = _ui_preferences_path()
 
 
-def load_ui_preferences(path: Path | str | None = None) -> dict[str, bool]:
+def parse_ui_scale_percent(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("界面缩放需填写 50–200 之间的整数百分比。")
+    text = str(value).strip()
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    if not re.fullmatch(r"\d+", text):
+        raise ValueError("界面缩放需填写 50–200 之间的整数百分比。")
+    percent = int(text)
+    if not MIN_UI_SCALE_PERCENT <= percent <= MAX_UI_SCALE_PERCENT:
+        raise ValueError(f"界面缩放范围为 {MIN_UI_SCALE_PERCENT}%–{MAX_UI_SCALE_PERCENT}%。")
+    return percent
+
+
+def _scaled_font_size(size: Any, percent: int) -> int | None:
+    try:
+        original = int(size)
+    except (TypeError, ValueError):
+        return None
+    if original == 0:
+        return None
+    scaled = max(1, round(abs(original) * percent / 100))
+    return -scaled if original < 0 else scaled
+
+
+def apply_ui_scale(root, percent: Any, font_baselines: dict[str, int] | None = None,
+                   widget_font_objects: dict[Any, Any] | None = None) -> int:
+    """Scale Tk named and explicit widget fonts from their original sizes."""
+    from tkinter import font as tkfont
+
+    scale = parse_ui_scale_percent(percent)
+    baselines = font_baselines if font_baselines is not None else {}
+    retained_fonts = widget_font_objects if widget_font_objects is not None else {}
+
+    def visit(widget):
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            children = ()
+        yield widget
+        for child in children:
+            yield from visit(child)
+
+    try:
+        named_fonts = set(tkfont.names(root))
+    except Exception:
+        named_fonts = set()
+    for widget in visit(root):
+        if widget in retained_fonts:
+            continue
+        try:
+            specification = widget.cget("font")
+            if not specification or str(specification) in named_fonts:
+                continue
+            adjustable_font = tkfont.Font(root=widget, font=specification)
+            widget.configure(font=adjustable_font)
+            retained_fonts[widget] = adjustable_font
+        except Exception:
+            continue
+
+    try:
+        names = tkfont.names(root)
+    except Exception:
+        names = ()
+    for name in names:
+        try:
+            adjustable_font = tkfont.nametofont(name, root=root)
+            current_size = int(adjustable_font.cget("size"))
+            if name not in baselines and current_size:
+                baselines[name] = current_size
+            original_size = baselines.get(name, current_size)
+            target_size = _scaled_font_size(original_size, scale)
+            if target_size is not None:
+                adjustable_font.configure(size=target_size)
+        except Exception:
+            continue
+    return scale
+
+
+def load_ui_preferences(path: Path | str | None = None) -> dict[str, Any]:
     target = Path(path) if path is not None else UI_PREFERENCES_PATH
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
@@ -73,18 +156,29 @@ def load_ui_preferences(path: Path | str | None = None) -> dict[str, bool]:
     return {
         "dont_show_version_notice": raw.get("dont_show_version_notice", False) is True,
         "dont_show_configuration_notice": raw.get("dont_show_configuration_notice", False) is True,
+        "ui_scale_percent": _normalized_ui_scale_preference(raw.get("ui_scale_percent")),
     }
+
+
+def _normalized_ui_scale_preference(value: Any) -> int:
+    try:
+        return parse_ui_scale_percent(value)
+    except (TypeError, ValueError):
+        return DEFAULT_UI_SCALE_PERCENT
 
 
 def save_ui_preferences(dont_show_version_notice: bool | None = None,
                         path: Path | str | None = None,
-                        dont_show_configuration_notice: bool | None = None) -> None:
+                        dont_show_configuration_notice: bool | None = None,
+                        ui_scale_percent: Any | None = None) -> None:
     target = Path(path) if path is not None else UI_PREFERENCES_PATH
     preferences = load_ui_preferences(target)
     if dont_show_version_notice is not None:
         preferences["dont_show_version_notice"] = bool(dont_show_version_notice)
     if dont_show_configuration_notice is not None:
         preferences["dont_show_configuration_notice"] = bool(dont_show_configuration_notice)
+    if ui_scale_percent is not None:
+        preferences["ui_scale_percent"] = parse_ui_scale_percent(ui_scale_percent)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
     temporary.write_text(json.dumps(preferences, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -97,6 +191,7 @@ def format_startup_notice(include_version_notice: bool, migration_notices: list[
     if include_version_notice:
         sections.append(
             f"{APP_NAME} {APP_VERSION}\n\n本次更新：\n"
+            "• 新增 50%–200% 自定义界面缩放，支持即时应用并记忆本机偏好；\n"
             "• 整合 v26 的五类源端文件选择、独立处理与同目录另存功能；\n"
             "• 保留可配置的连续整行空白停止阈值，默认 1 行；配置升级至 v20；\n"
             "• 版本与配置提醒保留独立的“不再提醒”设置。\n\n"
@@ -4603,6 +4698,11 @@ class App:
         self.tk, self.filedialog, self.messagebox, self.ttk = tk, filedialog, messagebox, ttk
         self.root = root
         self.root.title(APP_NAME)
+        self.ui_scale_percent = load_ui_preferences()["ui_scale_percent"]
+        self.ui_font_baselines: dict[str, int] = {}
+        self.ui_widget_fonts = weakref.WeakKeyDictionary()
+        self._ui_font_refresh_after_id = None
+        apply_ui_scale(self.root, self.ui_scale_percent, self.ui_font_baselines, self.ui_widget_fonts)
         try:
             screen_width = self.root.winfo_screenwidth()
             screen_height = self.root.winfo_screenheight()
@@ -4627,12 +4727,33 @@ class App:
         self.active_job_index: int | None = None
         self.active_profile_name = str(self.settings.get("config_name") or "")
         self._build()
+        apply_ui_scale(self.root, self.ui_scale_percent, self.ui_font_baselines, self.ui_widget_fonts)
+        self.root.bind_all("<Map>", self._on_ui_widget_mapped, add="+")
         self._render_jobs()
         self._render_merge_sources()
         self._render_area_configs()
         self._render_workflow()
         self._refresh_profile_choices()
         self.root.after(150, self._drain_events)
+
+    def _on_ui_widget_mapped(self, _event=None):
+        if self._ui_font_refresh_after_id is not None:
+            return
+        try:
+            self._ui_font_refresh_after_id = self.root.after_idle(self._refresh_ui_fonts)
+        except Exception:
+            self._ui_font_refresh_after_id = None
+
+    def _refresh_ui_fonts(self):
+        self._ui_font_refresh_after_id = None
+        try:
+            apply_ui_scale(self.root, self.ui_scale_percent,
+                           self.ui_font_baselines, self.ui_widget_fonts)
+            self.root.update_idletasks()
+            if hasattr(self, "main_canvas"):
+                self._on_content_configure()
+        except Exception:
+            pass
 
     def _on_close(self):
         try:
@@ -6091,7 +6212,14 @@ class App:
     def _open_settings(self):
         dialog = self.tk.Toplevel(self.root)
         dialog.title("设置")
-        dialog.geometry("840x690")
+        dialog_width = max(650, round(840 * self.ui_scale_percent / 100))
+        dialog_height = max(500, round(690 * self.ui_scale_percent / 100))
+        try:
+            dialog_width = min(dialog_width, max(650, dialog.winfo_screenwidth() - 80))
+            dialog_height = min(dialog_height, max(500, dialog.winfo_screenheight() - 100))
+        except Exception:
+            pass
+        dialog.geometry(f"{dialog_width}x{dialog_height}")
         dialog.minsize(650, 500)
         dialog.transient(self.root)
         notebook = self.ttk.Notebook(dialog)
@@ -6099,18 +6227,84 @@ class App:
         license_page = self.ttk.Frame(notebook, padding=12)
         help_page = self.ttk.Frame(notebook, padding=8)
         source_scan_page = self.ttk.Frame(notebook, padding=12)
+        ui_scale_page = self.ttk.Frame(notebook, padding=12)
         config_page = self.ttk.Frame(notebook, padding=12)
         about_page = self.ttk.Frame(notebook, padding=12)
         notebook.add(license_page, text="秘钥管理")
         notebook.add(help_page, text="使用说明")
         notebook.add(source_scan_page, text="源数据扫描")
+        notebook.add(ui_scale_page, text="界面缩放")
         notebook.add(config_page, text="配置管理")
         notebook.add(about_page, text="关于")
         self._build_license_settings_tab(license_page)
         self._build_usage_help_tab(help_page)
         self._build_source_scan_settings_tab(source_scan_page)
+        self._build_ui_scale_settings_tab(ui_scale_page)
         self._build_profile_management_tab(config_page)
         self._build_about_tab(about_page)
+        self._refresh_ui_fonts()
+
+    def _build_ui_scale_settings_tab(self, parent):
+        ttk = self.ttk
+        parent.columnconfigure(0, weight=1)
+        ttk.Label(parent, text="自定义界面缩放", font=("Microsoft YaHei UI", 11, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(
+            parent,
+            text=(f"填写 {MIN_UI_SCALE_PERCENT}–{MAX_UI_SCALE_PERCENT} 的整数百分比。"
+                  "应用后立即调整界面字体，并记忆在本机界面偏好中；主窗口仍可单独拖动边缘调整大小。"
+                  "此选项不写入表格处理配置，也不会改变工作簿内容。"),
+            wraplength=680, justify="left", foreground="#4b5563",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 14))
+        controls = ttk.Frame(parent)
+        controls.grid(row=2, column=0, sticky="w")
+        self.ui_scale_var = self.tk.StringVar(value=str(self.ui_scale_percent))
+        self.ui_scale_spinbox = ttk.Spinbox(
+            controls, from_=MIN_UI_SCALE_PERCENT, to=MAX_UI_SCALE_PERCENT,
+            increment=1, width=9, textvariable=self.ui_scale_var,
+        )
+        self.ui_scale_spinbox.grid(row=0, column=0, sticky="w")
+        ttk.Label(controls, text="%").grid(row=0, column=1, sticky="w", padx=(4, 14))
+        ttk.Button(controls, text="应用缩放", command=self._apply_ui_scale_from_settings).grid(
+            row=0, column=2, padx=(0, 8))
+        ttk.Button(controls, text="恢复 100%", command=self._reset_ui_scale).grid(row=0, column=3)
+        self.ui_scale_spinbox.bind("<Return>", lambda _event: self._apply_ui_scale_from_settings())
+        self.ui_scale_status_var = self.tk.StringVar(value=f"当前界面缩放：{self.ui_scale_percent}%")
+        ttk.Label(parent, textvariable=self.ui_scale_status_var).grid(
+            row=3, column=0, sticky="w", pady=(14, 0))
+
+    def _apply_ui_scale_from_settings(self):
+        try:
+            percent = parse_ui_scale_percent(self.ui_scale_var.get())
+        except ValueError as exc:
+            self.messagebox.showerror("界面缩放", str(exc), parent=self.root)
+            self.ui_scale_var.set(str(self.ui_scale_percent))
+            return False
+        previous = self.ui_scale_percent
+        self.ui_scale_percent = percent
+        try:
+            apply_ui_scale(self.root, percent, self.ui_font_baselines, self.ui_widget_fonts)
+            self.root.update_idletasks()
+            save_ui_preferences(ui_scale_percent=percent)
+        except Exception as exc:
+            self.ui_scale_percent = previous
+            try:
+                apply_ui_scale(self.root, previous, self.ui_font_baselines, self.ui_widget_fonts)
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            self.ui_scale_var.set(str(previous))
+            self.messagebox.showerror("界面缩放", f"应用或保存缩放设置失败：\n{exc}", parent=self.root)
+            return False
+        self.ui_scale_var.set(str(percent))
+        self.ui_scale_status_var.set(f"当前界面缩放：{percent}%")
+        if hasattr(self, "main_canvas"):
+            self._on_content_configure()
+        return True
+
+    def _reset_ui_scale(self):
+        self.ui_scale_var.set(str(DEFAULT_UI_SCALE_PERCENT))
+        return self._apply_ui_scale_from_settings()
 
     def _build_source_scan_settings_tab(self, parent):
         ttk = self.ttk

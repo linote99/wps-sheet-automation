@@ -71,10 +71,10 @@ set "FAIL_STEP=Inno Setup installer compilation"
 "%ISCC_EXE%" "%~dp0WpsSheetAutomation.iss" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto failed
 set "FAIL_STEP=installer output validation"
-if not exist "%~dp0dist\WpsSheetAutomation_Setup_v27.exe" goto failed
+if not exist "%~dp0dist\WpsSheetAutomation_Setup_v28.exe" goto failed
 
 echo Main application: %~dp0dist\WpsSheetAutomation\WpsSheetAutomation.exe
-echo Windows installer: %~dp0dist\WpsSheetAutomation_Setup_v27.exe
+echo Windows installer: %~dp0dist\WpsSheetAutomation_Setup_v28.exe
 echo Main-only installer does not contain the license generator or signing private key.
 echo The installer is unsigned; Windows SmartScreen may show a publisher warning.
 >>"%LOG_FILE%" echo Installer build completed %date% %time%
