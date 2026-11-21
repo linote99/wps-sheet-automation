@@ -28,6 +28,15 @@ jobs:
         shell: cmd
         run: call install_and_build_main_only.bat
 
+      - name: Upload build diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-build-log
+          path: install_and_build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
