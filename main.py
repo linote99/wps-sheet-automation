@@ -1671,6 +1671,79 @@ def _find_external_formula(formula: str) -> bool:
     return bool(re.search(r"\b(?:WEBSERVICE|FILTERXML|RTD|CALL|REGISTER\.ID|EXEC)\s*\(", formula, flags=re.IGNORECASE))
 
 
+def _find_external_formula_cell_in_worksheet_xml(data: bytes) -> str | None:
+    """Return the first cell containing an unsafe formula without walking blank cells."""
+    compact = data.replace(b"\x00", b"").upper()
+    if b"<!DOCTYPE" in compact or b"<!ENTITY" in compact:
+        raise ValueError("工作表 XML 包含不支持的 DTD 或实体声明。")
+    parser = expat.ParserCreate(namespace_separator="}")
+    worksheet_namespace: str | None = None
+    current_cell: str | None = None
+    formula_cell: str | None = None
+    formula_parts: list[str] = []
+    found: str | None = None
+
+    def split_name(name: str) -> tuple[str, str]:
+        if "}" in name:
+            return tuple(name.rsplit("}", 1))
+        return "", name
+
+    def start_element(name: str, attributes: dict[str, str]) -> None:
+        nonlocal worksheet_namespace, current_cell, formula_cell, formula_parts
+        namespace, local_name = split_name(name)
+        if worksheet_namespace is None and local_name == "worksheet":
+            worksheet_namespace = namespace
+        if namespace != worksheet_namespace:
+            return
+        if local_name == "c":
+            current_cell = attributes.get("r")
+        elif local_name == "f" and current_cell is not None:
+            formula_cell = current_cell
+            formula_parts = []
+
+    def character_data(value: str) -> None:
+        if formula_cell is not None:
+            formula_parts.append(value)
+
+    def end_element(name: str) -> None:
+        nonlocal current_cell, formula_cell, found
+        namespace, local_name = split_name(name)
+        if namespace != worksheet_namespace:
+            return
+        if local_name == "f" and formula_cell is not None:
+            if _find_external_formula("".join(formula_parts)):
+                found = formula_cell
+            formula_cell = None
+        elif local_name == "c":
+            current_cell = None
+
+    parser.StartElementHandler = start_element
+    parser.CharacterDataHandler = character_data
+    parser.EndElementHandler = end_element
+    parser.ExternalEntityRefHandler = lambda *_args: 0
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.Parse(data, True)
+    return found
+
+
+def _check_workbook_external_formulas(path: Path) -> None:
+    """Check every worksheet formula in a bounded XLSX copy, independent of UsedRange size."""
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            member_names = {info.filename for info in archive.infolist()}
+            for part, sheet_name in _worksheet_parts(archive, member_names).items():
+                raw = _read_bounded_zip_xml(archive, part, MAX_XLSX_WORKSHEET_XML_BYTES)
+                coordinate = _find_external_formula_cell_in_worksheet_xml(raw)
+                if coordinate:
+                    raise ProcessingError(
+                        f"源文件 {path.name}!{sheet_name}!{coordinate} 含外部引用或访问函数，已停止。"
+                    )
+    except ProcessingError:
+        raise
+    except Exception as exc:
+        raise ProcessingError(f"无法安全检查源文件“{path.name}”中的公式；已停止。原因：{exc}") from exc
+
+
 def _normalize_path(value: str, label: str) -> Path:
     raw = str(value or "").strip()
     if not raw:
@@ -4371,12 +4444,7 @@ def _prepare_selected_source_copy(group: dict[str, Any], log: Callable[[str], No
                     raise ProcessingError("选定源文件组没有可执行规则。")
                 if len(paths) == 1:
                     # The original zip structure, other sheets, formatting and formulas remain intact.
-                    for sheet in first_book:
-                        _check_processing_area_size((1, 1, max(1, sheet.max_column), max(1, sheet.max_row)), "源文件安全检查")
-                        for row in sheet.iter_rows():
-                            for cell in row:
-                                if isinstance(cell.value, str) and cell.value.startswith("=") and _find_external_formula(cell.value):
-                                    raise ProcessingError(f"源文件 {paths[0].name}!{sheet.title}!{cell.coordinate} 含外部引用或访问函数，已停止。")
+                    _check_workbook_external_formulas(safe.path)
                     shutil.copyfile(safe.path, temporary)
                     log(f"已为单个源文件创建完整安全副本：{paths[0].name}（保留其他工作表）。")
                     return temporary

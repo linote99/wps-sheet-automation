@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -24,6 +26,24 @@ def workbook(path: Path, sheets: dict[str, list[list[object]]]) -> None:
             sheet.append(row)
     book.save(path)
     book.close()
+
+
+def set_first_sheet_dimension(path: Path, reference: str) -> None:
+    rewritten = path.with_name(f"{path.stem}_dimension.xlsx")
+    with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(rewritten, "w") as target:
+        for info in source.infolist():
+            data = source.read(info.filename)
+            if info.filename == "xl/worksheets/sheet1.xml":
+                data, count = re.subn(
+                    rb'(<dimension\b[^>]*\bref=")[^"]+(\")',
+                    lambda match: match.group(1) + reference.encode("ascii") + match.group(2),
+                    data,
+                    count=1,
+                )
+                if count != 1:
+                    raise AssertionError("generated worksheet has no dimension ref")
+            target.writestr(info, data)
+    rewritten.replace(path)
 
 
 def source_rule(sheet="Data", area="A1:A999", **extra):
@@ -62,6 +82,38 @@ class SelectedSourceCopyTests(unittest.TestCase):
         self.assertEqual(result.sheetnames, ["Data", "Notes"])
         self.assertEqual(result["Data"]["B2"].value, "=1+1")
         self.assertEqual(result["Notes"]["A1"].value, "keep")
+
+    def test_sparse_large_used_range_does_not_trigger_processing_area_guard(self):
+        source = self.root / "sparse.xlsx"
+        book = Workbook()
+        book.active.title = "Data"
+        book.active["A1"] = "id"
+        book.active["B2"] = "=1+1"
+        book.save(source)
+        book.close()
+        set_first_sheet_dimension(source, "A1:XFD40")  # 655,360 nominal cells, but only two stored cells.
+        group = {"source_paths": [str(source)], "rules": {"Deduplicate": [source_rule()]}}
+
+        copied = Path(main._prepare_selected_source_copy(group, lambda _msg: None))
+        self.addCleanup(copied.unlink, missing_ok=True)
+        result = load_workbook(copied, data_only=False)
+        self.addCleanup(result.close)
+        self.assertEqual(result["Data"]["B2"].value, "=1+1")
+
+    def test_sparse_large_used_range_still_rejects_unsafe_formula_on_other_sheet(self):
+        source = self.root / "unsafe.xlsx"
+        book = Workbook()
+        book.active.title = "Data"
+        book.active["A1"] = "id"
+        notes = book.create_sheet("Notes")
+        notes["A1"] = '=WEBSERVICE("https://example.com")'
+        book.save(source)
+        book.close()
+        set_first_sheet_dimension(source, "A1:XFD40")
+        group = {"source_paths": [str(source)], "rules": {"Deduplicate": [source_rule()]}}
+
+        with self.assertRaisesRegex(main.ProcessingError, r"Notes!A1 含外部引用或访问函数"):
+            main._prepare_selected_source_copy(group, lambda _msg: None)
 
     def test_multi_copy_merges_only_referenced_sheet_and_keeps_every_header(self):
         first = self.root / "first.xlsx"
